@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>宿经03超大CSV文件实用编辑器 — 技术手册</title>
+<style>
+  :root {
+    --primary: #0e6dc0;
+    --primary-dark: #0a5296;
+    --border: #d9e2ec;
+    --bg: #f7fafc;
+    --bg-card: #ffffff;
+    --text: #2d3748;
+    --muted: #718096;
+    --code-bg: #f6f8fa;
+    --mono: "JetBrains Mono", Consolas, "Courier New", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.75;
+  }
+  header {
+    background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+    color: #fff;
+    padding: 32px 24px;
+    text-align: center;
+  }
+  header h1 { margin: 0 0 8px; font-size: 26px; }
+  header p { margin: 0; opacity: .9; font-size: 15px; }
+  .container { max-width: 1000px; margin: 32px auto; padding: 0 20px; }
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 24px 28px;
+    margin-bottom: 24px;
+    box-shadow: 0 1px 4px rgba(0,0,0,.04);
+  }
+  h2 {
+    color: var(--primary-dark);
+    border-left: 5px solid var(--primary);
+    padding-left: 12px;
+    margin: 0 0 16px;
+    font-size: 21px;
+  }
+  h3 { color: var(--primary); font-size: 17px; margin: 22px 0 8px; border-bottom: 1px dashed var(--border); padding-bottom: 4px; }
+  h4 { color: var(--primary-dark); font-size: 15px; margin: 16px 0 6px; }
+  p, li { font-size: 15px; }
+  ul, ol { padding-left: 22px; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; }
+  th, td { border: 1px solid var(--border); padding: 7px 11px; text-align: left; vertical-align: top; }
+  th { background: #edf4fb; color: var(--primary-dark); }
+  tr:nth-child(even) td { background: #fbfcfe; }
+  code {
+    font-family: var(--mono);
+    background: var(--code-bg);
+    border: 1px solid #e3e8ee;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 13px;
+    color: #c0392b;
+  }
+  pre {
+    background: #1e2530;
+    color: #e6edf3;
+    border-radius: 8px;
+    padding: 14px 18px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  pre code { background: none; border: none; padding: 0; color: inherit; }
+  .tag {
+    display: inline-block;
+    background: #ebf5ff;
+    color: var(--primary);
+    border: 1px solid #bad1ef;
+    border-radius: 4px;
+    padding: 1px 8px;
+    margin: 2px;
+    font-size: 13px;
+  }
+  .note, .warn, .ok {
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin: 14px 0;
+    font-size: 14px;
+  }
+  .note { background: #f0f7ff; border: 1px solid #c2dcf5; }
+  .warn { background: #fffaf0; border: 1px solid #ed8936; }
+  .ok { background: #f0fff4; border: 1px solid #48bb78; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px,1fr)); gap: 14px; }
+  .grid .cell { background: #f9fbfd; border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+  .grid .cell b { color: var(--primary-dark); }
+  .tree { font-family: var(--mono); font-size: 13.5px; background: var(--code-bg); border: 1px solid #e3e8ee; border-radius: 8px; padding: 14px 18px; white-space: pre; overflow-x: auto; line-height: 1.6; }
+  .muted { color: var(--muted); font-size: 13px; }
+  footer { text-align: center; color: var(--muted); font-size: 13px; margin: 40px 0; }
+  a { color: var(--primary); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>宿经03超大CSV文件实用编辑器 — 技术手册</h1>
+  <p>Rust 重构版 · 架构 · 核心引擎设计 · Win7 兼容 · 构建与测试</p>
+</header>
+
+<div class="container">
+
+  <!-- 一、项目概览 -->
+  <div class="card">
+    <h2>一、项目概览</h2>
+    <p>原 Python/PyQt6 工具（<code>1.3_nodask.py</code>，4227 行）的 Rust 重构，专注超大 CSV 文件的读取、预览、筛选、拆分、列操作、哈希与导出。实测可处理 <b>6.5GB / 901 万行 / 55 列</b> 的数据，打开约 4 秒、峰值内存约 148MB，最终产物为<b>兼容 Windows 7 的单文件 exe</b>（约 6.5MB，无外部 DLL 依赖）。</p>
+    <div class="grid">
+      <div class="cell"><b>语言</b><br>Rust 2021 edition</div>
+      <div class="cell"><b>GUI</b><br>egui / eframe 0.27</div>
+      <div class="cell"><b>窗口后端</b><br>winit 0.29（Win7 兼容）</div>
+      <div class="cell"><b>渲染</b><br>glow（OpenGL）</div>
+      <div class="cell"><b>虚拟表格</b><br>egui_extras 0.27</div>
+      <div class="cell"><b>编码</b><br>encoding_rs 0.8</div>
+      <div class="cell"><b>映射</b><br>memmap2 0.9</div>
+      <div class="cell"><b>哈希</b><br>md-5 / sha1 / sha2</div>
+      <div class="cell"><b>XLSX</b><br>rust_xlsxwriter 0.66</div>
+      <div class="cell"><b>对话框</b><br>rfd 0.14</div>
+      <div class="cell"><b>Win API</b><br>winapi 0.3</div>
+      <div class="cell"><b>日志</b><br>log 0.4（文件落盘）</div>
+    </div>
+  </div>
+
+  <!-- 二、分层架构 -->
+  <div class="card">
+    <h2>二、分层架构</h2>
+    <p>核心原则：<b>数据引擎（core）与 GUI 层严格分离</b>，core 无任何 GUI 依赖，可独立编译、单元测试与命令行调用。</p>
+    <div class="tree">src/
+├── main.rs               # eframe 入口（窗口/字体/滚动条/诊断日志/图标）
+├── lib.rs                # 核心库入口（pub mod core）
+├── core/                 # 数据引擎（无 GUI 依赖）
+│   ├── encoding.rs       # 严格编码检测与流式转码
+│   ├── csv.rs            # CSV 字节级解析状态机（行索引/字段切分）
+│   ├── reader.rs         # mmap + 流式行索引 + 惰性字段访问
+│   ├── model.rs          # DataModel + 类型推断（全文本模式）
+│   ├── filter.rs         # 筛选引擎（并行）
+│   ├── split.rs          # 拆分引擎（单遍哈希分组）
+│   ├── column_ops.rs     # 列操作 + 命令式 undo/redo
+│   ├── hash.rs           # 行哈希（4 算法并行）
+│   └── export.rs         # CSV/XLSX 导出（自动分 sheet/长数字文本）
+├── app/                  # GUI 层
+│   ├── background.rs     # 后台工作线程桥接（mpsc）
+│   ├── dialogs.rs        # 对话框状态
+│   ├── dialog_ui.rs      # 各操作对话框渲染与动作
+│   ├── panels.rs         # 菜单/控制/日志/预览/进度窗口
+│   └── table.rs          # 虚拟化预览表格
+└── bin/                  # 命令行工具
+    ├── inspect.rs        # 打开报告
+    ├── verify.rs         # 与 Python 参照对照
+    └── e2e.rs            # 端到端回归</div>
+  </div>
+
+  <!-- 三、核心引擎设计 -->
+  <div class="card">
+    <h2>三、核心引擎设计</h2>
+
+    <h3>3.1 读取器（reader.rs + csv.rs）</h3>
+    <ul>
+      <li><b>mmap</b> 内存映射文件（不载入内容，仅映射虚拟地址空间）。</li>
+      <li><b>流式行索引</b>：分块顺序读文件构建行偏移索引（<code>build_index_streaming</code>），不触碰 mmap 页，避免把 6.5GB 文件整体拉入工作集 —— 这是内存降低两个数量级的关键。</li>
+      <li><b>引号感知</b>：CSV 状态机（<code>csv.rs</code>）处理双引号包裹字段、字段内换行、<code>""</code> 转义、CRLF / CR / LF 换行。</li>
+      <li><b>惰性字段访问</b>：按 (行, 列) 取原始字节，仅在需要时解码为 UTF-8。行偏移索引内存约 <b>8B/行</b>，O(行数)。</li>
+      <li>UTF-16 文件在字节级无法安全切分（分隔符含 <code>0x00</code>），打开时<b>整体转码</b>为 UTF-8 再走统一路径。</li>
+    </ul>
+
+    <h3>3.2 编码检测（encoding.rs）</h3>
+    <p>修正 Python 版“chardet + GB18030 优先”会把 UTF-8 文件误判为 GB18030 产生乱码的问题。改为<b>严格验证优先</b>：</p>
+    <pre><code>BOM → 严格 UTF-8 验证 → UTF-16 启发式 → GB18030 兜底</code></pre>
+    <div class="note">UTF-8 是自校验编码，严格验证可靠；GBK/GB2312 等必然通过不了 UTF-8 验证而正确落到 GB18030 超集。所有数据内部统一为 UTF-8 <code>String</code>。</div>
+
+    <h3>3.3 数据模型（model.rs）— 全文本模式</h3>
+    <ul>
+      <li>所有列一律视为文本（<code>TypeKind::Text</code>），避免数值类型影响导出，保证<b>长数字 / 前导零 / 大整数不丢精度</b>。</li>
+      <li><code>classify</code> 保留用于诊断/测试（整数 ≤18 位、浮点、>18 位长数字 → 文本、特殊浮点文本），不再参与导出类型判断。</li>
+      <li><code>row_into</code> 复用目标容量，避免大数据逐行遍历时的字符串分配。默认采样 <code>DEFAULT_SAMPLE_ROWS = 1000</code>。</li>
+    </ul>
+
+    <h3>3.4 筛选引擎（filter.rs）</h3>
+    <ul>
+      <li>10 种条件：等于/包含/不包含/大于/小于/大于等于/小于等于/不等于/空值/非空值；条件间用<b>且/或</b>组合，AND 短路。</li>
+      <li><b>数值比较优先</b>：整数用 <code>i128</code> 精确比较（覆盖 19 位卡号），浮点回退 f64；双方均可数值化时数值比较，否则字符串比较（trim 后）。</li>
+      <li><b>并行分块</b>评估（<code>std::thread::scope</code>，上限 16 线程），进度回调，900 万行目标 &lt; 10 秒。</li>
+      <li>结果行号用 <code>u32</code>（支持 ≥43 亿行）。</li>
+    </ul>
+
+    <h3>3.5 拆分引擎（split.rs）</h3>
+    <ul>
+      <li><b>按字段拆分单遍哈希分组</b> O(N)，消除 Python 版 <code>df[df[col]==value]</code> 的 O(N×U) 重复全表扫描。</li>
+      <li>文件数上限保护 <code>MAX_SPLIT_FILES = 20000</code>；重名文件自动追加序号（Python 版直接覆盖）。</li>
+      <li>文件名清洗：替换 Windows 非法字符与控制字符、压缩连续下划线、按字符边界截断 100 字符。</li>
+      <li>多列组合键用 <code>\x1F</code> 连接，避免歧义。</li>
+    </ul>
+
+    <h3>3.6 列操作 / undo-redo（column_ops.rs）</h3>
+    <div class="warn">Python 版每次操作 <code>df.copy(deep=True)</code> 深拷贝整表 + 20 步历史，6.5GB 数据单次拷贝即 OOM。</div>
+    <ul>
+      <li>本引擎以<b>操作描述（派生列 <code>DerivedColumn</code>）</b>记录，<b>零复制零物化</b>；字段在访问时按需计算。</li>
+      <li>删除/隐藏为视图层操作（不物理重写 900 万行数据）。</li>
+      <li>undo/redo 为命令式栈：undo 弹出并反向执行，redo 重放，同样零复制。</li>
+      <li>派生列类型：<code>SplitField</code> / <code>Merge</code> / <code>Copy</code> / <code>Constant</code> / <code>Hash</code>。</li>
+    </ul>
+
+    <h3>3.7 导出引擎（export.rs）</h3>
+    <ul>
+      <li>CSV：<b>utf-8-sig（带 BOM）</b> 流式写出，与 Python 版一致。</li>
+      <li>XLSX：超过 <code>XLSX_MAX_ROWS_PER_SHEET = 1_048_576</code> 自动分 sheet（Python 版直接崩溃）；超过 Excel 上限 16384 列则报错改用 CSV。</li>
+      <li><b>长数字列文本格式</b>：列名含 账号/卡号/身份证/证件号/编号/ID/电话/手机/号码/账户 等关键词，或采样值 &gt; 11 位整数 → 文本格式，防科学计数法与精度丢失。</li>
+      <li><b>公式注入防护（CWE-1236）</b>：以 <code>= + - @</code> 开头的字段加 <code>'</code> 前缀；内部中转文件用 <code>new_raw</code> 关闭。</li>
+    </ul>
+  </div>
+
+  <!-- 四、GUI 与后台线程 -->
+  <div class="card">
+    <h2>四、GUI 与后台线程</h2>
+    <h3>4.1 即时模式架构</h3>
+    <p>egui 即时模式：以布尔标志控制对话框（<code>DialogStates</code>）。主循环每帧：poll 消息 → 菜单栏 → 控制面板 → 日志 → 中央预览 → 进度 → 对话框。</p>
+    <h3>4.2 后台线程桥接（background.rs）</h3>
+    <p>耗时操作（打开/筛选/拆分/导出）在<b>后台线程</b>执行，通过 <code>mpsc</code> 通道回传 <code>BgMsg</code>（进度 / 加载完成 / 筛选结果 / 拆分完成 / 导出完成 / 错误），UI 不阻塞。任务用 <code>catch_unwind</code> 包裹，任务 panic 时补发错误消息，避免 UI 永久卡在忙碌状态。</p>
+    <h3>4.3 虚拟化预览表格（table.rs）</h3>
+    <p><code>egui_extras</code> 虚拟化表格仅渲染可见行，900 万行流畅滚动；显示行数可切换 100/1000/10000/全部；双击单元格弹出该行全部列-值详情。</p>
+    <h3>4.4 界面细节</h3>
+    <ul>
+      <li>加载微软雅黑/黑体中文字体，默认字号 14 便于中文阅读。</li>
+      <li>加宽滚动条，避免数据预览区滚动条过窄难操作。</li>
+      <li>弹出窗口位置可配置（居中/右侧/左侧/中间/记忆位置），egui <code>persistence</code> 记忆。</li>
+      <li>进程峰值内存用 <code>GetProcessMemoryInfo</code>（winapi）实时显示。</li>
+    </ul>
+  </div>
+
+  <!-- 五、Win7 兼容 -->
+  <div class="card">
+    <h2>五、Windows 7 单文件兼容</h2>
+    <div class="warn">标准 Rust std 自 1.58+ 静态导入 Win8/Win10 API（如 <code>GetSystemTimePreciseAsFileTime</code>），普通编译产物在 Win7 无法加载。本项目用 Rust 官方 Tier 3 目标 <code>x86_64-win7-windows-gnu</code> + nightly <code>build-std</code> 重新编译标准库，才得到真正 Win7 兼容的产物（已验证导入表）。</div>
+    <h3>5.1 关键构建参数</h3>
+    <pre><code>RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=yes -C linker=rust-lld
+cargo +nightly-2025-06-23-x86_64-pc-windows-gnu build --release \
+  --target x86_64-win7-windows-gnu -Z build-std=std,panic_abort</code></pre>
+    <div class="tree">产物：target\x86_64-win7-windows-gnu\release\csv_editor_rust.exe
+导入表：仅 Win7 内置系统 DLL（kernel32 / msvcrt / user32 / gdi32 / advapi32 /
+        shell32 / ole32 / opengl32 / dwmapi 等），无 UCRT、无 API-set 依赖。</div>
+    <h3>5.2 版本陷阱（实测）</h3>
+    <ul>
+      <li><b>Mesa 22.1.7</b>（x64 mingw opengl32.dll + libgallium_wgl.dll + libglapi.dll，用系统 msvcrt 免 VC++）+ <b>安装 Vulkan Runtime</b>（提供 vulkan-1.dll）→ Win7 x64 实测可运行。</li>
+      <li>26.1.7 依赖 UCRT 与 Win8 的 <code>GetSystemTimePreciseAsFileTime</code> → 报“无法定位程序输入点”；22.1.7 静态导入 <code>vulkan-1.dll</code> → 不装 Vulkan 报缺失。</li>
+      <li>20.3.4 / 18.1.8 的 opengl32.dll 编入 AVX/AVX512 → 无 AVX CPU（如 Core2 T7700）报 0xc000001d。</li>
+      <li>CPU 需支持 AVX（建议 Sandy Bridge 2011+）。</li>
+      <li>依赖锁定：egui/eframe 0.27 + winit 0.29 才是 Win7 兼容版本；本地 <code>vendor/webbrowser</code> stub 绕开 idna/icu 的 edition2024 依赖（Cargo 1.81 不支持）。</li>
+    </ul>
+    <h3>5.3 诊断机制</h3>
+    <p>release 为 GUI 子系统且 <code>panic = "abort"</code>（无控制台、无 stderr），任何启动错误都“无反应”。因此 main 里安装<b>文件 logger + panic hook</b>，把 <code>log::error!/warn!</code>、panic 与 <code>run_native</code> 返回的 Err 写到 exe 同目录 <code>csv_editor_rust.log</code>（不可写则回退 %TEMP%），可在 Win7 上定位真实错误（如 NoGlutinConfigs、OpenGL 版本、缺失 DLL）。</p>
+  </div>
+
+  <!-- 六、构建与测试 -->
+  <div class="card">
+    <h2>六、构建与测试</h2>
+    <h3>6.1 开发 / 测试（stable）</h3>
+    <pre><code>set PATH=D:\project_xiangmu\.rust-toolchain\rust-1.88.0-x86_64-pc-windows-gnu\rustc\bin;D:\project_xiangmu\.rust-toolchain\rust-1.88.0-x86_64-pc-windows-gnu\cargo\bin;%PATH%
+cargo test          # 单元测试
+cargo run --bin csv_editor_rust</code></pre>
+    <h3>6.2 Win7 单文件发布</h3>
+    <p>运行项目根目录的 <code>build_win7.bat</code>（或手动执行上文 5.1 命令）。</p>
+    <h3>6.3 测试与验证工具</h3>
+    <table>
+      <tr><th style="width:150px;">工具</th><th>用途</th></tr>
+      <tr><td><code>cargo test</code></td><td>74 项单元测试，覆盖编码检测、行索引边界、字段切分、筛选语义、列操作、导出等。</td></tr>
+      <tr><td><code>bin/inspect</code></td><td>打开报告：行数/列数/编码/耗时/峰值内存/采样预览。</td></tr>
+      <tr><td><code>bin/verify</code></td><td>与 <code>testdata/verify_ref.py</code> 输出同结构 JSON（筛选行号 + 行哈希），验证 Rust 与 Python 语义一致。</td></tr>
+      <tr><td><code>bin/e2e</code></td><td>端到端回归：打开 → 类型推断 → 筛选 → 列操作(undo/redo) → 拆分 → 导出 CSV/XLSX。</td></tr>
+    </table>
+    <div class="note">testdata/ 含 jymxb_1000.csv（真实数据子集）、ref_result.json / rust_result.json（对照结果）。</div>
+  </div>
+
+  <!-- 七、性能与限制 -->
+  <div class="card">
+    <h2>七、性能数据与已知限制</h2>
+    <h3>7.1 实测性能（jymxb.csv：6.5GB / 9,013,661 行 / 55 列 / UTF-8）</h3>
+    <table>
+      <tr><th>指标</th><th>Python 1.3</th><th>Rust 版</th></tr>
+      <tr><td>打开 + 行索引</td><td>数分钟（pandas 全量载入）</td><td><b>4.1 秒</b></td></tr>
+      <tr><td>峰值内存</td><td>15GB+（低配机直接 OOM）</td><td><b>148 MB</b></td></tr>
+      <tr><td>全量筛选</td><td>分钟级</td><td>并行秒级</td></tr>
+      <tr><td>文件体积</td><td>~300MB（PyInstaller）</td><td><b>6.5 MB</b></td></tr>
+    </table>
+    <h3>7.2 已知限制</h3>
+    <ul>
+      <li>按字段拆分对唯一值超过 20,000 个的字段会拒绝（提示改用按行数拆分），避免生成海量文件。</li>
+      <li>XLSX 导出超 1,048,576 行自动分 sheet；列数超 16,384 报错改用 CSV。</li>
+      <li>UTF-16 文件整体转码载入内存（此类文件通常较小）；超大 UTF-16 建议先转码。</li>
+    </ul>
+  </div>
+
+  <footer>
+    宿经03超大CSV文件实用编辑器 · Rust 重构版 · 技术手册 v1.0
+  </footer>
+</div>
+
+</body>
+</html>

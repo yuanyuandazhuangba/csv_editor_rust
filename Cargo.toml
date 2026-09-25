@@ -1,0 +1,54 @@
+[package]
+name = "csv_editor_rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# GUI: 锁定 egui/eframe 0.27（winit 0.29，Win7 兼容）；关闭 links/webbrowser 默认特性，
+# 以避免 idna/icu 传递依赖要求 edition2024（Cargo 1.81 不支持）
+eframe = { version = "0.27", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "persistence",
+    "wayland",
+    "x11",
+] }
+egui = { version = "0.27", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "log",
+    "persistence",
+] }
+# TableBuilder 不需要 image loader；关闭默认 all_loaders 以避开 mime_guess2（edition2024）
+egui_extras = { version = "0.27", default-features = false }
+encoding_rs = "0.8"
+# 窗口图标解码：png 特性与 eframe 传递依赖的 image 0.24 一致（ico 的 PNG 条目兜底解码）
+image = { version = "0.24", default-features = false, features = ["png"] }
+md-5 = "0.10"
+memmap2 = "0.9"
+rust_xlsxwriter = "0.66"
+rfd = "0.14"
+sha1 = "0.10"
+sha2 = "0.10"
+winapi = { version = "0.3", features = ["psapi", "winuser", "shellapi", "processthreadsapi"] }
+# 文件日志：捕获 eframe/glow 初始化时的 log::error!/warn!（无 logger 时这些是 no-op，Win7 无反应无从诊断）
+log = "0.4"
+
+[build-dependencies]
+embed-resource = "2"
+
+# 测试读回 xlsx（zip 容器解析，仅 deflate）；版本与 rust_xlsxwriter 传递依赖一致
+[dev-dependencies]
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+
+# 本地 stub 替换 webbrowser，避免 url/idna/icu（edition2024）传递依赖
+[patch.crates-io]
+webbrowser = { path = "vendor/webbrowser" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

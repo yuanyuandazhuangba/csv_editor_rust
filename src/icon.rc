@@ -1,0 +1,28 @@
+// 图标资源
+IDI_ICON1 ICON "assets/csv_editor_icon.ico"
+
+// 版本信息
+1 VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+FILEOS          0x40004
+FILETYPE        0x1
+{
+  BLOCK "StringFileInfo"
+  {
+    BLOCK "080404b0"
+    {
+      VALUE "CompanyName", "SZJZ-王安工作室"
+      VALUE "FileDescription", "宿经03超大CSV文件实用编辑器 (Rust)"
+      VALUE "FileVersion", "1.0.0"
+      VALUE "InternalName", "csv_editor_rust"
+      VALUE "OriginalFilename", "CSV_Editor_Rust.exe"
+      VALUE "ProductName", "宿经03超大CSV文件实用编辑器"
+      VALUE "ProductVersion", "1.0.0"
+    }
+  }
+  BLOCK "VarFileInfo"
+  {
+    VALUE "Translation", 0x0804, 1200
+  }
+}

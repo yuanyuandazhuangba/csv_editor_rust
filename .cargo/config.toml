@@ -1,0 +1,12 @@
+# 项目级 Rust 配置
+#
+# 开发/测试链（本机）：stable 1.88 GNU，默认 x86_64-pc-windows-gnu，直接 cargo test/check。
+#
+# 发布链（Win7 单文件）：nightly + build-std + x86_64-win7-windows-gnu。
+# 构建参数通过 build_win7.bat 封装传递（见脚本），避免污染日常 cargo test：
+#   set RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=yes -C linker=rust-lld
+#   cargo +nightly-2025-06-23-x86_64-pc-windows-gnu build --release --target x86_64-win7-windows-gnu -Z build-std=std,panic_abort
+#
+# 背景：标准 Rust std 自 1.58+ 静态导入 Win8/Win10 API（api-ms-win-core-synch-l1-2-0、
+# bcryptprimitives 等），在 Win7 上无法加载；x86_64-win7-windows-gnu（Tier 3）目标 +
+# build-std 重编译 std 后，产物导入表仅含 Win7 内置 DLL（已实验验证）。

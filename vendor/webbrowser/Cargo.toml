@@ -1,0 +1,7 @@
+[package]
+name = "webbrowser"
+version = "0.8.99"
+edition = "2021"
+
+[dependencies]
+winapi = { version = "0.3", features = ["shellapi", "winuser"] }
