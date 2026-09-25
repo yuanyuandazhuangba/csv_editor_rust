@@ -5,10 +5,14 @@ use eframe::egui;
 use csv_editor_rust::core::column_ops::{HashAlgo, InsertPosition};
 use csv_editor_rust::core::export;
 use csv_editor_rust::core::filter::{FilterCondition, FilterOp, Logic};
+use csv_editor_rust::core::merge::{self, HeaderCheck};
 use csv_editor_rust::core::split::{self, OutputFormat, SplitOptions};
 
 use super::background::BgMsg;
 use super::{CsvEditorApp, DialogPosition};
+
+/// 内嵌的微信收款码（自愿捐助窗口用；单文件发布无法依赖外部图片）
+const WECHAT_QR_PNG: &[u8] = include_bytes!("../../assets/wechat_qr.png");
 
 /// 筛选操作符到下拉列表索引
 fn filter_op_idx(op: FilterOp) -> usize {
@@ -92,6 +96,15 @@ impl CsvEditorApp {
         let mut f = std::mem::take(&mut self.dialogs.export_data);
         self.dialog_export(ctx, &mut f);
         self.dialogs.export_data = f;
+        let mut f = std::mem::take(&mut self.dialogs.merge_window);
+        self.dialog_merge_files(ctx, &mut f);
+        self.dialogs.merge_window = f;
+        let mut f = std::mem::take(&mut self.dialogs.help_guide);
+        self.dialog_help_guide(ctx, &mut f);
+        self.dialogs.help_guide = f;
+        let mut f = std::mem::take(&mut self.dialogs.donate);
+        self.dialog_donate(ctx, &mut f);
+        self.dialogs.donate = f;
         // 数据行详情（双击单元格触发）
         let mut open = self.detail_row.is_some();
         self.dialog_row_detail(ctx, &mut open);
@@ -949,6 +962,332 @@ impl CsvEditorApp {
             });
         });
         *open = keep;
+    }
+
+    /// 多文件合并对话框：选择/追加文件 → 表头校验 → 合并为一个数据集
+    fn dialog_merge_files(&mut self, ctx: &egui::Context, open: &mut bool) {
+        let mut keep = *open;
+        let mut closed = false;
+        apply_dialog_pos(
+            egui::Window::new("合并多个CSV文件")
+                .open(&mut keep)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([760.0, 470.0]),
+            self.dialog_position,
+            ctx,
+        )
+        .show(ctx, |ui| {
+            ui.label("选择多个表头相同的 CSV 文件（可反复追加），校验表头后合并为一个数据集。");
+            ui.weak("合并结果会作为当前数据打开；需要留存时用「💾 导出数据」另存到指定位置。");
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                if ui.button("➕ 选择文件（可多选）").clicked() {
+                    self.pick_merge_files(false);
+                }
+                if ui.button("➕ 追加选择文件").clicked() {
+                    self.pick_merge_files(true);
+                }
+                let has_files = !self.dialogs.merge_files.is_empty();
+                if ui
+                    .add_enabled(has_files, egui::Button::new("🗑 清空列表"))
+                    .clicked()
+                {
+                    self.set_merge_files(Vec::new());
+                }
+                if self.dialogs.merge_scanning {
+                    ui.spinner();
+                    ui.weak("正在读取表头...");
+                }
+            });
+            ui.add_space(4.0);
+
+            // 待合并文件列表
+            let files = self.dialogs.merge_files.clone();
+            let headers = self.dialogs.merge_headers.clone();
+            let mut remove_idx: Option<usize> = None;
+            ui.group(|ui| {
+                ui.set_min_width(700.0);
+                egui::ScrollArea::vertical()
+                    .max_height(170.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if files.is_empty() {
+                            ui.weak("（尚未选择文件，请用上方按钮选择）");
+                        }
+                        for (i, f) in files.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                let short = std::path::Path::new(f)
+                                    .file_name()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| f.clone());
+                                let text = match headers.get(i) {
+                                    Some(h) => {
+                                        format!("{}. {}（{} 列）", i + 1, short, h.header.len())
+                                    }
+                                    None => format!("{}. {}", i + 1, short),
+                                };
+                                ui.label(text).on_hover_text(f.as_str());
+                                if ui.small_button("移除").clicked() {
+                                    remove_idx = Some(i);
+                                }
+                            });
+                        }
+                    });
+            });
+            if let Some(i) = remove_idx {
+                let mut remaining = files.clone();
+                remaining.remove(i);
+                self.set_merge_files(remaining);
+            }
+
+            ui.add_space(4.0);
+            // 表头校验结果（读取数据之前完成）
+            let hs: Vec<Vec<String>> = headers.iter().map(|h| h.header.clone()).collect();
+            match self.dialogs.merge_check {
+                Some(HeaderCheck::Identical) => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0, 120, 0),
+                        format!(
+                            "✓ 表头校验通过：{} 个文件表头完全一致（{} 列），可直接合并",
+                            files.len(),
+                            hs.first().map(|h| h.len()).unwrap_or(0)
+                        ),
+                    );
+                }
+                Some(HeaderCheck::Reordered) => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0, 120, 0),
+                        "✓ 表头校验通过：字段完全相同（仅列顺序不同），将按字段名对齐后合并",
+                    );
+                }
+                Some(HeaderCheck::Differ) => {
+                    let common = merge::common_fields(&hs);
+                    ui.colored_label(egui::Color32::from_rgb(190, 60, 60), "⚠ 表头不一致");
+                    if !self.dialogs.merge_diff.is_empty() {
+                        ui.label(format!(
+                            "差异字段（并非所有文件都有）：{}",
+                            self.dialogs.merge_diff.join("、")
+                        ));
+                    }
+                    if ui
+                        .checkbox(
+                            &mut self.dialogs.merge_keep_common,
+                            format!("只保留相同字段名的字段进行合并（共有 {} 列）", common.len()),
+                        )
+                        .changed()
+                    {
+                        // 选项变化只是重算显示，无需重新读表头
+                    }
+                    if common.is_empty() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(190, 60, 60),
+                            "所选文件没有任何共同字段，无法合并",
+                        );
+                    }
+                }
+                None => {
+                    if !files.is_empty() && !self.dialogs.merge_scanning {
+                        ui.weak("（表头校验未完成）");
+                    }
+                }
+            }
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let differ_blocked = matches!(self.dialogs.merge_check, Some(HeaderCheck::Differ))
+                    && !self.dialogs.merge_keep_common;
+                let can_merge = !files.is_empty() && !self.dialogs.merge_scanning && !differ_blocked;
+                if ui
+                    .add_enabled(can_merge, egui::Button::new("开始合并"))
+                    .clicked()
+                {
+                    self.run_merge();
+                }
+                if ui.button("取消").clicked() {
+                    closed = true;
+                }
+                if differ_blocked {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(190, 60, 60),
+                        "表头不一致：请勾选「只保留相同字段名」，或移除不一致的文件",
+                    );
+                }
+            });
+        });
+        if closed {
+            keep = false;
+        }
+        *open = keep;
+    }
+
+    /// 使用说明对话框：面向首次使用者，按使用顺序分节讲解
+    fn dialog_help_guide(&mut self, ctx: &egui::Context, open: &mut bool) {
+        let mut keep = *open;
+        let mut closed = false;
+        apply_dialog_pos(
+            egui::Window::new("使用说明")
+                .open(&mut keep)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([800.0, 580.0]),
+            self.dialog_position,
+            ctx,
+        )
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new("宿经03超大CSV文件实用编辑器 · 使用说明").heading());
+            ui.weak("专为超大 CSV 设计（实测 6.5GB / 901 万行流畅操作）。下面按使用顺序讲解，跟着做一遍就能上手。");
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.collapsing("一、三步上手", |ui| {
+                        ui.label("第 1 步：点工具栏「📂 选择CSV文件」选择一个 CSV（或 .txt）文件；");
+                        ui.label("第 2 步：打开后中间区域是数据预览，工具栏下方显示总行数/筛选后行数/列数/内存；");
+                        ui.label("第 3 步：需要保存时点「💾 导出数据」，选择 CSV 或 XLSX 格式与保存位置。");
+                        ui.weak("读取在后台线程进行，会弹出进度窗口；6.5GB 文件约 4 秒打开，内存占用约 150MB。");
+                    });
+                    ui.collapsing("二、打开文件：单个文件 / 多个文件合并", |ui| {
+                        ui.label("• 单个文件：工具栏「📂 选择CSV文件」，或菜单「文件 → 打开CSV文件」。");
+                        ui.label("• 多个同表头文件合并：工具栏「📚 选择多个CSV文件（合并）」，或菜单「文件 → 打开多个CSV文件（合并）」。");
+                        ui.label("    1) 弹窗中可一次性多选，也可反复点「追加选择文件」逐个添加；");
+                        ui.label("    2) 软件会先读取各文件表头并校验一致性（此时尚未读取数据行）；");
+                        ui.label("    3) 表头不一致时会列出差异字段，勾选「只保留相同字段名的字段」即按共同字段合并；");
+                        ui.label("    4) 合并完成后结果自动作为当前数据打开，可用「💾 导出数据」另存。");
+                        ui.weak("编码自动识别：BOM → 严格 UTF-8 → UTF-16 → GB18030，ANSI/GBK 中文文件与 UTF-16 都能正确打开。");
+                    });
+                    ui.collapsing("三、数据预览", |ui| {
+                        ui.label("• 表格只渲染屏幕内的行（虚拟化），900 万行滚动依然流畅；");
+                        ui.label("• 双击任意单元格，会弹出该行的「数据行详情」，逐列查看完整内容；");
+                        ui.label("• 顶部「刷新显示」可把视图滚回第一行。");
+                    });
+                    ui.collapsing("四、数据筛选", |ui| {
+                        ui.label("• 点工具栏「🔍 数据筛选」打开筛选窗口；");
+                        ui.label("• 每个条件选：字段 + 条件 + 值，条件共 10 种：等于/包含/不包含/大于/小于/大于等于/小于等于/不等于/空值/非空值；");
+                        ui.label("• 多个条件之间可选「且 / 或」组合，点「应用筛选」执行（超大文件为并行计算，秒级完成）；");
+                        ui.label("• 数值比较用高精度整数实现，19 位银行卡号不会因精度丢失而误判；");
+                        ui.label("• 点「清除筛选」恢复显示全部数据；工具栏的「🧹 清除筛选」按钮作用相同，不用打开窗口。");
+                    });
+                    ui.collapsing("五、数据拆分", |ui| {
+                        ui.label("• 菜单「数据处理 → 拆分数据…」或筛选后执行；");
+                        ui.label("• 按行数拆分：指定每批行数，生成 part_1、part_2…；");
+                        ui.label("• 按字段拆分：勾选 1~3 个字段，按字段取值分组，每组一个文件；");
+                        ui.label("• 输出格式可选 CSV 或 XLSX，保存文件夹自选；");
+                        ui.weak("按字段拆分对唯一值过多的字段（>20000）会拒绝，避免产生海量小文件；当前筛选结果会作为拆分范围。");
+                    });
+                    ui.collapsing("六、列操作（支持撤销/恢复）", |ui| {
+                        ui.label("菜单「数据处理 → 列操作」下：拆分字段、合并字段、生成行哈希（md5/sha1/sha256/sha512）、复制列、插入列、删除列、隐藏列、显示列；");
+                        ui.label("所有这些操作只记录“操作描述”，不会复制整表数据，对超大文件也是瞬时完成；");
+                        ui.label("菜单「编辑 → 撤销 / 恢复」（不可用时为灰色）可逐步回退或重做。");
+                    });
+                    ui.collapsing("七、导出数据", |ui| {
+                        ui.label("• 点「💾 导出数据」，选择 CSV 或 XLSX 与保存位置；导出范围是当前筛选结果（未筛选则全部）；");
+                        ui.label("• XLSX 为全文本导出：卡号、账号、长数字、前导零都不会变成科学计数法或丢精度（代价是在 Excel 中不参与自动求和）；");
+                        ui.label("• 超过 Excel 单表 1,048,576 行会自动分多个工作表；");
+                        ui.label("• CSV 输出带 BOM（utf-8-sig），用 Excel 打开中文不乱码。");
+                    });
+                    ui.collapsing("八、界面缩放（按钮大小）", |ui| {
+                        ui.label("• 工具栏最右侧有「按钮大小」输入框，范围 1.0 ~ 1.5 倍，默认 1.0；");
+                        ui.label("• 输入或拖动数值即可把菜单、菜单命令、工具栏按钮、表格文字整体等比放大，方便视力不佳的用户；");
+                        ui.weak("设置会被记住，下次启动仍然生效。");
+                    });
+                    ui.collapsing("九、常见问题", |ui| {
+                        ui.label("• 打开很慢或卡住？ 读文件在后台进行，请看进度窗口与右下「操作日志」面板；");
+                        ui.label("• 中文显示乱码？ 编码由软件自动识别；若结果异常，请在日志中确认识别到的编码；");
+                        ui.label("• 中文输入只出现第一个字？ 该问题已在当前版本修复（若仍出现请反馈输入法名称）；");
+                        ui.label("• 拆分产生文件太多？ 改用「按行数拆分」，或先筛选缩小数据范围；");
+                        ui.label("• 程序启动无反应？ 请查看 exe 同目录的 csv_editor_rust.log（记录启动诊断信息）。");
+                    });
+                    ui.collapsing("十、支持开发者", |ui| {
+                        ui.label("工具栏「❤ 自愿捐助」按钮中有微信收款码，感谢您的支持。");
+                    });
+                });
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("知道了").clicked() {
+                    closed = true;
+                }
+            });
+        });
+        if closed {
+            keep = false;
+        }
+        *open = keep;
+    }
+
+    /// 自愿捐助对话框（内嵌微信收款码）
+    fn dialog_donate(&mut self, ctx: &egui::Context, open: &mut bool) {
+        let mut keep = *open;
+        let mut closed = false;
+        apply_dialog_pos(
+            egui::Window::new("捐助")
+                .open(&mut keep)
+                .collapsible(false)
+                .resizable(false),
+            self.dialog_position,
+            ctx,
+        )
+        .show(ctx, |ui| {
+            ui.set_min_width(360.0);
+            ui.label("如果您愿意捐助钱款帮助开发者改进产品请微信扫码，万分感谢！");
+            ui.add_space(6.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("捐助").size(26.0));
+                ui.add_space(4.0);
+                if let Some(tex) = self.qr_texture(ctx) {
+                    let sz = tex.size_vec2();
+                    let w = 300.0;
+                    let h = if sz.x > 0.0 { w * (sz.y / sz.x) } else { w };
+                    ui.add(egui::Image::from_texture(&tex).fit_to_exact_size(egui::vec2(w, h)));
+                } else {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(190, 60, 60),
+                        "收款码图片加载失败（详见日志）",
+                    );
+                }
+            });
+            ui.add_space(8.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("开发人员：周玉明");
+                ui.add_space(20.0);
+                ui.label("邮箱：443149727@qq.com");
+            });
+            ui.label("王安工作室");
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("关闭").clicked() {
+                    closed = true;
+                }
+            });
+        });
+        if closed {
+            keep = false;
+        }
+        *open = keep;
+    }
+
+    /// 懒加载微信收款码纹理（只解码一次，之后复用）
+    fn qr_texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+        if self.qr_texture.is_none() {
+            match image::load_from_memory(WECHAT_QR_PNG) {
+                Ok(img) => {
+                    let rgba = img.to_rgba8();
+                    let (w, h) = rgba.dimensions();
+                    let color = egui::ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        rgba.as_raw(),
+                    );
+                    self.qr_texture =
+                        Some(ctx.load_texture("wechat_qr", color, egui::TextureOptions::LINEAR));
+                }
+                Err(e) => {
+                    self.log(&format!("收款码图片解码失败：{}", e));
+                }
+            }
+        }
+        self.qr_texture.clone()
     }
 
     /// 导出当前视图（后台线程）

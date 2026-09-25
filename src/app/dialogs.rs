@@ -1,5 +1,7 @@
 //! 对话框状态（egui 即时模式：以布尔标志控制对话框显示）。
 
+use csv_editor_rust::core::merge::{FileHeader, HeaderCheck};
+
 /// 各操作对话框的显示标志与输入状态
 #[derive(Default)]
 pub struct DialogStates {
@@ -14,6 +16,23 @@ pub struct DialogStates {
     pub show_column: bool,
     // 关于
     pub about: bool,
+    // 帮助 / 捐助
+    pub help_guide: bool,
+    pub donate: bool,
+    // 多文件合并
+    pub merge_window: bool,
+    /// 已选文件路径（可追加选择）
+    pub merge_files: Vec<String>,
+    /// 表头校验信息（与 merge_files 一一对应；空 = 尚未读取）
+    pub merge_headers: Vec<FileHeader>,
+    /// 表头一致性判定（None = 尚未校验）
+    pub merge_check: Option<HeaderCheck>,
+    /// 差异字段名（表头不一致时用于提示）
+    pub merge_diff: Vec<String>,
+    /// 是否正在后台读取表头
+    pub merge_scanning: bool,
+    /// 表头不一致时：只保留相同字段名（交集）
+    pub merge_keep_common: bool,
     // 筛选/拆分/文件信息 弹出窗口
     pub filter_window: bool,
     pub split_window: bool,

@@ -6,6 +6,7 @@ pub mod encoding;
 pub mod export;
 pub mod filter;
 pub mod hash;
+pub mod merge;
 pub mod model;
 pub mod reader;
 pub mod split;

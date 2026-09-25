@@ -2,6 +2,9 @@
 
 use eframe::egui;
 
+use csv_editor_rust::core::merge::{self, HeaderCheck, MergeMode};
+
+use super::background::{BgMsg, Worker};
 use super::{CsvEditorApp, DialogPosition};
 
 impl CsvEditorApp {
@@ -15,9 +18,7 @@ impl CsvEditorApp {
                         ui.close_menu();
                     }
                     if ui.button("打开多个CSV文件（合并）").clicked() {
-                        self.log(
-                            "多文件合并尚未实现：可先按字段/行数拆分，或分别打开后用「导出数据」汇总",
-                        );
+                        self.pick_merge_files(false);
                         ui.close_menu();
                     }
                     if ui.button("导出数据").clicked() {
@@ -160,6 +161,11 @@ impl CsvEditorApp {
                     });
                 });
                 ui.menu_button("帮助", |ui| {
+                    if ui.button("使用说明").clicked() {
+                        self.dialogs.help_guide = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("关于").clicked() {
                         self.dialogs.about = true;
                         ui.close_menu();
@@ -173,35 +179,84 @@ impl CsvEditorApp {
     pub fn controls_panel(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                // 文件操作
-                if ui.button("📂 选择CSV文件").clicked() {
-                    self.pick_and_open_file();
-                }
-                if ui.button("💾 导出数据").clicked() {
-                    if self.model.is_some() {
-                        self.dialogs.export_data = true;
-                    } else {
-                        self.log("请先加载数据");
+            // 工具栏按钮较多，界面放大到 1.5 倍时可能超出窗口宽度：
+            // 用横向滚动区域包住——未溢出时右侧组仍贴最右，溢出时可横向滚动访问。
+            let avail_width = ui.available_width();
+            egui::ScrollArea::horizontal()
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.set_min_width(avail_width);
+                    ui.horizontal(|ui| {
+                    // 文件操作
+                    if ui.button("📂 选择CSV文件").clicked() {
+                        self.pick_and_open_file();
                     }
-                }
-                if ui.button("🧪 加载示例数据").clicked() {
-                    self.load_sample_data();
-                }
-                if ui.button("🗑 清空数据").clicked() {
-                    self.clear_data();
-                }
-                if ui.button("🔍 数据筛选").clicked() {
-                    self.dialogs.filter_window = true;
-                }
-                ui.separator();
-                if ui.button("刷新显示").clicked() {
-                    self.refresh_view();
-                }
-                if ui.button("日志").clicked() {
-                    self.show_log = !self.show_log;
-                }
-            });
+                    if ui
+                        .button("📚 选择多个CSV文件（合并）")
+                        .on_hover_text("一次性选择或追加多个同表头 CSV，先校验表头再合并为一个数据集")
+                        .clicked()
+                    {
+                        self.pick_merge_files(false);
+                    }
+                    if ui.button("💾 导出数据").clicked() {
+                        if self.model.is_some() {
+                            self.dialogs.export_data = true;
+                        } else {
+                            self.log("请先加载数据");
+                        }
+                    }
+                    if ui.button("🧪 加载示例数据").clicked() {
+                        self.load_sample_data();
+                    }
+                    if ui.button("🗑 清空数据").clicked() {
+                        self.clear_data();
+                    }
+                    if ui.button("🔍 数据筛选").clicked() {
+                        self.dialogs.filter_window = true;
+                    }
+                    if ui
+                        .button("🧹 清除筛选")
+                        .on_hover_text("清除全部筛选条件并显示完整数据（等同筛选窗口中的「清除筛选」）")
+                        .clicked()
+                    {
+                        self.clear_filters();
+                    }
+                    ui.separator();
+                    if ui.button("刷新显示").clicked() {
+                        self.refresh_view();
+                    }
+                    if ui.button("日志").clicked() {
+                        self.show_log = !self.show_log;
+                    }
+                    // 工具栏最右侧：自愿捐助 + 按钮大小（等比缩放，右对齐）
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // right_to_left 下先添加的靠右，故先放数值框 → 再“倍” → 再“按钮大小”，
+                        // 视觉顺序即「按钮大小 [1.0] 倍」
+                        let mut zoom = ui.ctx().zoom_factor();
+                        let resp = ui.add(
+                            egui::DragValue::new(&mut zoom)
+                                .clamp_range(1.0f32..=1.5f32)
+                                .speed(0.01)
+                                .fixed_decimals(1),
+                        );
+                        if resp.changed() {
+                            let z = zoom.clamp(1.0, 1.5);
+                            ui.ctx().set_zoom_factor(z);
+                            self.log(&format!("按钮大小：{:.1} 倍（界面等比缩放）", z));
+                        }
+                        ui.label("倍");
+                        ui.label("按钮大小");
+                        ui.separator();
+                        if ui
+                            .button("❤ 自愿捐助")
+                            .on_hover_text("扫码支持开发者，万分感谢")
+                            .clicked()
+                        {
+                            self.dialogs.donate = true;
+                        }
+                    });
+                    });
+                });
             ui.add_space(2.0);
             // 统计信息
             ui.horizontal(|ui| {
@@ -387,6 +442,134 @@ impl CsvEditorApp {
             Ok(()) => self.log("恢复操作"),
             Err(e) => self.log(&e),
         }
+    }
+
+    /// 清除筛选（与筛选窗口中的「清除筛选」等价）：清空条件并回到完整数据视图
+    pub fn clear_filters(&mut self) {
+        if self.filter_conditions.is_empty() && self.filtered_rows.is_none() {
+            self.log("当前没有筛选条件");
+            return;
+        }
+        self.filter_conditions.clear();
+        self.filtered_rows = None;
+        self.log("已清除所有筛选条件，显示完整数据");
+    }
+
+    /// 选择多个 CSV 文件（合并）：`append=false` 重新选择，`true` 追加选择
+    pub fn pick_merge_files(&mut self, append: bool) {
+        let picked = rfd::FileDialog::new()
+            .add_filter("CSV 文件", &["csv", "txt"])
+            .add_filter("所有文件", &["*"])
+            .pick_files();
+        let Some(paths) = picked else { return };
+        if !append {
+            self.dialogs.merge_files.clear();
+        }
+        let mut added = 0usize;
+        for p in paths {
+            let s = p.to_string_lossy().into_owned();
+            if !self.dialogs.merge_files.contains(&s) {
+                self.dialogs.merge_files.push(s);
+                added += 1;
+            }
+        }
+        self.log(&format!(
+            "已选择 {} 个待合并文件（本次新增 {} 个）",
+            self.dialogs.merge_files.len(),
+            added
+        ));
+        self.dialogs.merge_window = true;
+        self.scan_merge_headers();
+    }
+
+    /// 后台读取各文件表头并校验一致性（**读取数据之前**完成校验）
+    pub fn scan_merge_headers(&mut self) {
+        let files = self.dialogs.merge_files.clone();
+        if files.is_empty() {
+            self.dialogs.merge_headers.clear();
+            self.dialogs.merge_check = None;
+            self.dialogs.merge_diff.clear();
+            self.dialogs.merge_scanning = false;
+            return;
+        }
+        self.dialogs.merge_scanning = true;
+        let tx = self.tx.clone();
+        self.worker = Some(Worker::spawn(tx.clone(), move |_ctl| {
+            let mut headers = Vec::with_capacity(files.len());
+            for f in &files {
+                match merge::read_file_header(f) {
+                    Ok(h) => headers.push(h),
+                    Err(e) => {
+                        let _ = tx.send(BgMsg::Error(format!("读取表头失败：{}", e)));
+                        return;
+                    }
+                }
+            }
+            let hs: Vec<Vec<String>> = headers.iter().map(|h| h.header.clone()).collect();
+            let check = merge::check_headers(&hs);
+            let diff = merge::exclusive_fields(&hs);
+            let _ = tx.send(BgMsg::MergeHeaders(headers, check, diff));
+        }));
+    }
+
+    /// 更新待合并文件列表（移除某项后重新校验表头）
+    pub fn set_merge_files(&mut self, keep: Vec<String>) {
+        self.dialogs.merge_files = keep;
+        self.dialogs.merge_keep_common = false;
+        self.scan_merge_headers();
+    }
+
+    /// 执行合并（后台）：结果写入临时文件，完成后自动作为当前数据打开
+    pub fn run_merge(&mut self) {
+        if self.busy.is_some() {
+            self.log("已有任务在执行，请稍候");
+            return;
+        }
+        let files = self.dialogs.merge_files.clone();
+        if files.is_empty() {
+            self.log("请先选择要合并的 CSV 文件");
+            return;
+        }
+        let mode = match self.dialogs.merge_check {
+            Some(HeaderCheck::Differ) => {
+                if self.dialogs.merge_keep_common {
+                    MergeMode::KeepCommonFields
+                } else {
+                    self.log("表头不一致：请勾选「只保留相同字段名」，或移除不一致的文件后再合并");
+                    return;
+                }
+            }
+            _ => MergeMode::RequireIdentical,
+        };
+        // 输出到临时目录：合并结果随后按普通单文件打开，需要留存时用「导出数据」另存
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let out_path = std::env::temp_dir()
+            .join(format!("csv_merged_{}_{}.csv", std::process::id(), ts))
+            .to_string_lossy()
+            .into_owned();
+        self.log(&format!(
+            "开始合并 {} 个文件（{}）...",
+            files.len(),
+            mode.label()
+        ));
+        let tx = self.tx.clone();
+        self.worker = Some(Worker::spawn(tx.clone(), move |ctl| {
+            let result = merge::merge_to_file(&files, mode, &out_path, Some(&|p| {
+                ctl.report_progress(p as f32, "正在合并文件...")
+            }));
+            match result {
+                Ok(rep) => {
+                    let _ = tx.send(BgMsg::Merged(rep));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::Error(format!("合并失败：{}", e)));
+                }
+            }
+        }));
+        self.set_busy("合并CSV文件", "正在合并...", 0.0);
     }
 
     /// 刷新预览视图：滚动回首行（表格内容本身每帧重渲染）

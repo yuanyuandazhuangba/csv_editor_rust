@@ -151,8 +151,8 @@
     <p>软件打开后主要分为以下几个区域：</p>
     <table>
       <tr><th style="width:160px;">区域</th><th>作用</th></tr>
-      <tr><td><b>顶部菜单栏</b></td><td>文件、编辑、视图、工具、数据处理、设置、帮助，几乎所有功能都能在菜单里找到。</td></tr>
-      <tr><td><b>顶部工具栏</b></td><td>常用的一键按钮：打开文件、导出数据、加载示例、清空数据、数据筛选。</td></tr>
+      <tr><td><b>顶部菜单栏</b></td><td>文件、编辑、视图、工具、数据处理、设置、帮助，几乎所有功能都能在菜单里找到（<b>帮助 → 使用说明</b> 可随时打开详细说明书）。</td></tr>
+      <tr><td><b>顶部工具栏</b></td><td>常用的一键按钮：打开文件、多文件合并、导出数据、加载示例、清空数据、数据筛选、清除筛选、刷新显示、日志；最右侧是 <b>❤ 自愿捐助</b> 与 <b>按钮大小</b>（界面等比放大倍数）。</td></tr>
       <tr><td><b>中部数据预览</b></td><td>展示表格内容，像网页一样流畅滚动查看上百 / 上千 / 上万行。<b>双击某个单元格</b>可查看这一行的完整数据。</td></tr>
       <tr><td><b>右侧日志面板</b></td><td>记录每一步操作的提示和结果，可清空、复制或导出成文本。</td></tr>
       <tr><td><b>进度小窗口</b></td><td>处理大文件时显示进度条和百分比，可拖动位置。</td></tr>
@@ -172,16 +172,29 @@
     <div class="step"><div class="step-num">3</div><div>等待几秒，自动识别文件编码并建立索引，随后表格内容出现在预览区。</div></div>
     <div class="note">如果你只是想先体验一下功能，可以点击 <span class="menu-path">🧪 加载示例数据</span>，软件会生成一份 1000 行的示例数据。</div>
 
-    <h3>2. 浏览数据</h3>
+    <h3>2. 一次打开多个 CSV 并合并</h3>
+    <p>同一类数据如果分散在多个 CSV 里（例如按月导出的交易明细），可以合并成一个数据集，再统一筛选、拆分、导出。</p>
+    <div class="step"><div class="step-num">1</div><div>点工具栏 <span class="menu-path">📚 选择多个CSV文件（合并）</span>，或菜单 <span class="menu-path">文件 → 打开多个CSV文件（合并）</span>。</div></div>
+    <div class="step"><div class="step-num">2</div><div>在系统窗口中<b>一次选中多个文件</b>；也可在弹出窗口点 <span class="menu-path">➕ 追加选择文件</span> 继续添加，列表里能逐项「移除」或「清空列表」。</div></div>
+    <div class="step"><div class="step-num">3</div><div>软件会<b>先读取各文件表头并校验是否一致</b>（此时尚未读取数据，速度很快）：</div></div>
+    <ul>
+      <li><b>表头完全一致</b> → 可以直接合并；</li>
+      <li><b>字段相同、只是列顺序不同</b> → 自动按字段名对齐后合并；</li>
+      <li><b>表头不一致</b> → 会列出差异字段，勾选 <span class="menu-path">只保留相同字段名的字段进行合并</span>，即按各文件共有的字段合并。</li>
+    </ul>
+    <div class="step"><div class="step-num">4</div><div>点 <span class="menu-path">开始合并</span>；完成后结果自动作为当前数据打开，需要留存时用 <span class="menu-path">💾 导出数据</span> 另存到指定位置。</div></div>
+    <div class="note">合并只是把各文件的行依次接在一起，<b>不会改动你的原始文件</b>；列按<b>字段名</b>对齐，所以各文件列顺序不同也没关系。</div>
+
+    <h3>3. 浏览数据</h3>
     <p>表格默认显示前 100 行。你可以在预览区拖动滚动条查看更多；<b>双击任意单元格</b>会弹出一个窗口，展示这一行的全部列-值对照，方便核对长文本或号码。</p>
 
-    <h3>3. 筛选想要的数据</h3>
+    <h3>4. 筛选想要的数据</h3>
     <p>想只看到某类数据（如“某账号的交易记录”或“金额大于 100 的行”），用筛选功能。</p>
     <div class="step"><div class="step-num">1</div><div>点击 <span class="menu-path">🔍 数据筛选</span> 打开筛选窗口。</div></div>
     <div class="step"><div class="step-num">2</div><div>点击 <span class="menu-path">+ 添加条件</span>，依次选择：<b>字段</b>（哪一列）、<b>条件</b>（等于/包含/大于…）、<b>值</b>。</div></div>
     <div class="step"><div class="step-num">3</div><div>加多条条件时，用 <b>且 / 或</b> 决定它们的关系。可点 ↑ / ↓ 调整顺序，× 删除某条。</div></div>
     <div class="step"><div class="step-num">4</div><div>点击 <span class="menu-path">应用筛选</span>，预览区只剩命中的行；顶部信息栏显示“筛选后”行数。</div></div>
-    <div class="step"><div class="step-num">5</div><div>想恢复全部数据，点 <span class="menu-path">清除筛选</span>。</div></div>
+    <div class="step"><div class="step-num">5</div><div>想恢复全部数据，点筛选窗口里的 <span class="menu-path">清除筛选</span>；工具栏上也有 <span class="menu-path">🧹 清除筛选</span> 按钮，不用打开窗口即可一键恢复。</div></div>
     <table>
       <tr><th>条件</th><th>含义举例</th></tr>
       <tr><td>等于 / 不等于</td><td>字段值精确等于 / 不等于某个值</td></tr>
@@ -190,7 +203,7 @@
       <tr><td>空值 / 非空值</td><td>该字段是否为空白</td></tr>
     </table>
 
-    <h3>4. 把大表拆成多个小文件</h3>
+    <h3>5. 把大表拆成多个小文件</h3>
     <p>通过 <span class="menu-path">数据处理 → 拆分数据…</span>，有两种拆法：</p>
     <ul>
       <li><b>按行数拆分</b>：每隔多少行生成一个文件（如每 10 万行一个）。</li>
@@ -198,7 +211,7 @@
     </ul>
     <p>再选好输出格式（CSV / XLSX）和保存的文件夹，点 <span class="menu-path">执行拆分</span> 即可。</p>
 
-    <h3>5. 对列做加工</h3>
+    <h3>6. 对列做加工</h3>
     <p>通过 <span class="menu-path">数据处理 → 列操作</span>，可以：</p>
     <table>
       <tr><th style="width:130px;">操作</th><th>说明</th></tr>
@@ -210,11 +223,18 @@
     </table>
     <div class="note">列操作后，可在 <span class="menu-path">编辑 → 撤销 / 恢复</span> 或 <span class="menu-path">数据处理 → 撤销 / 恢复</span> 里反悔，多步都能退回。</div>
 
-    <h3>6. 导出结果</h3>
+    <h3>7. 导出结果</h3>
     <div class="step"><div class="step-num">1</div><div>先筛选出你想要的数据（不筛选就是导出全部）。</div></div>
     <div class="step"><div class="step-num">2</div><div>点 <span class="menu-path">💾 导出数据</span>，选择 CSV 或 XLSX 格式。</div></div>
     <div class="step"><div class="step-num">3</div><div>选择保存位置，软件在后台写出，并显示进度。</div></div>
     <div class="ok"><b>导出小知识：</b>CSV 会带 BOM，用 Excel 打开中文不乱码；XLSX 全部按文本保存（卡号、账号、长数字、前导零都不会变成科学计数法或丢失精度，但 Excel 中不参与自动求和等计算）；超大结果会自动分成多个工作表。</div>
+
+    <h3>8. 界面缩放、使用说明与捐助</h3>
+    <ul>
+      <li><b>按钮大小（界面缩放）</b>：工具栏最右侧的 <span class="menu-path">按钮大小</span> 输入框可填 <b>1.0 ~ 1.5</b> 倍（默认 1.0）。菜单、菜单命令、工具栏按钮、表格文字会<b>整体等比放大</b>，方便视力不佳的老年用户；设置会被记住，下次打开依然生效。</li>
+      <li><b>使用说明</b>：菜单 <span class="menu-path">帮助 → 使用说明</span> 可随时打开详细的图文说明书（按使用顺序分节讲解，首次使用跟着走一遍即可上手）。</li>
+      <li><b>自愿捐助</b>：工具栏最右侧的 <span class="menu-path">❤ 自愿捐助</span> 按钮内是开发者的微信收款码，感谢您的支持。</li>
+    </ul>
   </div>
 
   <!-- 四、常见疑问 -->

@@ -3,6 +3,7 @@
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 
+use csv_editor_rust::core::merge::{FileHeader, HeaderCheck, MergeReport};
 use csv_editor_rust::core::model::DataModel;
 
 /// 后台 → UI 消息
@@ -17,6 +18,10 @@ pub enum BgMsg {
     SplitDone(usize),
     /// 导出完成（行数, 路径）
     ExportDone(usize, String),
+    /// 多文件表头读取完成（表头列表, 一致性判定, 差异字段）
+    MergeHeaders(Vec<FileHeader>, HeaderCheck, Vec<String>),
+    /// 多文件合并完成
+    Merged(MergeReport),
     /// 错误
     Error(String),
 }

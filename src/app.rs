@@ -55,6 +55,10 @@ pub struct CsvEditorApp {
     detail_row: Option<usize>,
     // 进程峰值内存
     peak_memory_mb: f64,
+    // 微信收款码纹理（首次打开捐助窗口时解码一次并缓存）
+    qr_texture: Option<egui::TextureHandle>,
+    // 上一次合并输出的临时文件（下次合并前清理，避免临时目录堆积）
+    merged_temp: Option<String>,
 }
 
 /// 弹出窗口位置（数据预览区右侧靠上为默认）
@@ -119,6 +123,8 @@ impl CsvEditorApp {
             preview: PreviewTable::new(),
             detail_row: None,
             peak_memory_mb: 0.0,
+            qr_texture: None,
+            merged_temp: None,
         }
     }
 
@@ -231,6 +237,49 @@ impl CsvEditorApp {
                 BgMsg::ExportDone(n, path) => {
                     self.busy = None;
                     self.log(&format!("导出完成: {} 行 -> {}", n, path));
+                }
+                BgMsg::MergeHeaders(headers, check, diff) => {
+                    self.busy = None;
+                    self.dialogs.merge_scanning = false;
+                    self.log(&format!(
+                        "多文件表头校验：{}（差异字段：{}）",
+                        check.label(),
+                        if diff.is_empty() {
+                            "无".to_string()
+                        } else {
+                            diff.join("、")
+                        }
+                    ));
+                    self.dialogs.merge_headers = headers;
+                    self.dialogs.merge_check = Some(check);
+                    self.dialogs.merge_diff = diff;
+                    // 表头有差异时，默认勾选“只保留相同字段名”，让用户一眼看到可用方案
+                    if check == csv_editor_rust::core::merge::HeaderCheck::Differ {
+                        self.dialogs.merge_keep_common = true;
+                    }
+                }
+                BgMsg::Merged(report) => {
+                    self.busy = None;
+                    self.log(&format!(
+                        "多文件合并完成：{} 个文件 → {} 行 × {} 列（{}）",
+                        report.files,
+                        report.rows,
+                        report.columns,
+                        report.mode.label()
+                    ));
+                    // 清理上一次的临时文件（避免临时目录堆积）
+                    if let Some(old) = self.merged_temp.take() {
+                        if old != report.out_path {
+                            let _ = std::fs::remove_file(&old);
+                        }
+                    }
+                    let path = report.out_path.clone();
+                    self.merged_temp = Some(path.clone());
+                    self.dialogs.merge_window = false;
+                    self.dialogs.merge_files.clear();
+                    self.dialogs.merge_headers.clear();
+                    // 合并结果作为当前数据打开（复用既有加载流程）
+                    self.open_file(path);
                 }
                 BgMsg::Error(e) => {
                     self.busy = None;
