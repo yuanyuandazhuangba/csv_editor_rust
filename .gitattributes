@@ -1,0 +1,25 @@
+# 换行策略：显式固化，消除 autocrlf 带来的 CRLF/LF 歧义
+#
+# 1) 源码 / 文档 / 配置：仓库与工作区一律 LF（跨平台一致，diff 稳定）
+* text=auto eol=lf
+
+# 2) Windows 专用脚本：检出为 CRLF（cmd.exe 惯例，标签跳转最稳妥）
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 3) 测试数据与产物：保持原始字节，不做任何换行转换（-eol 显式关闭行尾约定，
+#    避免 check-attr 仍显示 eol 值造成误读）
+#    含真实银行 CSV 样本（原始 CRLF）与程序写出结果（CsvWriter 按 \r\n 输出），
+#    改写字节会使“测试数据”与“运行时输出”不一致，故一律保真。
+testdata/** -text -eol
+
+# 4) 二进制资源：禁止换行转换、行尾约定与文本合并
+*.ico binary -eol
+*.png binary -eol
+*.jpg binary -eol
+*.jpeg binary -eol
+*.gif binary -eol
+*.xlsx binary -eol
+*.exe binary -eol
+*.dll binary -eol
+*.zip binary -eol
