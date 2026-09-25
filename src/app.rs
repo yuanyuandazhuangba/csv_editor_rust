@@ -337,9 +337,61 @@ pub fn install_fonts(ctx: &egui::Context) {
     });
 }
 
+// ==================== IME 修补（中文输入）====================
+
+/// 修补 egui 0.27 的 IME 提交缺陷（Windows 中文输入只出第一个字）。
+///
+/// 现象：筛选条件等输入框里输入中文，只有第一个字（词）能上屏，之后的字词
+/// 输入后不显示；字母、数字、符号一切正常（它们走 `Event::Text`，不经过 IME）。
+///
+/// 根因（已在 headless 测试中复现）：egui 0.27.2 的 `TextEdit` 处理
+/// `Event::CompositionEnd(prediction)` 时，要求当前光标与 `state.ime_cursor_range`
+/// 的 `secondary` 端一致才插入文本；而 `ime_cursor_range` **只在
+/// `Event::CompositionUpdate` 中更新**。Windows 输入法连续上屏时，winit 会发出
+/// 没有 preedit 的 `Ime::Commit`，egui-winit 于是只推送一个 `CompositionEnd`——
+/// 此时 `ime_cursor_range` 仍是上一次的值，与当前光标不符，提交被静默丢弃，
+/// 于是“只有第一个字能输入”。
+///
+/// 修补：对每个“前面没有 `CompositionUpdate` 的 `CompositionEnd`”，先补发
+/// `CompositionStart` + 一个**空的** `CompositionUpdate`。空 preedit 不插入任何字符，
+/// 只让 egui 把 `ime_cursor_range` 同步到当前光标，随后该次提交即可正常落字。
+pub fn patch_ime_events(events: &mut Vec<egui::Event>) {
+    if !events
+        .iter()
+        .any(|e| matches!(e, egui::Event::CompositionEnd(_)))
+    {
+        return; // 绝大多数帧不含 IME 提交，直接返回
+    }
+    let mut out: Vec<egui::Event> = Vec::with_capacity(events.len() + 4);
+    let mut saw_composition_update = false;
+    for ev in events.drain(..) {
+        match ev {
+            egui::Event::CompositionUpdate(_) => {
+                saw_composition_update = true;
+                out.push(ev);
+            }
+            egui::Event::CompositionEnd(_) => {
+                if !saw_composition_update {
+                    out.push(egui::Event::CompositionStart);
+                    out.push(egui::Event::CompositionUpdate(String::new()));
+                }
+                saw_composition_update = false;
+                out.push(ev);
+            }
+            other => out.push(other),
+        }
+    }
+    *events = out;
+}
+
 // ==================== eframe::App 实现 ====================
 
 impl eframe::App for CsvEditorApp {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // 在 egui 处理输入前修补 IME 事件序列（见 patch_ime_events）
+        patch_ime_events(&mut raw_input.events);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_messages();
         self.peak_memory_mb = peak_working_set_mb();
@@ -353,5 +405,109 @@ impl eframe::App for CsvEditorApp {
         self.progress_window(ctx);
         self.show_dialogs(ctx);
         self.request_repaint_if_busy(ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{pos2, vec2, Event, Rect};
+
+    /// 用 headless egui 模拟一串 IME 事件，返回 TextEdit 最终内容。
+    /// `patched=true` 时先经过 `patch_ime_events`（等价于 app 的 raw_input_hook）。
+    fn type_ime_events(patched: bool, per_frame: &[Vec<Event>]) -> String {
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        let step = |mut events: Vec<Event>, text: &mut String| {
+            if patched {
+                patch_ime_events(&mut events);
+            }
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 400.0)));
+            input.time = Some(1.0);
+            input.events = events;
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let resp = ui.add(egui::TextEdit::singleline(text));
+                    if !resp.has_focus() {
+                        resp.request_focus();
+                    }
+                });
+            });
+        };
+        step(Vec::new(), &mut text); // 先聚焦
+        for events in per_frame {
+            step(events.clone(), &mut text);
+        }
+        text
+    }
+
+    fn upd(s: &str) -> Event {
+        Event::CompositionUpdate(s.to_string())
+    }
+    fn end(s: &str) -> Event {
+        Event::CompositionEnd(s.to_string())
+    }
+
+    #[test]
+    fn ime_bug_is_real_without_patch() {
+        // 记录上游缺陷：无 preedit 的连续 commit 只会保留第一个字（修补前）
+        let case = vec![vec![end("北")], vec![end("京")]];
+        assert_eq!(type_ime_events(false, &case), "北");
+    }
+
+    #[test]
+    fn ime_patch_restores_consecutive_commits() {
+        // 回归：修补后，连续上屏（无 preedit 的 commit）应完整落字
+        let cases: Vec<(Vec<Vec<Event>>, &str)> = vec![
+            // 每帧一次 commit（最常见：连续输入单字）
+            (vec![vec![end("北")], vec![end("京")]], "北京"),
+            // 同帧多次 commit（连续选词）
+            (vec![vec![end("北"), end("京"), end("市")]], "北京市"),
+            // 带 preedit 的常规两轮输入
+            (
+                vec![
+                    vec![Event::CompositionStart, upd("bei")],
+                    vec![end("北")],
+                    vec![Event::CompositionStart, upd("jing")],
+                    vec![end("京")],
+                ],
+                "北京",
+            ),
+            // 同一帧内 preedit 与 commit 混合
+            (
+                vec![
+                    vec![Event::CompositionStart, upd("bei"), end("北")],
+                    vec![end("京")],
+                ],
+                "北京",
+            ),
+        ];
+        for (case, expect) in cases {
+            assert_eq!(
+                type_ime_events(true, &case),
+                expect,
+                "修补后应得到 {expect:?}，事件序列 {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ime_patch_keeps_normal_preedit_and_text_events() {
+        // 正常 preedit 一次成词不受影响
+        let case = vec![vec![Event::CompositionStart, upd("beijing"), end("北京")]];
+        assert_eq!(type_ime_events(true, &case), "北京");
+        // 字母/数字等非 IME 输入不受影响
+        let case = vec![vec![Event::Text("a".into()), Event::Text("1".into())]];
+        assert_eq!(type_ime_events(true, &case), "a1");
+    }
+
+    #[test]
+    fn patch_leaves_event_stream_untouched_without_commit() {
+        // 不含 CompositionEnd 时不应改动事件列表（零开销路径）
+        let mut events = vec![Event::Text("x".into()), Event::CompositionUpdate("y".into())];
+        let before = events.len();
+        patch_ime_events(&mut events);
+        assert_eq!(events.len(), before);
     }
 }
