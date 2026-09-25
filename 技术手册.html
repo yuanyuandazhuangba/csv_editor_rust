@@ -117,7 +117,7 @@
   <!-- 一、项目概览 -->
   <div class="card">
     <h2>一、项目概览</h2>
-    <p>原 Python/PyQt6 工具（<code>1.3_nodask.py</code>，4227 行）的 Rust 重构，专注超大 CSV 文件的读取、预览、筛选、拆分、列操作、哈希与导出。实测可处理 <b>6.5GB / 901 万行 / 55 列</b> 的数据，打开约 4 秒、峰值内存约 148MB，最终产物为<b>兼容 Windows 7 的单文件 exe</b>（约 6.5MB，无外部 DLL 依赖）。</p>
+    <p>原 Python/PyQt6 工具（<code>1.3_nodask.py</code>，4227 行）的 Rust 重构，专注超大 CSV 文件的读取、预览、筛选、拆分、列操作、哈希与导出。实测可处理 <b>6.5GB / 901 万行 / 55 列</b> 的数据，打开约 4 秒、峰值内存约 148MB，最终产物为<b>兼容 Windows 7 的单文件 exe</b>（约 7.4MB，无外部 DLL 依赖）。</p>
     <div class="grid">
       <div class="cell"><b>语言</b><br>Rust 2021 edition</div>
       <div class="cell"><b>GUI</b><br>egui / eframe 0.27</div>
@@ -150,7 +150,7 @@
 │   ├── split.rs          # 拆分引擎（单遍哈希分组）
 │   ├── column_ops.rs     # 列操作 + 命令式 undo/redo
 │   ├── hash.rs           # 行哈希（4 算法并行）
-│   └── export.rs         # CSV/XLSX 导出（自动分 sheet/长数字文本）
+│   └── export.rs         # CSV/XLSX 导出（自动分 sheet/全文本导出）
 ├── app/                  # GUI 层
 │   ├── background.rs     # 后台工作线程桥接（mpsc）
 │   ├── dialogs.rs        # 对话框状态
@@ -217,7 +217,7 @@
     <ul>
       <li>CSV：<b>utf-8-sig（带 BOM）</b> 流式写出，与 Python 版一致。</li>
       <li>XLSX：超过 <code>XLSX_MAX_ROWS_PER_SHEET = 1_048_576</code> 自动分 sheet（Python 版直接崩溃）；超过 Excel 上限 16384 列则报错改用 CSV。</li>
-      <li><b>长数字列文本格式</b>：列名含 账号/卡号/身份证/证件号/编号/ID/电话/手机/号码/账户 等关键词，或采样值 &gt; 11 位整数 → 文本格式，防科学计数法与精度丢失。</li>
+      <li><b>全文本导出</b>：所有列一律按文本（<code>@</code> 格式）写入，长数字 / 前导零 / 大整数不会被 Excel 数值化，从根本上杜绝科学计数法与精度丢失（不再依赖“列名关键词 + 数据采样”的启发式长数字列识别）。</li>
       <li><b>公式注入防护（CWE-1236）</b>：以 <code>= + - @</code> 开头的字段加 <code>'</code> 前缀；内部中转文件用 <code>new_raw</code> 关闭。</li>
     </ul>
   </div>
@@ -250,7 +250,7 @@ cargo +nightly-2025-06-23-x86_64-pc-windows-gnu build --release \
   --target x86_64-win7-windows-gnu -Z build-std=std,panic_abort</code></pre>
     <div class="tree">产物：target\x86_64-win7-windows-gnu\release\csv_editor_rust.exe
 导入表：仅 Win7 内置系统 DLL（kernel32 / msvcrt / user32 / gdi32 / advapi32 /
-        shell32 / ole32 / opengl32 / dwmapi 等），无 UCRT、无 API-set 依赖。</div>
+        shell32 / ole32 / opengl32 / dwmapi / uiautomationcore 等，实测 16 个），无 UCRT、无 API-set 依赖。</div>
     <h3>5.2 版本陷阱（实测）</h3>
     <ul>
       <li><b>Mesa 22.1.7</b>（x64 mingw opengl32.dll + libgallium_wgl.dll + libglapi.dll，用系统 msvcrt 免 VC++）+ <b>安装 Vulkan Runtime</b>（提供 vulkan-1.dll）→ Win7 x64 实测可运行。</li>
@@ -268,14 +268,15 @@ cargo +nightly-2025-06-23-x86_64-pc-windows-gnu build --release \
     <h2>六、构建与测试</h2>
     <h3>6.1 开发 / 测试（stable）</h3>
     <pre><code>set PATH=D:\project_xiangmu\.rust-toolchain\rust-1.88.0-x86_64-pc-windows-gnu\rustc\bin;D:\project_xiangmu\.rust-toolchain\rust-1.88.0-x86_64-pc-windows-gnu\cargo\bin;%PATH%
-cargo test          # 单元测试
+cargo test          # 87 项单元测试
 cargo run --bin csv_editor_rust</code></pre>
     <h3>6.2 Win7 单文件发布</h3>
     <p>运行项目根目录的 <code>build_win7.bat</code>（或手动执行上文 5.1 命令）。</p>
+    <div class="note"><b>编码注意：</b><code>build_win7.bat</code> 以 <b>GBK（cp936）</b>保存。cmd 按本地代码页逐行解析批处理，UTF-8 中文行会因字节错位被误当命令执行（实测报 <code>'输出:' 不是内部或外部命令</code>）；若用编辑器重存，请保持 GBK 编码。</div>
     <h3>6.3 测试与验证工具</h3>
     <table>
       <tr><th style="width:150px;">工具</th><th>用途</th></tr>
-      <tr><td><code>cargo test</code></td><td>74 项单元测试，覆盖编码检测、行索引边界、字段切分、筛选语义、列操作、导出等。</td></tr>
+      <tr><td><code>cargo test</code></td><td>87 项单元测试，覆盖编码检测、行索引边界、字段切分、筛选语义、列操作、导出等。</td></tr>
       <tr><td><code>bin/inspect</code></td><td>打开报告：行数/列数/编码/耗时/峰值内存/采样预览。</td></tr>
       <tr><td><code>bin/verify</code></td><td>与 <code>testdata/verify_ref.py</code> 输出同结构 JSON（筛选行号 + 行哈希），验证 Rust 与 Python 语义一致。</td></tr>
       <tr><td><code>bin/e2e</code></td><td>端到端回归：打开 → 类型推断 → 筛选 → 列操作(undo/redo) → 拆分 → 导出 CSV/XLSX。</td></tr>
@@ -292,12 +293,13 @@ cargo run --bin csv_editor_rust</code></pre>
       <tr><td>打开 + 行索引</td><td>数分钟（pandas 全量载入）</td><td><b>4.1 秒</b></td></tr>
       <tr><td>峰值内存</td><td>15GB+（低配机直接 OOM）</td><td><b>148 MB</b></td></tr>
       <tr><td>全量筛选</td><td>分钟级</td><td>并行秒级</td></tr>
-      <tr><td>文件体积</td><td>~300MB（PyInstaller）</td><td><b>6.5 MB</b></td></tr>
+      <tr><td>文件体积</td><td>~300MB（PyInstaller）</td><td><b>7.4 MB</b></td></tr>
     </table>
     <h3>7.2 已知限制</h3>
     <ul>
       <li>按字段拆分对唯一值超过 20,000 个的字段会拒绝（提示改用按行数拆分），避免生成海量文件。</li>
       <li>XLSX 导出超 1,048,576 行自动分 sheet；列数超 16,384 报错改用 CSV。</li>
+      <li>XLSX 为<b>全文本导出</b>：所有单元格按文本写入（Excel 中数字左对齐、不参与求和等数值计算），以此换取长数字、前导零与大整数的零精度损失。</li>
       <li>UTF-16 文件整体转码载入内存（此类文件通常较小）；超大 UTF-16 建议先转码。</li>
     </ul>
   </div>

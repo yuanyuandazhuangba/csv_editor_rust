@@ -1,8 +1,8 @@
 @echo off
 REM ============================================================
-REM å®¿ç»03è¶…å¤§CSVæ–‡ä»¶å®ç”¨ç¼–è¾‘å™¨ - Win7 å•æ–‡ä»¶æ„å»ºè„šæœ¬
-REM è¾“å‡º: target\x86_64-win7-windows-gnu\release\csv_editor_rust.exe
-REM å‰æ: é¡¹ç›®å†… rustup å·¥å…·é“¾ï¼ˆnightly-2025-06-23 GNU + rust-srcï¼‰
+REM ËŞ¾­03³¬´óCSVÎÄ¼şÊµÓÃ±à¼­Æ÷ - Win7 µ¥ÎÄ¼ş¹¹½¨½Å±¾
+REM Êä³ö: target\x86_64-win7-windows-gnu\release\csv_editor_rust.exe
+REM Ç°Ìá: ÏîÄ¿ÄÚ rustup ¹¤¾ßÁ´£¨nightly-2025-06-23 GNU + rust-src£©
 REM ============================================================
 set RUSTUP_HOME=D:\project_xiangmu\.rustup
 set CARGO_HOME=D:\project_xiangmu\.cargo
@@ -10,16 +10,16 @@ set PATH=D:\project_xiangmu\.cargo\bin;%PATH%
 set RUSTFLAGS=-C target-feature=+crt-static -C link-self-contained=yes -C linker=rust-lld
 cd /d %~dp0
 
-echo [1/2] ç¼–è¯‘ Win7 ç›®æ ‡ï¼ˆnightly + build-stdï¼‰...
+echo [1/2] ±àÒë Win7 Ä¿±ê£¨nightly + build-std£©...
 cargo +nightly-2025-06-23-x86_64-pc-windows-gnu build --release --target x86_64-win7-windows-gnu -Z build-std=std,panic_abort
 if errorlevel 1 (
-  echo æ„å»ºå¤±è´¥ï¼
+  echo ¹¹½¨Ê§°Ü£¡
   pause
   exit /b 1
 )
 
 echo.
-echo [2/2] æ„å»ºå®Œæˆï¼š
+echo [2/2] ¹¹½¨Íê³É£º
 echo    target\x86_64-win7-windows-gnu\release\csv_editor_rust.exe
-echo å•æ–‡ä»¶ï¼Œæ— å¤–éƒ¨ DLL ä¾èµ–ï¼ˆé™æ€é“¾æ¥ msvcrt + Win7 å†…ç½®ç³»ç»Ÿ DLLï¼‰
+echo µ¥ÎÄ¼ş£¬ÎŞÍâ²¿ DLL ÒÀÀµ£¨¾²Ì¬Á´½Ó msvcrt + Win7 ÄÚÖÃÏµÍ³ DLL£©
 pause

@@ -106,7 +106,7 @@ impl OpenWriter {
             )),
             OutputFormat::Xlsx => {
                 // 全文本导出：无需识别长数字列
-                Ok(OpenWriter::Xlsx(XlsxWriter::new(path, header, &[])?))
+                Ok(OpenWriter::Xlsx(XlsxWriter::new(path, header)?))
             }
         }
     }
@@ -411,7 +411,7 @@ fn split_by_field_xlsx(
         let src = &temp_paths[i];
         let out_path = format!("{}\\{}.xlsx", opts.folder, final_names[i]);
         let file = crate::core::reader::CsvFile::open(src).map_err(|e| e.to_string())?;
-        let mut w = XlsxWriter::new(&out_path, &header, &[])?;
+        let mut w = XlsxWriter::new(&out_path, &header)?;
         for r in 0..file.row_count() {
             file.row_into(r, &mut fields);
             w.write_row(&fields)?;

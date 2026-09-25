@@ -15,7 +15,7 @@
 | 筛选 | 10 种条件（等于/包含/不包含/大于/小于/大于等于/小于等于/不等于/空值/非空值）+ 且/或组合；并行分块，901 万行秒级完成；数值比较用 i128 精确（19 位卡号不丢精度） |
 | 拆分 | 按行数 / 按字段（1~3 列组合）；按字段单遍哈希分组 O(N)，文件数上限保护，重名自动序号 |
 | 列操作 | 拆分字段、合并字段、复制列、插入列、删除列、隐藏/显示列、生成行哈希（md5/sha1/sha256/sha512）；撤销/恢复（命令式，零复制） |
-| 导出 | CSV（utf-8-sig 带 BOM）/ XLSX（长数字列文本格式防科学计数法；超过 1,048,576 行自动分 sheet） |
+| 导出 | CSV（utf-8-sig 带 BOM）/ XLSX（全文本导出，防科学计数法与精度丢失；超过 1,048,576 行自动分 sheet） |
 | 其他 | 操作日志、内存占用显示、示例数据、关于 |
 
 ## 二、与 Python 版（1.3_nodask）的差异与改进
@@ -24,7 +24,7 @@
 1. **编码检测**：Python 版"chardet + GB18030 优先"会把 UTF-8 文件误判为 GB18030 产生**静默乱码**（实测证实）。Rust 版改为"严格 UTF-8 验证优先、GB18030 兜底"，UTF-8 文件绝不会再乱码；latin1 兜底导致的编码误判不重试问题一并消除。
 2. **拆分性能**：Python 版按字段拆分对每个唯一值全表扫描 `df[df[col]==value]`（O(N×U)）；Rust 版单遍哈希分组 O(N)。多列组合键用 `\x1F` 连接，文件名清理覆盖控制字符。
 3. **XLSX 行数上限**：Python 版 901 万行导出 XLSX 直接崩溃（Excel 单表上限 1,048,576）；Rust 版自动分多个 sheet。
-4. **长数字**：XLSX 导出长数字列（账号/卡号/证件号等关键词 + 数据采样）强制文本格式，防精度丢失与科学计数法。
+4. **长数字**：Rust 版 XLSX 采用**全文本导出**（所有列按文本 `@` 格式写入），长数字、前导零、大整数一律不丢精度；不再沿用 Python 版"列名关键词 + 数据采样"的启发式长数字列识别（该启发式会漏判无关键词的列）。
 5. **撤销/恢复**：Python 版每次操作深拷贝整个 DataFrame（20 步历史），6.5GB 文件单次拷贝即 OOM；Rust 版为命令式操作栈（记录操作描述），零复制。
 6. **错误处理**：Python 版大量 `except: pass` 吞错；Rust 版全部显式错误信息进入日志。
 7. **死代码**：Python 版 ThreadPoolExecutor/ProcessPoolExecutor 从未使用；Rust 版按需使用 std::thread。
@@ -35,12 +35,12 @@
 | 打开+行索引 | 数分钟（pandas 全量载入） | **4.1 秒** |
 | 峰值内存 | 15GB+（pandas 全量，低配机直接 OOM） | **148 MB** |
 | 全量筛选 | 分钟级（逐条件全列转换） | 并行秒级 |
-| 文件体积 | ~300MB（PyInstaller 单文件） | **6.5 MB** |
+| 文件体积 | ~300MB（PyInstaller 单文件） | **7.4 MB** |
 
 ## 三、系统要求与 Win7 兼容
 
 - **运行时**：Windows 7 SP1 及以上（x64），无需安装任何运行库。
-- 单文件 exe 导入表仅含 Win7 内置系统 DLL（kernel32 / msvcrt / user32 / gdi32 / advapi32 / shell32 / ole32 / opengl32 / dwmapi 等），无 UCRT、无 API-set 依赖。
+- 单文件 exe 导入表仅含 Win7 内置系统 DLL（kernel32 / msvcrt / user32 / gdi32 / advapi32 / shell32 / ole32 / opengl32 / dwmapi / uiautomationcore 等，实测 16 个），无 UCRT、无 API-set 依赖。
 - 中文界面使用系统字体（微软雅黑/黑体）。
 - 图形渲染依赖 OpenGL（Win7 显卡驱动通常支持；软件渲染亦可回退）。
 
@@ -51,7 +51,7 @@
 ### 开发/测试（stable）
 ```bat
 set PATH=D:\project_xiangmu\.rust-toolchain\rust-1.88.0-x86_64-pc-windows-gnu\rustc\bin;D:\project_xiangmu\.rust-toolchain\rust-1.88.0-x86_64-pc-windows-gnu\cargo\bin;%PATH%
-cargo test        :: 74 项单元测试
+cargo test        :: 87 项单元测试
 cargo run --bin csv_editor_rust
 ```
 
@@ -95,7 +95,7 @@ src/
 │   ├── split.rs            # 拆分引擎（单遍哈希分组）
 │   ├── column_ops.rs       # 列操作 + 命令式 undo/redo
 │   ├── hash.rs             # 行哈希（4 算法并行）
-│   └── export.rs           # CSV/XLSX 导出（自动分 sheet/长数字文本）
+│   └── export.rs           # CSV/XLSX 导出（自动分 sheet/全文本导出）
 └── app/                    # GUI 层
     ├── panels.rs           # 菜单/控制/筛选/日志/预览布局
     ├── dialog_ui.rs        # 各操作对话框
@@ -112,4 +112,5 @@ src/bin/                    # 命令行工具
 
 - 按字段拆分对唯一值超过 20,000 个的字段会拒绝（提示改用按行数拆分），避免生成海量文件。
 - XLSX 导出行数超过 1,048,576 时自动分 sheet（每 sheet 满额即开新 sheet）。
+- XLSX 为**全文本导出**：所有单元格按文本写入（Excel 中数字左对齐、不参与求和等数值计算），以此换取长数字、前导零与大整数的零精度损失。
 - UTF-16 编码文件会整体转码载入内存（此类文件通常较小）；超大 UTF-16 文件建议先转码。

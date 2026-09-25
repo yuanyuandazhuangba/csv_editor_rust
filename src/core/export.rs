@@ -1,8 +1,8 @@
 //! 导出引擎：CSV 流式写出（utf-8-sig）与 XLSX 写出。
 //!
 //! XLSX 要点（修正 Python 版缺陷）：
-//! - 长数字列（列名含 账号/卡号/身份证/证件号/编号/ID/电话/手机/号码/账户 等，
-//!   或采样值 >11 位整数）以文本格式写入，避免 Excel 科学计数法与精度丢失；
+//! - 全文本导出：所有列一律按文本（`@` 格式）写入，长数字/前导零/大整数不会被
+//!   Excel 数值化，从根本上杜绝科学计数法与精度丢失（无需按列名或采样识别长数字列）；
 //! - 超过 Excel 单表 1,048,576 行上限自动新建 sheet（Python 版直接崩溃）；
 //! - 全部流式写入，不把数据驻留内存。
 
@@ -13,40 +13,6 @@ use rust_xlsxwriter::{Format, Workbook};
 
 /// Excel 单 sheet 最大行数（含表头）
 pub const XLSX_MAX_ROWS_PER_SHEET: u32 = 1_048_576;
-
-/// 长数字列关键词（与 Python 版一致，用于识别需文本格式的列）
-const LONG_NUMBER_KEYWORDS: [&str; 18] = [
-    "账号", "卡号", "身份证", "证件号", "编号", "ID", "id", "number", "Number", "code",
-    "Code", "电话", "手机", "电话号", "手机号", "号码", "证件", "账户",
-];
-
-/// 识别需要文本格式的长数字列索引
-pub fn identify_long_number_columns(header: &[String], sample_rows: &[Vec<String>]) -> Vec<usize> {
-    let mut out: Vec<usize> = Vec::new();
-    for (i, name) in header.iter().enumerate() {
-        if LONG_NUMBER_KEYWORDS.iter().any(|k| name.contains(k)) {
-            out.push(i);
-            continue;
-        }
-        // 数据采样：>11 位的整数值
-        let mut found = false;
-        'sample: for row in sample_rows {
-            if let Some(v) = row.get(i) {
-                let t = v.trim();
-                if t.len() > 11
-                    && !t.is_empty()
-                    && t.bytes().all(|b| b.is_ascii_digit())
-                {
-                    out.push(i);
-                    found = true;
-                    break 'sample;
-                }
-            }
-        }
-        let _ = found;
-    }
-    out
-}
 
 /// CSV 流式写出器（utf-8-sig，即带 BOM 的 UTF-8，与 Python 版一致）
 pub struct CsvWriter {
@@ -140,11 +106,7 @@ pub struct XlsxWriter {
 }
 
 impl XlsxWriter {
-    pub fn new(
-        path: &str,
-        header: &[String],
-        _long_cols: &[usize],
-    ) -> Result<Self, String> {
+    pub fn new(path: &str, header: &[String]) -> Result<Self, String> {
         // Excel 最大列数 16384（XFD）
         if header.len() > 16_384 {
             return Err(format!(
@@ -258,7 +220,7 @@ pub fn export_rows_xlsx(
     rows: impl Iterator<Item = Vec<String>>,
 ) -> Result<usize, String> {
     // 全文本导出：所有字段按文本写出，无需识别长数字列
-    let mut w = XlsxWriter::new(path, header, &[])?;
+    let mut w = XlsxWriter::new(path, header)?;
     let mut n = 0;
     for r in rows {
         w.write_row(&r)?;
@@ -331,7 +293,7 @@ pub fn export_view_xlsx(
     let header_visible: Vec<String> = visible.iter().map(|&i| header[i].clone()).collect();
 
     // 全文本导出：所有字段按文本写出，无需识别长数字列
-    let mut w = XlsxWriter::new(path, &header_visible, &[])?;
+    let mut w = XlsxWriter::new(path, &header_visible)?;
 
     let total = rows.map(|r| r.len() as f64).unwrap_or(model.row_count() as f64);
     let mut done = 0usize;
@@ -424,39 +386,18 @@ mod tests {
         // security 修复：列数超过 Excel 上限 16384 时显式报错
         let p = write_temp("wide.xlsx");
         let header: Vec<String> = (0..16_400).map(|i| format!("C{}", i)).collect();
-        let r = XlsxWriter::new(&p, &header, &[]);
+        let r = XlsxWriter::new(&p, &header);
         assert!(r.is_err());
         std::fs::remove_file(&p).ok();
-    }
-
-    #[test]
-    fn identify_long_columns_by_keyword() {
-        let header = vec![
-            "交易卡号".to_string(),
-            "ID".to_string(),
-            "金额".to_string(),
-        ];
-        let sample: Vec<Vec<String>> = Vec::new();
-        let cols = identify_long_number_columns(&header, &sample);
-        assert_eq!(cols, vec![0, 1]);
-    }
-
-    #[test]
-    fn identify_long_columns_by_sample() {
-        let header = vec!["CODE".to_string()];
-        let sample = vec![vec!["6222020200112345678".to_string()]];
-        let cols = identify_long_number_columns(&header, &sample);
-        assert_eq!(cols, vec![0]);
     }
 
     #[test]
     fn xlsx_writer_basic_and_sheet_split() {
         let p = write_temp("b.xlsx");
         let header = vec!["卡号".to_string(), "值".to_string()];
-        let long_cols = identify_long_number_columns(&header, &[]);
-        let mut w = XlsxWriter::new(&p, &header, &long_cols).unwrap();
+        let mut w = XlsxWriter::new(&p, &header).unwrap();
         // 写入超过单 sheet 上限的行数（用小阈值模拟不可行，直接用真实上限附近
-        // 的成本过高；这里验证常规写入 + 长数字文本）
+        // 的成本过高；这里验证常规写入 + 长数字以文本保留）
         for i in 0..100u32 {
             let card = format!("622202020011234567{}", i % 10);
             w.write_row(&[card, i.to_string()]).unwrap();
@@ -470,7 +411,7 @@ mod tests {
     fn xlsx_writer_many_rows_auto_sheet() {
         let p = write_temp("c.xlsx");
         let header = vec!["A".to_string()];
-        let mut w = XlsxWriter::new(&p, &header, &[]).unwrap();
+        let mut w = XlsxWriter::new(&p, &header).unwrap();
         w.write_row(&["1".into()]).unwrap();
         w.write_row(&["2".into()]).unwrap();
         let rows = w.rows_written;
@@ -484,8 +425,7 @@ mod tests {
         // 长数字以文本写入（write_string 路径）：数字列正常数值
         let p = write_temp("d.xlsx");
         let header = vec!["卡号".to_string(), "金额".to_string()];
-        let long_cols = vec![0];
-        let mut w = XlsxWriter::new(&p, &header, &long_cols).unwrap();
+        let mut w = XlsxWriter::new(&p, &header).unwrap();
         w.write_row(&["6222020200112345678".into(), "123.5".into()])
             .unwrap();
         w.finish().unwrap();
@@ -518,8 +458,7 @@ mod tests {
         // 数值解析必须先 trim 再 parse，否则金额全部写成 0（此前 bug）
         let p = write_temp("tab.xlsx");
         let header = vec!["金额".to_string(), "卡号".to_string()];
-        let long_cols = vec![1];
-        let mut w = XlsxWriter::new(&p, &header, &long_cols).unwrap();
+        let mut w = XlsxWriter::new(&p, &header).unwrap();
         w.write_row(&["2553.34\t".into(), "6230520600147748672\t".into()])
             .unwrap();
         w.write_row(&["0.00\t".into(), "271101101708087\t".into()])
@@ -562,7 +501,7 @@ mod tests {
         // 回归：XLSX 导出应去除字段前后空白（空格/制表符），保留字段内部内容
         let p = write_temp("trim.xlsx");
         let header = vec!["金额".to_string(), "城市".to_string()];
-        let mut w = XlsxWriter::new(&p, &header, &[]).unwrap();
+        let mut w = XlsxWriter::new(&p, &header).unwrap();
         w.write_row(&["  2553.34\t".into(), "  北京  ".into()])
             .unwrap();
         w.finish().unwrap();

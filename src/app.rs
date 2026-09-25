@@ -264,7 +264,6 @@ impl CsvEditorApp {
         self.file_info = None;
         self.filter_conditions.clear();
         self.filtered_rows = None;
-        self.preview.total_rows = 0;
         self.log("已清空所有数据");
     }
 }

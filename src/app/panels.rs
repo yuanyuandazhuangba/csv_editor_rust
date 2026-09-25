@@ -15,7 +15,9 @@ impl CsvEditorApp {
                         ui.close_menu();
                     }
                     if ui.button("打开多个CSV文件（合并）").clicked() {
-                        self.log("多文件合并功能：请使用拆分/合并工具处理");
+                        self.log(
+                            "多文件合并尚未实现：可先按字段/行数拆分，或分别打开后用「导出数据」汇总",
+                        );
                         ui.close_menu();
                     }
                     if ui.button("导出数据").clicked() {
@@ -28,11 +30,21 @@ impl CsvEditorApp {
                     }
                 });
                 ui.menu_button("编辑", |ui| {
-                    if ui.button("撤销").clicked() {
+                    let (can_undo, can_redo) = self
+                        .ops
+                        .as_ref()
+                        .map_or((false, false), |o| (o.can_undo(), o.can_redo()));
+                    if ui
+                        .add_enabled(can_undo, egui::Button::new("撤销"))
+                        .clicked()
+                    {
                         self.do_undo();
                         ui.close_menu();
                     }
-                    if ui.button("恢复").clicked() {
+                    if ui
+                        .add_enabled(can_redo, egui::Button::new("恢复"))
+                        .clicked()
+                    {
                         self.do_redo();
                         ui.close_menu();
                     }
@@ -43,6 +55,7 @@ impl CsvEditorApp {
                         ui.close_menu();
                     }
                     if ui.button("刷新视图").clicked() {
+                        self.refresh_view();
                         ui.close_menu();
                     }
                 });
@@ -92,11 +105,21 @@ impl CsvEditorApp {
                         }
                     });
                     ui.separator();
-                    if ui.button("撤销").clicked() {
+                    let (can_undo, can_redo) = self
+                        .ops
+                        .as_ref()
+                        .map_or((false, false), |o| (o.can_undo(), o.can_redo()));
+                    if ui
+                        .add_enabled(can_undo, egui::Button::new("撤销"))
+                        .clicked()
+                    {
                         self.do_undo();
                         ui.close_menu();
                     }
-                    if ui.button("恢复").clicked() {
+                    if ui
+                        .add_enabled(can_redo, egui::Button::new("恢复"))
+                        .clicked()
+                    {
                         self.do_redo();
                         ui.close_menu();
                     }
@@ -173,7 +196,7 @@ impl CsvEditorApp {
                 }
                 ui.separator();
                 if ui.button("刷新显示").clicked() {
-                    // 表格每帧重渲染，无需额外刷新
+                    self.refresh_view();
                 }
                 if ui.button("日志").clicked() {
                     self.show_log = !self.show_log;
@@ -366,6 +389,14 @@ impl CsvEditorApp {
         }
     }
 
+    /// 刷新预览视图：滚动回首行（表格内容本身每帧重渲染）
+    pub fn refresh_view(&mut self) {
+        self.preview.scroll_to(0);
+        if self.model.is_some() {
+            self.log("视图已刷新（滚动回首行）");
+        }
+    }
+
     /// 示例数据（写入临时文件后加载）
     pub fn load_sample_data(&mut self) {
         let dir = std::env::temp_dir();
@@ -373,7 +404,7 @@ impl CsvEditorApp {
         let mut content = String::from("ID,姓名,年龄,城市,部门,工资,入职日期\n");
         for i in 1..=1000u32 {
             content.push_str(&format!(
-                "{},用户{},{}m,城市{},部门{},{}m,2020-01-{:02}\n",
+                "{},用户{},{},城市{},部门{},{},2020-01-{:02}\n",
                 i,
                 i,
                 i % 47 + 18,
