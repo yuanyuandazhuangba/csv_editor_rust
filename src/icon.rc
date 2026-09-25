@@ -1,3 +1,9 @@
+// 代码页声明（必须有，否则版本信息里的中文会乱码）：
+// windres 默认按本地代码页解析 .rc（中文系统为 936/GBK），而本文件是 UTF-8，
+// 这会让 ProductName 等中文值在 exe 属性里显示成乱码（实测："瀹跨粡03瓒呭ぇ…"）。
+// 显式声明 65001 后中文正确；MSVC 的 rc.exe 同样支持该 pragma，跨编译器通用。
+#pragma code_page(65001)
+
 // 图标资源
 IDI_ICON1 ICON "assets/csv_editor_icon.ico"
 

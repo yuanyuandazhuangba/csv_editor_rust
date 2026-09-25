@@ -251,6 +251,7 @@ cargo +nightly-2025-06-23-x86_64-pc-windows-gnu build --release \
     <div class="tree">产物：target\x86_64-win7-windows-gnu\release\csv_editor_rust.exe
 导入表：仅 Win7 内置系统 DLL（kernel32 / msvcrt / user32 / gdi32 / advapi32 /
         shell32 / ole32 / opengl32 / dwmapi / uiautomationcore 等，实测 16 个），无 UCRT、无 API-set 依赖。</div>
+    <div class="note"><b>资源编码（易踩）：</b><code>src/icon.rc</code> 是 UTF-8，文件头必须保留 <code>#pragma code_page(65001)</code>。windres 默认按本地代码页解析 .rc（中文系统为 936/GBK），缺了这行则版本信息里的中文全部乱码——exe 属性中产品名会显示成“瀹跨粡03瓒呭ぇCSV鏂囦欢瀹炵敤缂栬緫鍣”。<code>build.rs</code> 用 <code>embed-resource</code> 调 windres 且不外传代码页参数，故只能由 .rc 自身声明。</div>
     <h3>5.2 版本陷阱（实测）</h3>
     <ul>
       <li><b>Mesa 22.1.7</b>（x64 mingw opengl32.dll + libgallium_wgl.dll + libglapi.dll，用系统 msvcrt 免 VC++）+ <b>安装 Vulkan Runtime</b>（提供 vulkan-1.dll）→ Win7 x64 实测可运行。</li>
