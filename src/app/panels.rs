@@ -237,19 +237,31 @@ impl CsvEditorApp {
                     }
                     ui.separator();
                     ui.label("按钮大小");
-                    let mut zoom = ui.ctx().zoom_factor();
-                    let resp = ui.add(
-                        egui::DragValue::new(&mut zoom)
-                            .clamp_range(1.0f32..=1.5f32)
-                            .speed(0.01)
-                            .fixed_decimals(1),
-                    );
-                    if resp.changed() {
-                        let z = zoom.clamp(1.0, 1.5);
+                    let resp = ui
+                        .add(
+                            egui::DragValue::new(&mut self.ui_zoom)
+                                .clamp_range(1.0f32..=1.5f32)
+                                .speed(0.002)
+                                .fixed_decimals(2),
+                        )
+                        .on_hover_text(
+                            "拖动或输入界面放大倍数（1.0 ~ 1.5）。拖动时先显示倍数，松开鼠标后应用，避免界面抖动。",
+                        );
+                    self.zoom_dragging = resp.dragged();
+                    // 拖动中只累积数值、不改动 pixels_per_point：缩放会让指针的逻辑坐标
+                    // 在一帧内突变，DragValue 依此算出的 drag_delta() 出现虚假位移，
+                    // 数值会反向跳变并与界面来回震荡（即“跳动厉害”）。
+                    // 松手（drag_stopped）或键盘输入完成（changed 且未拖动）后一次性平滑应用。
+                    if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
+                        let z = self.ui_zoom.clamp(1.0, 1.5);
+                        self.ui_zoom = z;
                         ui.ctx().set_zoom_factor(z);
-                        self.log(&format!("按钮大小：{:.1} 倍（界面等比缩放）", z));
+                        self.log(&format!("按钮大小：{:.2} 倍（界面等比缩放）", z));
                     }
                     ui.label("倍");
+                    if self.zoom_dragging {
+                        ui.weak("（松开鼠标后应用）");
+                    }
                     });
                 });
             ui.add_space(2.0);

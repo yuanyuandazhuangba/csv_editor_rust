@@ -268,7 +268,8 @@
 
     <h3>4.7 界面等比缩放（按钮大小）</h3>
     <ul>
-      <li>直接读写 <code>egui::Context::zoom_factor()</code>（egui 自带持久化，重启后仍生效），用 <code>DragValue</code> 限制 <b>1.0 ~ 1.5</b> 倍。</li>
+      <li>缩放值以应用状态 <code>ui_zoom</code> 为唯一真值源，写入 <code>egui::Context::zoom_factor()</code>（egui 自带持久化，重启后仍生效）；<code>DragValue</code> 限制 <b>1.0 ~ 1.5</b> 倍、步进 0.01。同时关闭 egui 内置的 <code>Ctrl +/-</code> 缩放（<code>options.zoom_with_keyboard = false</code>），避免出现两个真值源互相覆盖。</li>
+      <li><b>拖动时先累积、松手后应用</b>：<code>DragValue</code> 以 <code>response.drag_delta()</code>（本帧“逻辑坐标”位移）计算数值，而 <code>set_zoom_factor</code> 会改变 <code>pixels_per_point</code>，使同一物理鼠标位置对应的逻辑坐标在一帧内突变，于是 <code>drag_delta()</code> 出现虚假位移、数值反向跳变并与界面来回震荡（表现为“拖动时跳动厉害”）。因此拖动期间只更新数值（并提示“松开鼠标后应用”），在 <code>drag_stopped()</code> 或键盘输入完成时一次性平滑应用。</li>
       <li>采用<b>整体等比缩放</b>而非只放大字体：数据表格行高是固定 20px，只放大文字会导致错位；整体缩放让菜单、菜单命令、工具栏按钮、表格文字同步放大，符合「等比例放大倍数」的设定。</li>
       <li>「自愿捐助」与「按钮大小」<b>不右对齐</b>，按顺序排在工具栏按钮之后（输入框位于「按钮大小」与「倍」之间）；由于工具栏按钮较多（放大后总宽可超过窗口宽度），整行用 <code>ScrollArea::horizontal</code> 包住，溢出时可横向滚动访问，保证各按钮始终可达。</li>
     </ul>

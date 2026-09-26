@@ -59,6 +59,12 @@ pub struct CsvEditorApp {
     qr_texture: Option<egui::TextureHandle>,
     // 上一次合并输出的临时文件（下次合并前清理，避免临时目录堆积）
     merged_temp: Option<String>,
+    // 界面缩放（按钮大小）的唯一真值源。拖动过程中不立即应用缩放：
+    // set_zoom_factor 会改变 pixels_per_point，使指针的逻辑坐标在一帧内突变，
+    // 导致 DragValue 的 drag_delta() 出现虚假位移、数值反向跳变并与界面震荡。
+    ui_zoom: f32,
+    /// 缩放控件当前是否处于拖动中（拖动期间不应用缩放，松手后一次性应用）
+    zoom_dragging: bool,
 }
 
 /// 弹出窗口位置（数据预览区右侧靠上为默认）
@@ -104,7 +110,10 @@ pub struct BusyState {
 }
 
 impl CsvEditorApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // 界面缩放的唯一入口是工具栏「按钮大小」控件：关闭 egui 内置的键盘缩放
+        // （Ctrl + / Ctrl -），避免出现两个真值源互相覆盖。
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let (tx, rx) = mpsc::channel::<BgMsg>();
         Self {
             model: None,
@@ -125,6 +134,8 @@ impl CsvEditorApp {
             peak_memory_mb: 0.0,
             qr_texture: None,
             merged_temp: None,
+            ui_zoom: cc.egui_ctx.zoom_factor().clamp(1.0, 1.5),
+            zoom_dragging: false,
         }
     }
 
