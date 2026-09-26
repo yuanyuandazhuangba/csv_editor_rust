@@ -189,6 +189,106 @@ pub fn count_data_rows(path: &str) -> Result<usize, String> {
     Ok(data_rows)
 }
 
+/// CSV 字段转义（含逗号/引号/换行时加引号并翻倍引号）
+fn csv_escape(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// 写出「拆分完整性核对表」（CSV，utf-8-sig，Excel 可直接双击打开）。
+///
+/// 内容依次为：拆分类型、拆分依据、输出格式、数据来源行数、输出文件数、
+/// 输出总行数，以及**逐文件的数据行数**（不含表头，同时给出写入行数便于对照），
+/// 最后是完整性核对结果。核对表与拆分输出放在同一目录，便于随数据一起归档。
+pub fn write_split_checkfile(
+    path: &str,
+    generated_at: &str,
+    split_type: &str,
+    split_basis: &str,
+    format_label: &str,
+    report: &SplitReport,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let f = std::fs::File::create(path).map_err(|e| format!("无法创建核对表 {}：{}", path, e))?;
+    let mut w = std::io::BufWriter::new(f);
+    // BOM（utf-8-sig），Excel 打开中文不乱码
+    w.write_all(&[0xEF, 0xBB, 0xBF])
+        .map_err(|e| e.to_string())?;
+
+    let line = |w: &mut std::io::BufWriter<std::fs::File>, cells: &[&str]| -> std::io::Result<()> {
+        let s: Vec<String> = cells.iter().map(|c| csv_escape(c)).collect();
+        writeln!(w, "{}", s.join(","))
+    };
+
+    line(&mut w, &["拆分完整性核对表"]).map_err(|e| e.to_string())?;
+    line(&mut w, &["生成时间", generated_at]).map_err(|e| e.to_string())?;
+    line(&mut w, &["拆分类型", split_type]).map_err(|e| e.to_string())?;
+    line(&mut w, &["拆分依据", split_basis]).map_err(|e| e.to_string())?;
+    line(&mut w, &["输出格式", format_label]).map_err(|e| e.to_string())?;
+    line(&mut w, &["数据来源行数（不含表头）", &report.source_rows.to_string()])
+        .map_err(|e| e.to_string())?;
+    line(&mut w, &["输出文件数", &report.files.to_string()]).map_err(|e| e.to_string())?;
+    line(
+        &mut w,
+        &[
+            "输出总行数（不含表头）",
+            &report.total_on_disk().to_string(),
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    line(
+        &mut w,
+        &[
+            "完整性核对结果",
+            if report.is_complete() {
+                "通过（输出总行数 = 数据来源行数，无遗漏）"
+            } else {
+                "未通过（输出总行数与数据来源行数不一致，请检查磁盘空间与目录权限）"
+            },
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    line(&mut w, &[]).map_err(|e| e.to_string())?;
+    line(
+        &mut w,
+        &[
+            "序号",
+            "文件名",
+            "数据行数（不含表头）",
+            "写入行数（不含表头）",
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    for (i, s) in report.stats.iter().enumerate() {
+        line(
+            &mut w,
+            &[
+                &(i + 1).to_string(),
+                &s.name,
+                &s.disk_rows.to_string(),
+                &s.written_rows.to_string(),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    line(
+        &mut w,
+        &[
+            "合计",
+            &format!("{} 个文件", report.files),
+            &report.total_on_disk().to_string(),
+            &report.total_written().to_string(),
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    w.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// 拆分选项
 #[derive(Debug, Clone)]
 pub struct SplitOptions {
@@ -1235,6 +1335,49 @@ mod tests {
         assert_eq!(rep2.total_on_disk(), 5);
         assert!(rep2.is_complete(), "按字段拆分也应通过核对：{}", rep2.verdict());
 
+        cleanup(&dir);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn checkfile_contains_all_required_items() {
+        // 核对表须含：拆分类型/依据、逐文件行数、输出总行数、来源行数、核对结果
+        let data = "ID,NAME\n1,a\n2,b\n3,c\n4,d\n";
+        let p = write_temp_file(data.as_bytes(), "_check.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let dir = temp_dir();
+        let opts = SplitOptions {
+            folder: dir.clone(),
+            format: OutputFormat::Csv,
+        };
+        let rep = split_by_rows(&m, None, 2, &opts, None).unwrap();
+        let cf = format!("{}\\_check_result.csv", dir);
+        write_split_checkfile(
+            &cf,
+            "2026-09-27 10:00:00",
+            "按行数拆分",
+            "每批 2 行",
+            "CSV",
+            &rep,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&cf).unwrap();
+        for item in [
+            "拆分完整性核对表",
+            "按行数拆分",
+            "每批 2 行",
+            "数据来源行数（不含表头）,4",
+            "输出文件数,2",
+            "输出总行数（不含表头）,4",
+            "通过",
+            "split_data_part_1.csv,2,2",
+            "split_data_part_2.csv,2,2",
+            "合计,2 个文件,4,4",
+        ] {
+            assert!(text.contains(item), "核对表缺少条目 {item:?}：\n{text}");
+        }
+        // 以 BOM 开头（Excel 中文不乱码）
+        assert!(std::fs::read(&cf).unwrap().starts_with(&[0xEF, 0xBB, 0xBF]));
         cleanup(&dir);
         std::fs::remove_file(&p).ok();
     }

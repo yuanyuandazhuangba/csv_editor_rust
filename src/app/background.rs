@@ -16,8 +16,8 @@ pub enum BgMsg {
     FileLoaded(String, DataModel),
     /// 筛选完成（命中行号）
     Filtered(Vec<u32>),
-    /// 拆分完成（含逐文件行数与完整性核对结论）
-    SplitDone(SplitReport),
+    /// 拆分完成（含逐文件行数与完整性核对结论；第二个是该目录下生成的核对表路径）
+    SplitDone(SplitReport, Result<String, String>),
     /// 导出完成（行数, 路径）
     ExportDone(usize, String),
     /// 多文件表头读取完成（表头列表, 一致性判定, 差异字段）

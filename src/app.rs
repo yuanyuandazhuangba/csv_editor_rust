@@ -7,6 +7,8 @@
 //!   进度与结果，UI 不阻塞；
 //! - 数据预览用 egui_extras 虚拟化表格，900 万行仅渲染可见行。
 
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 
@@ -65,6 +67,8 @@ pub struct CsvEditorApp {
     merged_temp: Option<String>,
     /// 最近一次「提取唯一行」的结果（重复行对应表 + 判重字段）
     last_dedup: Option<LastDedup>,
+    /// 是否把操作日志追加写入 exe 同目录的「操作日志.txt」（默认关闭）
+    log_to_file: bool,
     // 界面缩放（按钮大小）的唯一真值源。拖动过程中不立即应用缩放：
     // set_zoom_factor 会改变 pixels_per_point，使指针的逻辑坐标在一帧内突变，
     // 导致 DragValue 的 drag_delta() 出现虚假位移、数值反向跳变并与界面震荡。
@@ -155,6 +159,11 @@ impl CsvEditorApp {
             qr_texture: None,
             merged_temp: None,
             last_dedup: None,
+            log_to_file: cc.egui_ctx.memory(|m| {
+                m.data
+                    .get_temp::<bool>(egui::Id::new("ops_log_to_file"))
+                    .unwrap_or(false)
+            }),
             ui_zoom: cc.egui_ctx.zoom_factor().clamp(1.0, 1.5),
             zoom_dragging: false,
         }
@@ -162,7 +171,12 @@ impl CsvEditorApp {
 
     pub fn log(&mut self, msg: &str) {
         let ts = format!("[{}]", now_str());
-        self.log.push(format!("{} {}", ts, msg));
+        let line = format!("{} {}", ts, msg);
+        // 可选落盘：纯文本追加，便于事后检索与审计（大小上限内自动轮转）
+        if self.log_to_file {
+            append_ops_log(&line);
+        }
+        self.log.push(line);
         if self.log.len() > 5000 {
             self.log.drain(0..self.log.len() - 5000);
         }
@@ -262,7 +276,7 @@ impl CsvEditorApp {
                     self.filtered_rows = Some(hits.clone());
                     self.log(&format!("筛选完成，命中行数: {}", hits.len()));
                 }
-                BgMsg::SplitDone(report) => {
+                BgMsg::SplitDone(report, check) => {
                     self.busy = None;
                     // 逐文件列出「不计表头的数据行数」，并给出与数据来源总行数的核对结论，
                     // 让用户能直观确认拆分导出完整、无遗漏。
@@ -291,6 +305,13 @@ impl CsvEditorApp {
                         report.source_rows
                     ));
                     self.log(&report.verdict());
+                    match check {
+                        Ok(p) => self.log(&format!(
+                            "已在该目录生成「拆分完整性核对表.csv」：{}",
+                            p
+                        )),
+                        Err(e) => self.log(&format!("⚠ 拆分完整性核对表生成失败：{}", e)),
+                    }
                 }
                 BgMsg::ExportDone(n, path) => {
                     self.busy = None;
@@ -392,6 +413,52 @@ impl CsvEditorApp {
         self.filter_conditions.clear();
         self.filtered_rows = None;
         self.log("已清空所有数据");
+    }
+}
+
+/// 操作日志落盘文件名（exe 同目录；不可写则回退 %TEMP%）
+const OPS_LOG_FILE: &str = "操作日志.txt";
+
+/// 操作日志文件大小上限：超过则轮转为 `.1`，避免无限增长
+const OPS_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// 操作日志落盘路径：优先 exe 同目录（与诊断日志一致），不可写则回退 %TEMP%
+fn ops_log_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join(OPS_LOG_FILE);
+            if std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&p)
+                .is_ok()
+            {
+                return p;
+            }
+        }
+    }
+    std::env::temp_dir().join(OPS_LOG_FILE)
+}
+
+/// 追加一条操作日志到文本文件（零依赖、纯文本可搜索；超限自动轮转）
+fn append_ops_log(line: &str) {
+    let path = ops_log_path();
+    let too_big = std::fs::metadata(&path)
+        .map(|m| m.len() > OPS_LOG_MAX_BYTES)
+        .unwrap_or(false);
+    if too_big {
+        let mut bak = path.as_os_str().to_owned();
+        bak.push(".1");
+        let bak = PathBuf::from(bak);
+        let _ = std::fs::remove_file(&bak);
+        let _ = std::fs::rename(&path, &bak);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{line}");
     }
 }
 

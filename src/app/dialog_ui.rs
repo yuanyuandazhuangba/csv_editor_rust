@@ -1586,6 +1586,28 @@ impl CsvEditorApp {
         }
         // 拆分范围：始终跟随筛选结果（无筛选时 filtered_rows 为 None = 全量）
         let rows = self.visible_rows().map(|v| v.to_vec());
+        // 核对表所需的描述信息（拆分类型 / 依据 / 输出格式 / 生成时间）
+        let split_type = if method == 0 {
+            "按行数拆分"
+        } else {
+            "按字段拆分"
+        };
+        let split_basis = if method == 0 {
+            format!("每批 {} 行", batch)
+        } else {
+            let names: Vec<String> = cols
+                .iter()
+                .filter_map(|&c| model.header().get(c).cloned())
+                .collect();
+            format!("字段：{}", names.join("、"))
+        };
+        let format_label = if format == OutputFormat::Csv {
+            "CSV"
+        } else {
+            "XLSX"
+        };
+        let check_path = format!("{}\\拆分完整性核对表.csv", opts.folder);
+        let generated_at = super::now_str();
         let tx = self.tx.clone();
         self.worker = Some(super::background::Worker::spawn(tx.clone(), move |ctl| {
             let result = if method == 0 {
@@ -1599,7 +1621,17 @@ impl CsvEditorApp {
             };
             match result {
                 Ok(report) => {
-                    let _ = tx.send(BgMsg::SplitDone(report));
+                    // 拆分完成后，在同一目录自动生成「拆分完整性核对表」
+                    let check = split::write_split_checkfile(
+                        &check_path,
+                        &generated_at,
+                        split_type,
+                        &split_basis,
+                        format_label,
+                        &report,
+                    )
+                    .map(|_| check_path.clone());
+                    let _ = tx.send(BgMsg::SplitDone(report, check));
                 }
                 Err(e) => {
                     let _ = tx.send(BgMsg::Error(format!("拆分失败: {}", e)));

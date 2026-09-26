@@ -201,6 +201,33 @@ impl CsvEditorApp {
                             ui.ctx().memory_mut(|m| m.reset_areas());
                         }
                     });
+                    ui.separator();
+                    // 操作日志落盘开关（两态文本等长，保证左对齐且宽度不跳动）
+                    let label = if self.log_to_file {
+                        "操作日志落盘  ✔"
+                    } else {
+                        "操作日志落盘    "
+                    };
+                    if ui
+                        .button(label)
+                        .on_hover_text(
+                            "开启后，每条操作日志会追加写入 exe 同目录的「操作日志.txt」\
+                             （超过 2MB 自动轮转为 .1），便于事后检索与审计。默认关闭，设置会被记住。",
+                        )
+                        .clicked()
+                    {
+                        self.log_to_file = !self.log_to_file;
+                        let on = self.log_to_file;
+                        ui.ctx().memory_mut(|m| {
+                            m.data.insert_temp(egui::Id::new("ops_log_to_file"), on)
+                        });
+                        self.log(if on {
+                            "已开启操作日志落盘（追加到 exe 同目录的「操作日志.txt」）"
+                        } else {
+                            "已关闭操作日志落盘"
+                        });
+                        ui.close_menu();
+                    }
                 });
                 ui.menu_button("帮助", |ui| {
                     if ui.button("使用说明").clicked() {
