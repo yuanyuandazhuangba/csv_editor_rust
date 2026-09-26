@@ -387,6 +387,11 @@ impl CsvEditorApp {
             .movable(true)
             .default_pos(default_pos)
             .order(egui::Order::Foreground)
+            // Area 默认不约束在屏幕内（`Area::constrain` 默认 false），而它的位置在首次之后
+            // 一律取自 memory（持久化的“上次拖动位置”）。一旦界面缩放（按钮大小）或窗口尺寸
+            // 变化，逻辑屏幕变小，这个记住的位置就可能落到可视区之外 —— 进度窗口于是“不见了”。
+            // 对话框用的是 Window，默认 constrain = true，所以不受影响。
+            .constrain_to(screen)
             .show(ctx, |ui| {
                 egui::Frame::window(&ctx.style()).show(ui, |ui| {
                     ui.set_min_width(360.0);

@@ -248,6 +248,7 @@
       <li>加宽滚动条，避免数据预览区滚动条过窄难操作。</li>
       <li>弹出窗口位置可配置（居中/右侧/左侧/中间/记忆位置），egui <code>persistence</code> 记忆。</li>
       <li>进程峰值内存用 <code>GetProcessMemoryInfo</code>（winapi）实时显示。</li>
+      <li><b>进度窗口必须 <code>constrain_to(screen)</code></b>：该窗口用 <code>egui::Area</code> 实现，而 <code>Area</code> 默认 <code>constrain = false</code>（不夹取到屏幕内），位置又取自持久化的“上次拖动位置”。界面缩放（按钮大小）或窗口尺寸变化后逻辑屏幕变小，记忆位置可能落到可视区之外，进度窗口便“消失”。对话框用 <code>Window</code>（默认 <code>constrain = true</code>）故不受影响——这正是“只有进度条不见了、对话框都正常”的原因。</li>
     </ul>
     <h3>4.5 IME 修补（中文输入，<code>app::patch_ime_events</code>）</h3>
     <div class="warn"><b>上游缺陷（已在 headless 测试中复现）：</b>egui 0.27.2 的 <code>TextEdit</code> 处理 <code>Event::CompositionEnd(prediction)</code> 时，要求当前光标与 <code>state.ime_cursor_range</code> 的 <code>secondary</code> 端一致才插入文本，而 <code>ime_cursor_range</code> <b>只在 <code>CompositionUpdate</code> 中更新</b>。Windows 输入法连续上屏时，winit 发出的是<b>没有 preedit 的 <code>Ime::Commit</code></b>，egui-winit 于是只推送一个 <code>CompositionEnd</code>，其 <code>ime_cursor_range</code> 仍停留在上一次的值 → 提交被静默丢弃，<b>表现为中文只能输入第一个字，之后的字词不显示</b>（字母/数字走 <code>Event::Text</code>，不受影响）。</div>
