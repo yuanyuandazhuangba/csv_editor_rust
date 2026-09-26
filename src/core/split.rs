@@ -136,6 +136,9 @@ pub fn split_by_rows(
     opts: &SplitOptions,
     progress: Option<&(dyn Fn(f64) + Sync)>,
 ) -> Result<usize, String> {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Mutex;
+
     if batch_size == 0 {
         return Err("每批行数必须大于 0".to_string());
     }
@@ -145,42 +148,84 @@ pub fn split_by_rows(
         return Err("没有可拆分的数据".to_string());
     }
     let header = model.header().to_vec();
-    let iter: Box<dyn Iterator<Item = usize>> = match rows {
-        Some(list) => Box::new(list.iter().map(|&r| r as usize)),
-        None => Box::new(0..n),
-    };
-    // peek 预检：数据恰好耗尽时不再打开新文件（避免 CSV 模式残留仅表头的空尾文件）
-    let mut iter = iter.peekable();
-    let mut file_count = 0usize;
-    let mut done = 0usize;
-    let mut rec: Vec<String> = Vec::new();
-    while iter.peek().is_some() {
-        let path = format!(
-            "{}\\split_data_part_{}.{}",
-            opts.folder,
-            file_count + 1,
-            opts.format.extension()
-        );
-        let mut w = OpenWriter::new(&path, opts.format, &header)?;
-        let mut written = 0usize;
-        for _ in 0..batch_size {
-            match iter.next() {
-                Some(row) => {
-                    model.row_into(row, &mut rec);
-                    w.write_row(&rec)?;
-                    written += 1;
+    // 批划分：第 b 批覆盖 [b*batch, min((b+1)*batch, total))，编号与单个文件一一对应
+    // （数据恰好耗尽时不会产生仅含表头的空尾文件，与原串行实现行为一致）。
+    let batch_count = total.div_ceil(batch_size);
+
+    // 并行写出：各批完全独立（不同输出文件、不同行区间），按批号原子分派。
+    // 并发度取核数但不超过 8 —— 拆分是 IO 密集型（同时打开多个输出文件），
+    // 并发过高在机械盘/网络盘上会因寻道竞争而变慢。
+    let threads = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(4)
+        .clamp(1, 8)
+        .min(batch_count);
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let files_done = AtomicUsize::new(0);
+    let err: Mutex<Option<String>> = Mutex::new(None);
+
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                let mut rec: Vec<String> = Vec::new();
+                loop {
+                    if err.lock().map(|g| g.is_some()).unwrap_or(true) {
+                        break; // 已有其他线程失败，尽快退出
+                    }
+                    let b = next.fetch_add(1, AtomicOrdering::Relaxed);
+                    if b >= batch_count {
+                        break;
+                    }
+                    let start = b * batch_size;
+                    let end = (start + batch_size).min(total);
+                    let path = format!(
+                        "{}\\split_data_part_{}.{}",
+                        opts.folder,
+                        b + 1,
+                        opts.format.extension()
+                    );
+                    let mut w = match OpenWriter::new(&path, opts.format, &header) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            *err.lock().unwrap() = Some(e);
+                            break;
+                        }
+                    };
+                    let mut write_err: Option<String> = None;
+                    for i in start..end {
+                        let row = match rows {
+                            Some(list) => list[i] as usize,
+                            None => i,
+                        };
+                        model.row_into(row, &mut rec);
+                        if let Err(e) = w.write_row(&rec) {
+                            write_err = Some(e);
+                            break;
+                        }
+                    }
+                    if let Some(e) = write_err {
+                        *err.lock().unwrap() = Some(e);
+                        break;
+                    }
+                    if let Err(e) = w.finish() {
+                        *err.lock().unwrap() = Some(e);
+                        break;
+                    }
+                    files_done.fetch_add(1, AtomicOrdering::Relaxed);
+                    let d = done.fetch_add(end - start, AtomicOrdering::Relaxed) + (end - start);
+                    if let Some(p) = progress {
+                        p(d as f64 / total as f64);
+                    }
                 }
-                None => break,
-            }
+            });
         }
-        w.finish()?;
-        file_count += 1;
-        done += written;
-        if let Some(p) = progress {
-            p(done as f64 / total as f64);
-        }
+    });
+
+    if let Some(e) = err.into_inner().unwrap_or(None) {
+        return Err(e);
     }
-    Ok(file_count)
+    Ok(files_done.load(AtomicOrdering::Relaxed))
 }
 
 /// 按字段拆分：以 columns 组合的值为 key，单遍分组写出。
@@ -240,10 +285,13 @@ fn split_by_field_csv(
     };
     let mut done = 0usize;
     let mut rec: Vec<String> = Vec::new();
+    // 复用 key 缓冲：命中已有分组时可直接用 &str 查询（Borrow<str>），
+    // 只有首次遇到新分组才需要 clone 一份 owned key 存入表里。
+    let mut key_buf = String::new();
     for row in iter {
         model.row_into(row, &mut rec);
-        let key = make_key(&rec, columns);
-        let idx = match key_index.get(&key) {
+        make_key_into(&rec, columns, &mut key_buf);
+        let idx = match key_index.get(key_buf.as_str()) {
             Some(&i) => i,
             None => {
                 if writers.len() >= MAX_SPLIT_FILES {
@@ -253,8 +301,8 @@ fn split_by_field_csv(
                     ));
                 }
                 let idx = writers.len();
-                let mut base = sanitize_filename(&key);
-                if key.trim().is_empty() || base == "nan" {
+                let mut base = sanitize_filename(&key_buf);
+                if key_buf.trim().is_empty() || base == "nan" {
                     empty_seq += 1;
                     base = format!("empty_value_{}", empty_seq);
                 }
@@ -273,7 +321,7 @@ fn split_by_field_csv(
                 );
                 let w = OpenWriter::new(&path, OutputFormat::Csv, &header)?;
                 writers.push(Some(w));
-                key_index.insert(key, idx);
+                key_index.insert(key_buf.clone(), idx);
                 idx
             }
         };
@@ -344,10 +392,13 @@ fn split_by_field_xlsx(
     };
     let mut done = 0usize;
     let mut rec: Vec<String> = Vec::new();
+    // 复用 key 缓冲：命中已有分组时可直接用 &str 查询（Borrow<str>），
+    // 只有首次遇到新分组才需要 clone 一份 owned key 存入表里。
+    let mut key_buf = String::new();
     for row in iter {
         model.row_into(row, &mut rec);
-        let key = make_key(&rec, columns);
-        let idx = match key_index.get(&key) {
+        make_key_into(&rec, columns, &mut key_buf);
+        let idx = match key_index.get(key_buf.as_str()) {
             Some(&i) => i,
             None => {
                 if csv_writers.len() >= MAX_SPLIT_FILES {
@@ -357,8 +408,8 @@ fn split_by_field_xlsx(
                     ));
                 }
                 let idx = csv_writers.len();
-                let mut base = sanitize_filename(&key);
-                if key.trim().is_empty() || base == "nan" {
+                let mut base = sanitize_filename(&key_buf);
+                if key_buf.trim().is_empty() || base == "nan" {
                     empty_seq += 1;
                     base = format!("empty_value_{}", empty_seq);
                 }
@@ -382,7 +433,7 @@ fn split_by_field_xlsx(
                 final_names.push(final_name);
                 temp_paths.push(temp_path.clone());
                 temp_guard.0.push(temp_path);
-                key_index.insert(key, idx);
+                key_index.insert(key_buf.clone(), idx);
                 idx
             }
         };
@@ -404,40 +455,86 @@ fn split_by_field_xlsx(
         p(0.5);
     }
 
-    // ---- 第二遍：逐个中间 CSV → XLSX（内存 = 单组行数），转换后删除中间文件 ----
-    let mut done_groups = 0usize;
-    let mut fields: Vec<String> = Vec::new();
-    for i in 0..group_count {
-        let src = &temp_paths[i];
-        let out_path = format!("{}\\{}.xlsx", opts.folder, final_names[i]);
-        let file = crate::core::reader::CsvFile::open(src).map_err(|e| e.to_string())?;
-        let mut w = XlsxWriter::new(&out_path, &header)?;
-        for r in 0..file.row_count() {
-            file.row_into(r, &mut fields);
-            w.write_row(&fields)?;
+    // ---- 第二遍：并行把各中间 CSV 转成 XLSX，转换后删除中间文件 ----
+    // 各分组相互独立（各自一个 Workbook、一个输出文件），可安全并行。
+    // 并发度上限取 6：每个转换会把该分组的全部单元格驻留内存，同时进行过多会
+    // 显著抬高进程峰值内存，此上限在“吃满核”与“控内存”之间折中。
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Mutex;
+
+    let threads = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(4)
+        .clamp(1, 6)
+        .min(group_count.max(1));
+    let next = AtomicUsize::new(0);
+    let done_groups = AtomicUsize::new(0);
+    let err: Mutex<Option<String>> = Mutex::new(None);
+
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                let mut fields: Vec<String> = Vec::new();
+                loop {
+                    if err.lock().map(|g| g.is_some()).unwrap_or(true) {
+                        break;
+                    }
+                    let i = next.fetch_add(1, AtomicOrdering::Relaxed);
+                    if i >= group_count {
+                        break;
+                    }
+                    let src = &temp_paths[i];
+                    let out_path = format!("{}\\{}.xlsx", opts.folder, final_names[i]);
+                    if let Err(e) = convert_csv_to_xlsx(src, &out_path, &header, &mut fields) {
+                        *err.lock().unwrap() = Some(e);
+                        break;
+                    }
+                    let _ = std::fs::remove_file(src);
+                    let d = done_groups.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                    if let Some(p) = progress {
+                        p(0.5 + (d as f64 / group_count.max(1) as f64) * 0.5);
+                    }
+                }
+            });
         }
-        w.finish()?;
-        drop(file); // 先释放 mmap 文件句柄，Windows 才能删除该中间 CSV
-        let _ = std::fs::remove_file(src);
-        done_groups += 1;
-        if let Some(p) = progress {
-            p(0.5 + (done_groups as f64 / group_count.max(1) as f64) * 0.5);
-        }
+    });
+
+    if let Some(e) = err.into_inner().unwrap_or(None) {
+        return Err(e);
     }
+    drop(temp_guard); // 提前释放：未转换成功的中间文件由 TempCleanup 兜底删除
     Ok(group_count)
 }
 
-/// 生成分组 key：多字段用 \x1F 连接（字段值中几乎不会出现）
-fn make_key(rec: &[String], columns: &[usize]) -> String {
-    if columns.len() == 1 {
-        // 字段数不一致的行（列数少于所选索引）→ 视为空值
-        return rec.get(columns[0]).map(|s| s.trim()).unwrap_or("").to_string();
+/// 把一份中间 CSV 转换成 XLSX（供并行转换调用；`fields` 为复用的行缓冲）。
+fn convert_csv_to_xlsx(
+    src: &str,
+    out_path: &str,
+    header: &[String],
+    fields: &mut Vec<String>,
+) -> Result<(), String> {
+    let file = crate::core::reader::CsvFile::open(src).map_err(|e| e.to_string())?;
+    let mut w = XlsxWriter::new(out_path, header)?;
+    for r in 0..file.row_count() {
+        file.row_into(r, fields);
+        w.write_row(fields)?;
     }
-    let mut parts = Vec::with_capacity(columns.len());
-    for &c in columns {
-        parts.push(rec.get(c).map(|s| s.trim()).unwrap_or(""));
+    w.finish()?;
+    // 先释放 mmap 文件句柄，Windows 才能删除该中间 CSV
+    drop(file);
+    Ok(())
+}
+
+/// 生成分组 key，写入复用的缓冲（避免每行一次 String 分配）。
+/// 多字段用 \x1F 连接（字段值中几乎不会出现）；字段数不足的行按空值处理。
+fn make_key_into(rec: &[String], columns: &[usize], out: &mut String) {
+    out.clear();
+    for (i, &c) in columns.iter().enumerate() {
+        if i > 0 {
+            out.push('\u{1F}');
+        }
+        out.push_str(rec.get(c).map(|s| s.trim()).unwrap_or(""));
     }
-    parts.join("\u{1F}")
 }
 
 #[cfg(test)]
@@ -759,6 +856,96 @@ mod tests {
         };
         let count = split_by_field(&m, None, &[1], &opts, None).unwrap();
         assert!(count >= 1);
+        cleanup(&dir);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn split_by_rows_parallel_many_batches() {
+        // 并行分派：批数（1000）远多于并发度上限（8），验证文件数、行序与内容
+        let mut data = String::from("ID,NAME\n");
+        for i in 0..1000 {
+            data.push_str(&format!("{},n{}\n", i, i));
+        }
+        let p = write_temp_file(data.as_bytes(), "_manybatch.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let dir = temp_dir();
+        let opts = SplitOptions {
+            folder: dir.clone(),
+            format: OutputFormat::Csv,
+        };
+        let count = split_by_rows(&m, None, 1, &opts, None).unwrap();
+        assert_eq!(count, 1000);
+        // 抽查若干批：批号即文件序号，且行序与源文件一致
+        for i in [0usize, 1, 499, 998, 999] {
+            let c =
+                std::fs::read_to_string(format!("{}\\split_data_part_{}.csv", dir, i + 1)).unwrap();
+            assert!(
+                c.contains(&format!("{},n{}", i, i)),
+                "第 {} 批内容缺失: {}",
+                i + 1,
+                c
+            );
+            assert!(!c.contains(&format!("{},n{}", i + 1, i + 1)), "第 {} 批混入了他批数据", i + 1);
+        }
+        cleanup(&dir);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn split_by_rows_reports_error_for_bad_folder() {
+        // 并行写出遇到坏目录：必须返回 Err（错误在多个工作线程间正确汇总，而非 panic/静默成功）
+        let data = "ID,NAME\n1,a\n2,b\n";
+        let p = write_temp_file(data.as_bytes(), "_badfolder.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let opts = SplitOptions {
+            folder: std::env::temp_dir()
+                .join("csv_split_no_such_dir_should_not_exist")
+                .to_string_lossy()
+                .into_owned(),
+            format: OutputFormat::Csv,
+        };
+        let e = split_by_rows(&m, None, 1, &opts, None).unwrap_err();
+        assert!(!e.is_empty(), "应返回可读的错误信息");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn split_by_field_xlsx_parallel_many_groups() {
+        // XLSX 并行转换：分组数（10）超过并发上限（6），验证不丢组且内容正确
+        let mut data = String::from("GROUP,VAL\n");
+        for i in 0..500u32 {
+            data.push_str(&format!("g{},v{}\n", i % 10, i));
+        }
+        let p = write_temp_file(data.as_bytes(), "_xlsxpar.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let dir = temp_dir();
+        let opts = SplitOptions {
+            folder: dir.clone(),
+            format: OutputFormat::Xlsx,
+        };
+        let count = split_by_field(&m, None, &[0], &opts, None).unwrap();
+        assert_eq!(count, 10);
+        for g in 0..10 {
+            let path = format!("{}\\g{}.xlsx", dir, g);
+            let file = std::fs::File::open(&path).unwrap_or_else(|_| panic!("缺少 {}", path));
+            let mut archive = zip::ZipArchive::new(file).unwrap();
+            let mut xml = String::new();
+            if let Ok(mut s) = archive.by_name("xl/sharedStrings.xml") {
+                std::io::Read::read_to_string(&mut s, &mut xml).unwrap();
+            }
+            // 每一组的行都应落在自己的文件里（抽查该组的首个值）
+            let first = format!("v{}", g);
+            assert!(xml.contains(&first), "g{}.xlsx 内容缺失（{}）", g, path);
+        }
+        // 中间临时 CSV 应已全部清理
+        let tmp_left = std::fs::read_dir(&dir)
+            .map(|it| {
+                it.filter_map(|e| e.ok())
+                    .any(|e| e.file_name().to_string_lossy().starts_with("~split_tmp"))
+            })
+            .unwrap_or(false);
+        assert!(!tmp_left, "并行转换后应清理中间临时 CSV");
         cleanup(&dir);
         std::fs::remove_file(&p).ok();
     }

@@ -203,6 +203,11 @@
       <li>文件数上限保护 <code>MAX_SPLIT_FILES = 20000</code>；重名文件自动追加序号（Python 版直接覆盖）。</li>
       <li>文件名清洗：替换 Windows 非法字符与控制字符、压缩连续下划线、按字符边界截断 100 字符。</li>
       <li>多列组合键用 <code>\x1F</code> 连接，避免歧义。</li>
+      <li><b>按行数拆分：并行写出</b>。各批的行区间与输出文件彼此独立，按批号用原子计数分派给工作线程；并发度取核数但不超过 8（拆分是 IO 密集型，同时打开过多输出文件在机械盘/网络盘上会因寻道竞争变慢）。实测 200 万行 × 15 列（326MB）：4.61s → <b>0.66s</b>，并行度 1.00 → 7.15。</li>
+      <li><b>按字段拆分 XLSX：第二阶段并行转换</b>。两阶段拆分中「中间 CSV → XLSX」的各分组相互独立，可安全并行；并发度上限取 6，因为每个转换会把该分组的全部单元格驻留内存，同时进行过多会显著抬高进程峰值内存。实测 47.66s → <b>18.27s</b>，并行度 0.97 → 3.72。</li>
+      <li><b>按字段拆分（CSV）仍为单线程</b>，这是刻意取舍：它要求“每个分组内的行序与源文件一致”，并行写同一文件会打乱顺序；可行的并行化要么两遍扫描（先算 key 再随机读回），要么按块切分临时文件再合并（临时文件数 = 块数 × 分组数），代价与收益不成比例。该路径只做单线程内的开销优化：分组 key 写入复用缓冲，命中已有分组时用 <code>&amp;str</code> 借用查询（<code>HashMap&lt;String, _&gt;</code> 实现 <code>Borrow&lt;str&gt;</code>），只有首次出现新分组才 <code>clone</code> 一份 owned key（实测 5.62s → 5.28s）。</li>
+      <li><b>CSV 写出路径</b>：<code>CsvWriter::write_row</code> 需要引号时按引号位置<b>分片写出</b>（早期实现是逐字节 <code>write_all</code>）。两条实测教训：不要在中间 <code>Vec</code> 里拼整行再写出（多一次整行拷贝，按字段拆分反而慢 14%）；<code>needs_quote</code> 保持用 <code>str::contains</code>（底层 memchr），改成手写逐字节扫描会慢约 7%。</li>
+      <li>性能基准：<code>src/bin/split_bench.rs</code>（<code>cargo run --release --bin split_bench -- [行数] [重复次数]</code>），输出各场景墙钟耗时、进程 CPU 时间与平均并行度（CPU/墙钟，≈1.0 即单核）。单次测量有 ±10% 抖动，故默认重复 3 次取最小值。</li>
     </ul>
 
     <h3>3.6 列操作 / undo-redo（column_ops.rs）</h3>
@@ -305,7 +310,7 @@ cargo +nightly-2025-06-23-x86_64-pc-windows-gnu build --release \
     <h2>六、构建与测试</h2>
     <h3>6.1 开发 / 测试（stable）</h3>
     <pre><code>set PATH=D:\project_xiangmu\.rust-toolchain\rust-1.88.0-x86_64-pc-windows-gnu\rustc\bin;D:\project_xiangmu\.rust-toolchain\rust-1.88.0-x86_64-pc-windows-gnu\cargo\bin;%PATH%
-cargo test          # 99 项单元测试
+cargo test          # 102 项单元测试
 cargo run --bin csv_editor_rust</code></pre>
     <h3>6.2 Win7 单文件发布</h3>
     <p>运行项目根目录的 <code>build_win7.bat</code>（或手动执行上文 5.1 命令）。</p>
@@ -313,9 +318,10 @@ cargo run --bin csv_editor_rust</code></pre>
     <h3>6.3 测试与验证工具</h3>
     <table>
       <tr><th style="width:150px;">工具</th><th>用途</th></tr>
-      <tr><td><code>cargo test</code></td><td>99 项单元测试，覆盖编码检测、行索引边界、字段切分、筛选语义、列操作、导出、多文件合并、IME 事件修补等。</td></tr>
+      <tr><td><code>cargo test</code></td><td>102 项单元测试，覆盖编码检测、行索引边界、字段切分、筛选语义、列操作、导出、多文件合并、拆分并行化、IME 事件修补等。</td></tr>
       <tr><td><code>bin/inspect</code></td><td>打开报告：行数/列数/编码/耗时/峰值内存/采样预览。</td></tr>
       <tr><td><code>bin/verify</code></td><td>与 <code>testdata/verify_ref.py</code> 输出同结构 JSON（筛选行号 + 行哈希），验证 Rust 与 Python 语义一致。</td></tr>
+      <tr><td><code>bin/split_bench</code></td><td>拆分性能基准：各场景耗时、CPU 时间与并行度（用 <code>--release</code> 运行）。</td></tr>
       <tr><td><code>bin/e2e</code></td><td>端到端回归：打开 → 类型推断 → 筛选 → 列操作(undo/redo) → 拆分 → 导出 CSV/XLSX。</td></tr>
     </table>
     <div class="note">testdata/ 含 jymxb_1000.csv（真实数据子集）、ref_result.json / rust_result.json（对照结果）。</div>
