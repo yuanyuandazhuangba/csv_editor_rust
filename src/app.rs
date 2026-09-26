@@ -63,12 +63,26 @@ pub struct CsvEditorApp {
     qr_texture: Option<egui::TextureHandle>,
     // 上一次合并输出的临时文件（下次合并前清理，避免临时目录堆积）
     merged_temp: Option<String>,
+    /// 最近一次「提取唯一行」的结果（重复行对应表 + 判重字段）
+    last_dedup: Option<LastDedup>,
     // 界面缩放（按钮大小）的唯一真值源。拖动过程中不立即应用缩放：
     // set_zoom_factor 会改变 pixels_per_point，使指针的逻辑坐标在一帧内突变，
     // 导致 DragValue 的 drag_delta() 出现虚假位移、数值反向跳变并与界面震荡。
     ui_zoom: f32,
     /// 缩放控件当前是否处于拖动中（拖动期间不应用缩放，松手后一次性应用）
     zoom_dragging: bool,
+}
+
+/// 最近一次「提取唯一行」的结果信息（供结果弹窗与「导出重复行对应表」使用）
+pub struct LastDedup {
+    /// (保留的首次出现行, 被剔除的重复行)
+    pub map: Vec<(u32, u32)>,
+    /// 判重字段（原始列索引）
+    pub key_columns: Vec<usize>,
+    /// 判重范围行数
+    pub input_rows: usize,
+    /// 去重后行数
+    pub unique_rows: usize,
 }
 
 /// 弹出窗口位置（数据预览区右侧靠上为默认）
@@ -140,6 +154,7 @@ impl CsvEditorApp {
             show_analysis_toolbar: true,
             qr_texture: None,
             merged_temp: None,
+            last_dedup: None,
             ui_zoom: cc.egui_ctx.zoom_factor().clamp(1.0, 1.5),
             zoom_dragging: false,
         }
@@ -247,9 +262,35 @@ impl CsvEditorApp {
                     self.filtered_rows = Some(hits.clone());
                     self.log(&format!("筛选完成，命中行数: {}", hits.len()));
                 }
-                BgMsg::SplitDone(count) => {
+                BgMsg::SplitDone(report) => {
                     self.busy = None;
-                    self.log(&format!("拆分完成，共生成 {} 个文件", count));
+                    // 逐文件列出「不计表头的数据行数」，并给出与数据来源总行数的核对结论，
+                    // 让用户能直观确认拆分导出完整、无遗漏。
+                    self.log(&format!(
+                        "拆分完成：共 {} 个文件（数据来源 {} 行，均不含表头）",
+                        report.files, report.source_rows
+                    ));
+                    const MAX_LIST: usize = 50; // 文件很多时避免刷屏，其余汇总显示
+                    for s in report.stats.iter().take(MAX_LIST) {
+                        self.log(&format!("    {}：{} 行（不含表头）", s.name, s.disk_rows));
+                    }
+                    if report.stats.len() > MAX_LIST {
+                        let rest: usize = report.stats[MAX_LIST..]
+                            .iter()
+                            .map(|s| s.disk_rows)
+                            .sum();
+                        self.log(&format!(
+                            "    ……（其余 {} 个文件略，合计 {} 行）",
+                            report.stats.len() - MAX_LIST,
+                            rest
+                        ));
+                    }
+                    self.log(&format!(
+                        "    各文件合计：{} 行（不含表头）；数据来源总行数：{} 行",
+                        report.total_on_disk(),
+                        report.source_rows
+                    ));
+                    self.log(&report.verdict());
                 }
                 BgMsg::ExportDone(n, path) => {
                     self.busy = None;
@@ -298,7 +339,7 @@ impl CsvEditorApp {
                     // 合并结果作为当前数据打开（复用既有加载流程）
                     self.open_file(path);
                 }
-                BgMsg::DedupDone(rows, report) => {
+                BgMsg::DedupDone(rows, report, map, key_cols) => {
                     self.busy = None;
                     // 去重结果作为新的当前视图：后续导出/拆分/统计都基于唯一行
                     self.filtered_rows = Some(rows);
@@ -309,6 +350,14 @@ impl CsvEditorApp {
                         report.duplicates,
                         report.key_columns
                     ));
+                    // 保存「保留行 ↔ 被剔除行」的对应关系，并弹出结果提示窗
+                    self.last_dedup = Some(LastDedup {
+                        map,
+                        key_columns: key_cols,
+                        input_rows: report.input_rows,
+                        unique_rows: report.unique_rows,
+                    });
+                    self.dialogs.dedup_done_window = true;
                 }
                 BgMsg::Error(e) => {
                     self.busy = None;

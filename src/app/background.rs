@@ -5,6 +5,7 @@ use std::thread::JoinHandle;
 
 use csv_editor_rust::core::dedup::DedupReport;
 use csv_editor_rust::core::merge::{FileHeader, HeaderCheck, MergeReport};
+use csv_editor_rust::core::split::SplitReport;
 use csv_editor_rust::core::model::DataModel;
 
 /// 后台 → UI 消息
@@ -15,16 +16,16 @@ pub enum BgMsg {
     FileLoaded(String, DataModel),
     /// 筛选完成（命中行号）
     Filtered(Vec<u32>),
-    /// 拆分完成（文件数）
-    SplitDone(usize),
+    /// 拆分完成（含逐文件行数与完整性核对结论）
+    SplitDone(SplitReport),
     /// 导出完成（行数, 路径）
     ExportDone(usize, String),
     /// 多文件表头读取完成（表头列表, 一致性判定, 差异字段）
     MergeHeaders(Vec<FileHeader>, HeaderCheck, Vec<String>),
     /// 多文件合并完成
     Merged(MergeReport),
-    /// 提取唯一行完成（唯一行号, 统计）
-    DedupDone(Vec<u32>, DedupReport),
+    /// 提取唯一行完成（唯一行号, 统计, 重复行对应关系, 判重字段原始列索引）
+    DedupDone(Vec<u32>, DedupReport, Vec<(u32, u32)>, Vec<usize>),
     /// 错误
     Error(String),
 }

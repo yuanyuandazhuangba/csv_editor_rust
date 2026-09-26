@@ -206,6 +206,77 @@ fn is_formula_prefix(s: &str) -> bool {
     )
 }
 
+/// 导出「重复行对应表」：每条记录给出"保留的首次出现行 ↔ 被剔除的重复行"，
+/// 并附上判重字段的取值，便于用户逐条核对去重是否正确。
+///
+/// 行号从 **1** 开始（与界面表格显示一致）。`is_xlsx` 为真时导出 XLSX，否则 CSV。
+pub fn export_dup_map(
+    model: &super::model::DataModel,
+    map: &[(u32, u32)],
+    key_columns: &[usize],
+    path: &str,
+    is_xlsx: bool,
+    progress: Option<&(dyn Fn(f64) + Sync)>,
+) -> Result<usize, String> {
+    let mut header: Vec<String> = vec!["保留行号".to_string(), "被剔除行号".to_string()];
+    for &c in key_columns {
+        header.push(
+            model
+                .header()
+                .get(c)
+                .cloned()
+                .unwrap_or_else(|| format!("列{}", c + 1)),
+        );
+    }
+
+    let total = map.len();
+    // 判重字段值直接从原文件按需读取（复用读取器，零分配）
+    let mut reader = super::reader::RowReader::new(key_columns.to_vec());
+    let mut row: Vec<String> = Vec::with_capacity(header.len());
+
+    let mut csv_w: Option<CsvWriter> = if is_xlsx {
+        None
+    } else {
+        Some(CsvWriter::new(path, &header).map_err(|e| e.to_string())?)
+    };
+    let mut xlsx_w: Option<XlsxWriter> = if is_xlsx {
+        Some(XlsxWriter::new(path, &header)?)
+    } else {
+        None
+    };
+
+    for (i, &(kept, dropped)) in map.iter().enumerate() {
+        row.clear();
+        row.push((kept + 1).to_string());
+        row.push((dropped + 1).to_string());
+        reader.load(model.file(), kept as usize);
+        for &c in key_columns {
+            row.push(reader.value(c).to_string());
+        }
+        if let Some(w) = csv_w.as_mut() {
+            w.write_row(&row).map_err(|e| e.to_string())?;
+        }
+        if let Some(w) = xlsx_w.as_mut() {
+            w.write_row(&row)?;
+        }
+        if let Some(p) = progress {
+            if i % 50_000 == 0 {
+                p(i as f64 / total.max(1) as f64);
+            }
+        }
+    }
+    if let Some(w) = csv_w {
+        w.finish().map_err(|e| e.to_string())?;
+    }
+    if let Some(w) = xlsx_w {
+        w.finish()?;
+    }
+    if let Some(p) = progress {
+        p(1.0);
+    }
+    Ok(total)
+}
+
 /// 便捷：把行集合导出为 CSV
 pub fn export_rows_csv(
     path: &str,

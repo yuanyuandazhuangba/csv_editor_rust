@@ -11,7 +11,7 @@
 //! 存入去重表。筛选/去重属于「结果相互依赖」的扫描，无法像拆分那样按行块并行
 //! （并行会破坏「保留首次出现」的顺序语义）。
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use super::model::DataModel;
 use super::reader::RowReader;
@@ -38,6 +38,20 @@ pub fn unique_rows(
     columns: &[usize],
     progress: Option<&(dyn Fn(f64) + Sync)>,
 ) -> (Vec<u32>, DedupReport) {
+    let (unique, report, _) = unique_rows_with_map(model, rows, columns, progress, false);
+    (unique, report)
+}
+
+/// 与 [`unique_rows`] 相同，但当 `collect_map` 为真时**额外返回重复行对应关系**
+/// `(保留的首次出现行, 被剔除的重复行)`（按被剔除行的出现顺序），
+/// 供界面导出「重复行对应表」以便逐条核对。
+pub fn unique_rows_with_map(
+    model: &DataModel,
+    rows: Option<&[u32]>,
+    columns: &[usize],
+    progress: Option<&(dyn Fn(f64) + Sync)>,
+    collect_map: bool,
+) -> (Vec<u32>, DedupReport, Vec<(u32, u32)>) {
     let column_count = model.column_count();
     // 空表示「全部字段」；同时丢弃越界列（界面可能传入陈旧索引）
     let cols: Vec<usize> = if columns.is_empty() {
@@ -58,8 +72,10 @@ pub fn unique_rows(
     };
 
     let total = rows.map(|v| v.len()).unwrap_or_else(|| model.row_count());
-    let mut seen: HashSet<String> = HashSet::with_capacity(1024);
+    // key -> 该 key 首次出现的行号（用行号而不是计数，便于导出对应关系）
+    let mut seen: HashMap<String, u32> = HashMap::with_capacity(1024);
     let mut out: Vec<u32> = Vec::with_capacity(total);
+    let mut duplicates: Vec<(u32, u32)> = Vec::new();
     let mut key = String::with_capacity(256);
     // 整行只解析一次，字段文本零分配
     let mut reader = RowReader::new(cols.clone());
@@ -78,9 +94,16 @@ pub fn unique_rows(
             key.push_str(reader.value(c));
         }
         // 命中已有 key 时用 &str 借用查询，不分配；仅新唯一行 clone 一份
-        if !seen.contains(key.as_str()) {
-            seen.insert(key.clone());
-            out.push(row as u32);
+        match seen.get(key.as_str()) {
+            Some(&kept) => {
+                if collect_map {
+                    duplicates.push((kept, row as u32));
+                }
+            }
+            None => {
+                seen.insert(key.clone(), row as u32);
+                out.push(row as u32);
+            }
         }
         if let Some(p) = progress {
             if i % 50_000 == 0 {
@@ -98,7 +121,7 @@ pub fn unique_rows(
         duplicates: total.saturating_sub(out.len()),
         key_columns: cols.len(),
     };
-    (out, report)
+    (out, report, duplicates)
 }
 
 #[cfg(test)]
@@ -207,6 +230,25 @@ mod tests {
         let (rows2, rep2) = unique_rows(&m, None, &[99], None);
         assert_eq!(rows2, vec![0]);
         assert_eq!(rep2.key_columns, 2, "全部越界时应退化为全部字段");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn dedup_map_records_kept_and_dropped_rows() {
+        // 对应关系：每个被剔除的重复行都指向它对应的首次保留行（行号从 0 起）
+        let p = write_temp(
+            b"ID,CITY\n1,bj\n2,sh\n1,bj\n3,bj\n2,sh\n",
+            "_map.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        // 只按 CITY 判重：bj 首次在第 0 行、sh 首次在第 1 行
+        let (unique, rep, map) = unique_rows_with_map(&m, None, &[1], None, true);
+        assert_eq!(unique, vec![0, 1]);
+        assert_eq!(rep.duplicates, 3);
+        assert_eq!(map, vec![(0, 2), (0, 3), (1, 4)]);
+        // 不收集时对应表为空（省内存）
+        let (_, _, empty) = unique_rows_with_map(&m, None, &[1], None, false);
+        assert!(empty.is_empty());
         std::fs::remove_file(&p).ok();
     }
 

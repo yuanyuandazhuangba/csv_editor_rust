@@ -89,9 +89,16 @@ fn main() {
         };
         let t = Instant::now();
         match split::split_by_field(&m, None, &[c_bank], &opts, None) {
-            Ok(n) => {
-                split_count = n;
-                println!("OK  按字段拆分: {} 个文件 ({:.2}s)", n, t.elapsed().as_secs_f64());
+            Ok(rep) => {
+                split_count = rep.files;
+                println!(
+                    "OK  按字段拆分: {} 个文件 / {} 行（来源 {} 行），完整性核对: {} ({:.2}s)",
+                    rep.files,
+                    rep.total_on_disk(),
+                    rep.source_rows,
+                    if rep.is_complete() { "通过" } else { "未通过" },
+                    t.elapsed().as_secs_f64()
+                );
             }
             Err(e) => {
                 println!("FAIL 拆分: {}", e);

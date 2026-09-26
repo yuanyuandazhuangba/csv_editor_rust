@@ -149,8 +149,13 @@ fn main() {
             folder: out_rows.to_string_lossy().into_owned(),
             format: OutputFormat::Csv,
         };
-        let n = split::split_by_rows(&m, None, 100_000, &opts, None).unwrap();
-        format!("{n} 个文件")
+        let rep = split::split_by_rows(&m, None, 100_000, &opts, None).unwrap();
+        format!(
+            "{} 个文件 / {} 行{}",
+            rep.files,
+            rep.total_on_disk(),
+            if rep.is_complete() { "（核对通过）" } else { "（核对未通过）" }
+        )
     }));
 
     results.push(bench("按字段拆分 CSV（银行列，20 个唯一值）", repeat, || {
@@ -158,8 +163,13 @@ fn main() {
             folder: out_field.to_string_lossy().into_owned(),
             format: OutputFormat::Csv,
         };
-        let n = split::split_by_field(&m, None, &[1], &opts, None).unwrap();
-        format!("{n} 个文件")
+        let rep = split::split_by_field(&m, None, &[1], &opts, None).unwrap();
+        format!(
+            "{} 个文件 / {} 行{}",
+            rep.files,
+            rep.total_on_disk(),
+            if rep.is_complete() { "（核对通过）" } else { "（核对未通过）" }
+        )
     }));
 
     results.push(bench("按字段拆分 XLSX（两阶段，20 组）", repeat, || {
@@ -167,8 +177,13 @@ fn main() {
             folder: out_xlsx.to_string_lossy().into_owned(),
             format: OutputFormat::Xlsx,
         };
-        let n = split::split_by_field(&m, None, &[1], &opts, None).unwrap();
-        format!("{n} 个文件")
+        let rep = split::split_by_field(&m, None, &[1], &opts, None).unwrap();
+        format!(
+            "{} 个文件 / {} 行{}",
+            rep.files,
+            rep.total_on_disk(),
+            if rep.is_complete() { "（核对通过）" } else { "（核对未通过）" }
+        )
     }));
 
     // 参考项：并行筛选（项目里少数已并行的路径），用于对照计算密集型的并行度

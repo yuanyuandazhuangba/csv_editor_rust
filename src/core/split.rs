@@ -45,6 +45,150 @@ impl OutputFormat {
     }
 }
 
+/// 单个输出文件的行数统计（完整性核对用）
+#[derive(Debug, Clone)]
+pub struct SplitFileStat {
+    /// 输出文件名（不含目录）
+    pub name: String,
+    /// 写入时累计的数据行数（不含表头）
+    pub written_rows: usize,
+    /// 读回核对得到的落盘数据行数（不含表头）
+    pub disk_rows: usize,
+}
+
+/// 拆分结果报告：用于向用户证明「导出数据完整、无遗漏」。
+///
+/// 每个文件都记录两个数：写入时累计的行数，以及**读回文件重新统计**的落盘行数。
+/// 两者一致、且落盘合计等于数据来源行数，才算核对通过。
+#[derive(Debug, Clone)]
+pub struct SplitReport {
+    /// 生成的文件数
+    pub files: usize,
+    /// 数据来源行数（本次要拆分的行数，不含表头）
+    pub source_rows: usize,
+    /// 各输出文件的统计（按文件顺序）
+    pub stats: Vec<SplitFileStat>,
+}
+
+impl SplitReport {
+    /// 写入时累计的总行数
+    pub fn total_written(&self) -> usize {
+        self.stats.iter().map(|s| s.written_rows).sum()
+    }
+
+    /// 读回核对的总行数（真实落盘）
+    pub fn total_on_disk(&self) -> usize {
+        self.stats.iter().map(|s| s.disk_rows).sum()
+    }
+
+    /// 完整性结论：每个文件「写入行数 == 落盘行数」，且落盘合计 == 数据来源行数
+    pub fn is_complete(&self) -> bool {
+        self.total_on_disk() == self.source_rows
+            && self.stats.iter().all(|s| s.written_rows == s.disk_rows)
+    }
+
+    /// 供日志显示的一句话核对结论
+    pub fn verdict(&self) -> String {
+        if self.is_complete() {
+            format!(
+                "✅ 完整性核对通过：全部输出合计 {} 行（不含表头）= 数据来源 {} 行，无遗漏",
+                self.total_on_disk(),
+                self.source_rows
+            )
+        } else {
+            let diff = self.source_rows as isize - self.total_on_disk() as isize;
+            format!(
+                "⚠ 完整性核对未通过：全部输出合计 {} 行 ≠ 数据来源 {} 行（相差 {} 行），请检查磁盘空间与目标目录权限",
+                self.total_on_disk(),
+                self.source_rows,
+                diff.abs()
+            )
+        }
+    }
+}
+
+/// 流式统计文件的数据行数（**不含表头**，引号感知：引号字段内的换行不计行）。
+///
+/// 用于拆分完成后核对输出文件的真实落盘行数。分块读取、不建索引、不缓存内容，
+/// 因此对超大文件也只是一次顺序读。
+pub fn count_data_rows(path: &str) -> Result<usize, String> {
+    use std::io::Read;
+
+    let mut f = std::fs::File::open(path).map_err(|e| format!("无法读取文件 {}：{}", path, e))?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut boundaries = 0usize; // 引号感知的行边界数
+    let mut in_quotes = false;
+    let mut pending_cr = false; // 跨块的 \r，留待下一块判定
+    let mut last_byte: Option<u8> = None;
+    loop {
+        let n = f.read(&mut buf).map_err(|e| format!("读取文件失败：{}", e))?;
+        if n == 0 {
+            break;
+        }
+        let chunk = &buf[..n];
+        last_byte = Some(chunk[n - 1]);
+        let mut i = 0usize;
+        if pending_cr {
+            // 上一块末尾的 \r：本块首字节为 \n 则合并为一个 \r\n 边界，否则 \r 单独成边界
+            boundaries += 1;
+            if chunk[0] == b'\n' {
+                i = 1;
+            }
+            pending_cr = false;
+        }
+        while i < n {
+            let b = chunk[i];
+            if in_quotes {
+                if b == b'"' {
+                    if i + 1 < n && chunk[i + 1] == b'"' {
+                        i += 2; // 转义引号
+                    } else {
+                        in_quotes = false;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            } else {
+                match b {
+                    b'"' => {
+                        in_quotes = true;
+                        i += 1;
+                    }
+                    b'\n' => {
+                        boundaries += 1;
+                        i += 1;
+                    }
+                    b'\r' => {
+                        if i + 1 == n {
+                            pending_cr = true;
+                            i += 1;
+                        } else if chunk[i + 1] == b'\n' {
+                            boundaries += 1;
+                            i += 2;
+                        } else {
+                            boundaries += 1;
+                            i += 1;
+                        }
+                    }
+                    _ => i += 1,
+                }
+            }
+        }
+    }
+    if pending_cr {
+        boundaries += 1;
+    }
+    let data_rows = match last_byte {
+        None => 0, // 空文件
+        // 末尾有换行：最后一个边界之后没有内容，boundaries 中已含表头行 → 减 1
+        Some(b'\n') | Some(b'\r') => boundaries.saturating_sub(1),
+        // 末尾无换行：表头 + 数据行 = boundaries + 1
+        Some(_) => boundaries,
+    };
+    Ok(data_rows)
+}
+
 /// 拆分选项
 #[derive(Debug, Clone)]
 pub struct SplitOptions {
@@ -135,7 +279,7 @@ pub fn split_by_rows(
     batch_size: usize,
     opts: &SplitOptions,
     progress: Option<&(dyn Fn(f64) + Sync)>,
-) -> Result<usize, String> {
+) -> Result<SplitReport, String> {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Mutex;
 
@@ -164,6 +308,8 @@ pub fn split_by_rows(
     let done = AtomicUsize::new(0);
     let files_done = AtomicUsize::new(0);
     let err: Mutex<Option<String>> = Mutex::new(None);
+    // 收集每批的写入行数：(批号, 行数)；批号唯一，写入端每次只锁一下
+    let written_log: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::with_capacity(batch_count));
 
     std::thread::scope(|s| {
         for _ in 0..threads {
@@ -213,6 +359,7 @@ pub fn split_by_rows(
                         break;
                     }
                     files_done.fetch_add(1, AtomicOrdering::Relaxed);
+                    written_log.lock().unwrap().push((b, end - start));
                     let d = done.fetch_add(end - start, AtomicOrdering::Relaxed) + (end - start);
                     if let Some(p) = progress {
                         p(d as f64 / total as f64);
@@ -225,7 +372,32 @@ pub fn split_by_rows(
     if let Some(e) = err.into_inner().unwrap_or(None) {
         return Err(e);
     }
-    Ok(files_done.load(AtomicOrdering::Relaxed))
+    let files = files_done.load(AtomicOrdering::Relaxed);
+    let _ = files;
+
+    // 读回核对：逐个输出文件重新统计落盘数据行数（引号感知、流式、不建索引）
+    let mut written = written_log.into_inner().unwrap_or_default();
+    written.sort_unstable_by_key(|(b, _)| *b);
+    let mut stats: Vec<SplitFileStat> = Vec::with_capacity(written.len());
+    for (b, rows) in written {
+        let name = format!(
+            "split_data_part_{}.{}",
+            b + 1,
+            opts.format.extension()
+        );
+        let path = format!("{}\\{}", opts.folder, name);
+        let disk_rows = count_data_rows(&path)?;
+        stats.push(SplitFileStat {
+            name,
+            written_rows: rows,
+            disk_rows,
+        });
+    }
+    Ok(SplitReport {
+        files: stats.len(),
+        source_rows: total,
+        stats,
+    })
 }
 
 /// 按字段拆分：以 columns 组合的值为 key，单遍分组写出。
@@ -237,7 +409,7 @@ pub fn split_by_field(
     columns: &[usize],
     opts: &SplitOptions,
     progress: Option<&(dyn Fn(f64) + Sync)>,
-) -> Result<usize, String> {
+) -> Result<SplitReport, String> {
     if columns.is_empty() {
         return Err("请选择至少一个拆分字段".to_string());
     }
@@ -267,13 +439,16 @@ fn split_by_field_csv(
     columns: &[usize],
     opts: &SplitOptions,
     progress: Option<&(dyn Fn(f64) + Sync)>,
-) -> Result<usize, String> {
+) -> Result<SplitReport, String> {
     let n = model.row_count();
     let total = rows.map(|v| v.len()).unwrap_or(n);
     let header = model.header().to_vec();
 
     // key(字段值组合) -> 文件序号
     let mut key_index: HashMap<String, usize> = HashMap::with_capacity(1024);
+    // 每个分组写入的数据行数与最终文件名（完整性核对用）
+    let mut group_rows: Vec<usize> = Vec::new();
+    let mut final_names: Vec<String> = Vec::new();
     // 文件名占用统计（重名追加序号）
     let mut used_names: HashMap<String, usize> = HashMap::new();
     let mut writers: Vec<Option<OpenWriter>> = Vec::new();
@@ -321,12 +496,15 @@ fn split_by_field_csv(
                 );
                 let w = OpenWriter::new(&path, OutputFormat::Csv, &header)?;
                 writers.push(Some(w));
+                group_rows.push(0);
+                final_names.push(final_name);
                 key_index.insert(key_buf.clone(), idx);
                 idx
             }
         };
         if let Some(w) = writers[idx].as_mut() {
             w.write_row(&rec)?;
+            group_rows[idx] += 1;
         }
         done += 1;
         if done % 50000 == 0 {
@@ -339,11 +517,27 @@ fn split_by_field_csv(
         p(1.0);
     }
 
-    let count = writers.len();
     for w in writers.into_iter().flatten() {
         w.finish()?;
     }
-    Ok(count)
+
+    // 读回核对：逐个输出文件重新统计落盘数据行数
+    let mut stats: Vec<SplitFileStat> = Vec::with_capacity(final_names.len());
+    for (i, name) in final_names.iter().enumerate() {
+        let file_name = format!("{}.{}", name, opts.format.extension());
+        let path = format!("{}\\{}", opts.folder, file_name);
+        let disk_rows = count_data_rows(&path)?;
+        stats.push(SplitFileStat {
+            name: file_name,
+            written_rows: group_rows.get(i).copied().unwrap_or(0),
+            disk_rows,
+        });
+    }
+    Ok(SplitReport {
+        files: stats.len(),
+        source_rows: total,
+        stats,
+    })
 }
 
 /// RAII：函数返回（含错误）时删除未清理的中间拆分临时 CSV
@@ -365,7 +559,7 @@ fn split_by_field_xlsx(
     columns: &[usize],
     opts: &SplitOptions,
     progress: Option<&(dyn Fn(f64) + Sync)>,
-) -> Result<usize, String> {
+) -> Result<SplitReport, String> {
     let n = model.row_count();
     let total = rows.map(|v| v.len()).unwrap_or(n);
     let header = model.header().to_vec();
@@ -378,6 +572,8 @@ fn split_by_field_xlsx(
     let mut used_names: HashMap<String, usize> = HashMap::new();
     let mut csv_writers: Vec<Option<CsvWriter>> = Vec::new();
     let mut final_names: Vec<String> = Vec::new();
+    // 每个分组写入的数据行数（完整性核对用）
+    let mut group_rows: Vec<usize> = Vec::new();
     let mut empty_seq = 0usize;
     let mut temp_paths: Vec<String> = Vec::new();
     // 临时命名含时间戳后缀，避免跨运行/进程复用冲突
@@ -431,6 +627,7 @@ fn split_by_field_xlsx(
                 let w = CsvWriter::new_raw(&temp_path, &header).map_err(|e| e.to_string())?;
                 csv_writers.push(Some(w));
                 final_names.push(final_name);
+                group_rows.push(0);
                 temp_paths.push(temp_path.clone());
                 temp_guard.0.push(temp_path);
                 key_index.insert(key_buf.clone(), idx);
@@ -439,6 +636,7 @@ fn split_by_field_xlsx(
         };
         if let Some(w) = csv_writers[idx].as_mut() {
             w.write_row(&rec).map_err(|e| e.to_string())?;
+            group_rows[idx] += 1;
         }
         done += 1;
         if done % 50000 == 0 {
@@ -470,6 +668,8 @@ fn split_by_field_xlsx(
     let next = AtomicUsize::new(0);
     let done_groups = AtomicUsize::new(0);
     let err: Mutex<Option<String>> = Mutex::new(None);
+    // 转换时读回的中间 CSV 行数：(组号, 行数)——用于与写入行数对照
+    let csv_rows_log: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::with_capacity(group_count));
 
     std::thread::scope(|s| {
         for _ in 0..threads {
@@ -485,9 +685,14 @@ fn split_by_field_xlsx(
                     }
                     let src = &temp_paths[i];
                     let out_path = format!("{}\\{}.xlsx", opts.folder, final_names[i]);
-                    if let Err(e) = convert_csv_to_xlsx(src, &out_path, &header, &mut fields) {
-                        *err.lock().unwrap() = Some(e);
-                        break;
+                    match convert_csv_to_xlsx(src, &out_path, &header, &mut fields) {
+                        Ok(rows) => {
+                            csv_rows_log.lock().unwrap().push((i, rows));
+                        }
+                        Err(e) => {
+                            *err.lock().unwrap() = Some(e);
+                            break;
+                        }
                     }
                     let _ = std::fs::remove_file(src);
                     let d = done_groups.fetch_add(1, AtomicOrdering::Relaxed) + 1;
@@ -503,7 +708,28 @@ fn split_by_field_xlsx(
         return Err(e);
     }
     drop(temp_guard); // 提前释放：未转换成功的中间文件由 TempCleanup 兜底删除
-    Ok(group_count)
+
+    // 核对：用「转换时读回的中间 CSV 行数」对照「写入时累计的行数」。
+    // 中间 CSV 是 XLSX 转换的输入，其行数可独立读回验证；XLSX 本身的行数由
+    // 写出 API 逐行写入保证（转换后中间文件即删除，无法再次读回）。
+    let mut disk_by_group = vec![0usize; group_count];
+    for (i, rows) in csv_rows_log.into_inner().unwrap_or_default() {
+        if i < group_count {
+            disk_by_group[i] = rows;
+        }
+    }
+    let stats: Vec<SplitFileStat> = (0..group_count)
+        .map(|i| SplitFileStat {
+            name: format!("{}.xlsx", final_names.get(i).cloned().unwrap_or_default()),
+            written_rows: group_rows.get(i).copied().unwrap_or(0),
+            disk_rows: disk_by_group[i],
+        })
+        .collect();
+    Ok(SplitReport {
+        files: group_count,
+        source_rows: total,
+        stats,
+    })
 }
 
 /// 把一份中间 CSV 转换成 XLSX（供并行转换调用；`fields` 为复用的行缓冲）。
@@ -512,17 +738,18 @@ fn convert_csv_to_xlsx(
     out_path: &str,
     header: &[String],
     fields: &mut Vec<String>,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let file = crate::core::reader::CsvFile::open(src).map_err(|e| e.to_string())?;
+    let rows = file.row_count(); // 读回的中间 CSV 数据行数（供完整性核对）
     let mut w = XlsxWriter::new(out_path, header)?;
-    for r in 0..file.row_count() {
+    for r in 0..rows {
         file.row_into(r, fields);
         w.write_row(fields)?;
     }
     w.finish()?;
     // 先释放 mmap 文件句柄，Windows 才能删除该中间 CSV
     drop(file);
-    Ok(())
+    Ok(rows)
 }
 
 /// 生成分组 key，写入复用的缓冲（避免每行一次 String 分配）。
@@ -593,7 +820,7 @@ mod tests {
             folder: dir.clone(),
             format: OutputFormat::Csv,
         };
-        let count = split_by_rows(&m, None, 2, &opts, None).unwrap();
+        let count = split_by_rows(&m, None, 2, &opts, None).unwrap().files;
         assert_eq!(count, 3);
         // 每个文件 2 行 + 表头
         let f1 = format!("{}\\split_data_part_1.csv", dir);
@@ -614,7 +841,7 @@ mod tests {
             folder: dir.clone(),
             format: OutputFormat::Csv,
         };
-        let count = split_by_field(&m, None, &[0], &opts, None).unwrap();
+        let count = split_by_field(&m, None, &[0], &opts, None).unwrap().files;
         assert_eq!(count, 2);
         let f1 = format!("{}\\苏州银行.csv", dir);
         let c1 = std::fs::read_to_string(&f1).unwrap();
@@ -633,7 +860,7 @@ mod tests {
             folder: dir.clone(),
             format: OutputFormat::Csv,
         };
-        let count = split_by_field(&m, None, &[0, 1], &opts, None).unwrap();
+        let count = split_by_field(&m, None, &[0, 1], &opts, None).unwrap().files;
         assert_eq!(count, 2);
         // 组合文件名 x_y.csv 与 x_z.csv
         let f1 = format!("{}\\x_y.csv", dir);
@@ -653,7 +880,7 @@ mod tests {
             folder: dir.clone(),
             format: OutputFormat::Csv,
         };
-        let count = split_by_field(&m, None, &[0], &opts, None).unwrap();
+        let count = split_by_field(&m, None, &[0], &opts, None).unwrap().files;
         assert_eq!(count, 2);
         let f1 = format!("{}\\empty_value_1.csv", dir);
         assert!(std::fs::metadata(&f1).is_ok());
@@ -672,7 +899,7 @@ mod tests {
             folder: dir.clone(),
             format: OutputFormat::Csv,
         };
-        let count = split_by_field(&m, None, &[0], &opts, None).unwrap();
+        let count = split_by_field(&m, None, &[0], &opts, None).unwrap().files;
         assert_eq!(count, 2);
         assert!(std::fs::metadata(format!("{}\\a_b.csv", dir)).is_ok());
         assert!(std::fs::metadata(format!("{}\\a_b_2.csv", dir)).is_ok());
@@ -690,7 +917,7 @@ mod tests {
             folder: dir.clone(),
             format: OutputFormat::Xlsx,
         };
-        let count = split_by_field(&m, None, &[0], &opts, None).unwrap();
+        let count = split_by_field(&m, None, &[0], &opts, None).unwrap().files;
         assert_eq!(count, 2);
         assert!(std::fs::metadata(format!("{}\\苏州银行.xlsx", dir)).is_ok());
         assert!(std::fs::metadata(format!("{}\\工商银行.xlsx", dir)).is_ok());
@@ -714,7 +941,7 @@ mod tests {
             folder: dir.clone(),
             format: OutputFormat::Xlsx,
         };
-        let count = split_by_field(&m, None, &[0], &opts, None).unwrap();
+        let count = split_by_field(&m, None, &[0], &opts, None).unwrap().files;
         assert_eq!(count, 2);
         // 读回银行A.xlsx：全文本导出后负数以文本保留（sharedStrings），无 ' 前缀污染
         let file = std::fs::File::open(format!("{}\\银行A.xlsx", dir)).unwrap();
@@ -747,7 +974,7 @@ mod tests {
             folder: dir.clone(),
             format: OutputFormat::Xlsx,
         };
-        let count = split_by_field(&m, None, &[0], &opts, None).unwrap();
+        let count = split_by_field(&m, None, &[0], &opts, None).unwrap().files;
         assert_eq!(count, 3);
         for g in 0..3 {
             let path = format!("{}\\g{}.xlsx", dir, g);
@@ -773,7 +1000,7 @@ mod tests {
             format: OutputFormat::Csv,
         };
         // 只拆第 1、3 行（"2,b"、"4,d"），每批 1 行 → 2 个文件
-        let count = split_by_rows(&m, Some(&[1, 3]), 1, &opts, None).unwrap();
+        let count = split_by_rows(&m, Some(&[1, 3]), 1, &opts, None).unwrap().files;
         assert_eq!(count, 2);
         let c1 = std::fs::read_to_string(format!("{}\\split_data_part_1.csv", dir)).unwrap();
         let c2 = std::fs::read_to_string(format!("{}\\split_data_part_2.csv", dir)).unwrap();
@@ -794,7 +1021,7 @@ mod tests {
             folder: dir.clone(),
             format: OutputFormat::Csv,
         };
-        let count = split_by_rows(&m, None, 2, &opts, None).unwrap();
+        let count = split_by_rows(&m, None, 2, &opts, None).unwrap().files;
         assert_eq!(count, 2);
         assert!(std::fs::metadata(format!("{}\\split_data_part_1.csv", dir)).is_ok());
         assert!(std::fs::metadata(format!("{}\\split_data_part_2.csv", dir)).is_ok());
@@ -834,7 +1061,7 @@ mod tests {
             format: OutputFormat::Csv,
         };
         // 只拆第 0、2 行（苏州银行,1 / 苏州银行,3）→ 仅 1 个分组文件
-        let count = split_by_field(&m, Some(&[0, 2]), &[0], &opts, None).unwrap();
+        let count = split_by_field(&m, Some(&[0, 2]), &[0], &opts, None).unwrap().files;
         assert_eq!(count, 1);
         let content = std::fs::read_to_string(format!("{}\\苏州银行.csv", dir)).unwrap();
         assert!(content.contains(",1") && content.contains(",3") && !content.contains(",2"));
@@ -854,7 +1081,7 @@ mod tests {
             folder: dir.clone(),
             format: OutputFormat::Csv,
         };
-        let count = split_by_field(&m, None, &[1], &opts, None).unwrap();
+        let count = split_by_field(&m, None, &[1], &opts, None).unwrap().files;
         assert!(count >= 1);
         cleanup(&dir);
         std::fs::remove_file(&p).ok();
@@ -874,7 +1101,7 @@ mod tests {
             folder: dir.clone(),
             format: OutputFormat::Csv,
         };
-        let count = split_by_rows(&m, None, 1, &opts, None).unwrap();
+        let count = split_by_rows(&m, None, 1, &opts, None).unwrap().files;
         assert_eq!(count, 1000);
         // 抽查若干批：批号即文件序号，且行序与源文件一致
         for i in [0usize, 1, 499, 998, 999] {
@@ -924,7 +1151,7 @@ mod tests {
             folder: dir.clone(),
             format: OutputFormat::Xlsx,
         };
-        let count = split_by_field(&m, None, &[0], &opts, None).unwrap();
+        let count = split_by_field(&m, None, &[0], &opts, None).unwrap().files;
         assert_eq!(count, 10);
         for g in 0..10 {
             let path = format!("{}\\g{}.xlsx", dir, g);
@@ -946,6 +1173,68 @@ mod tests {
             })
             .unwrap_or(false);
         assert!(!tmp_left, "并行转换后应清理中间临时 CSV");
+        cleanup(&dir);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn count_data_rows_is_quote_aware() {
+        // 核对用的行数统计：引号字段内的换行不计行；LF / CRLF / CR / 末尾无换行 都正确
+        let dir = temp_dir();
+        let cases: Vec<(&str, &[u8], usize)> = vec![
+            ("lf.csv", b"ID,NAME\n1,a\n2,b\n", 2),
+            ("nonewline.csv", b"ID,NAME\n1,a\n2,b", 2),
+            ("headeronly.csv", b"ID,NAME\n", 0),
+            ("empty.csv", b"", 0),
+            ("crlf.csv", b"ID,NAME\r\n1,a\r\n2,b\r\n", 2),
+            ("cr.csv", b"ID,NAME\r1,a\r2,b\r", 2),
+            // 引号内的换行属于同一字段，不应计为行边界
+            ("quoted_lf.csv", b"ID,NAME\n1,\"x\ny\"\n2,b\n", 2),
+            ("quoted_crlf.csv", b"ID,NAME\r\n1,\"x\r\ny\"\r\n2,b\r\n", 2),
+            // 转义引号 "" 不应干扰引号状态
+            ("escaped_quote.csv", b"ID,NAME\n1,\"he said \"\"hi\"\"\"\n2,b\n", 2),
+        ];
+        for (name, data, expect) in cases {
+            let path = format!("{}\\{}", dir, name);
+            std::fs::write(&path, data).unwrap();
+            let got = count_data_rows(&path).unwrap();
+            assert_eq!(got, expect, "{name} 行数统计不符");
+        }
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn split_report_reconciles_row_counts() {
+        // 拆分报告应逐文件给出「写入行数 == 落盘行数」，且合计等于数据来源行数
+        let data = "ID,NAME\n1,a\n2,b\n3,c\n4,d\n5,e\n";
+        let p = write_temp_file(data.as_bytes(), "_report.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let dir = temp_dir();
+        let opts = SplitOptions {
+            folder: dir.clone(),
+            format: OutputFormat::Csv,
+        };
+        // 按行数：每批 2 行 → 3 个文件（2、2、1）
+        let rep = split_by_rows(&m, None, 2, &opts, None).unwrap();
+        assert_eq!(rep.files, 3);
+        assert_eq!(rep.source_rows, 5);
+        assert_eq!(
+            rep.stats.iter().map(|s| s.disk_rows).collect::<Vec<_>>(),
+            vec![2, 2, 1]
+        );
+        assert!(
+            rep.stats.iter().all(|s| s.written_rows == s.disk_rows),
+            "写入行数与落盘行数应一致"
+        );
+        assert_eq!(rep.total_on_disk(), 5);
+        assert!(rep.is_complete(), "完整性核对应通过：{}", rep.verdict());
+
+        // 按字段：5 个不同 NAME → 5 个文件，行数合计仍应为 5
+        let rep2 = split_by_field(&m, None, &[1], &opts, None).unwrap();
+        assert_eq!(rep2.source_rows, 5);
+        assert_eq!(rep2.total_on_disk(), 5);
+        assert!(rep2.is_complete(), "按字段拆分也应通过核对：{}", rep2.verdict());
+
         cleanup(&dir);
         std::fs::remove_file(&p).ok();
     }

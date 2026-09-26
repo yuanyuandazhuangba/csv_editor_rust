@@ -35,6 +35,8 @@ pub struct DialogStates {
     pub merge_keep_common: bool,
     // 数据分析：提取唯一行（去重）
     pub dedup_window: bool,
+    /// 去重完成后的结果提示窗（询问是否导出「重复行对应表」）
+    pub dedup_done_window: bool,
     /// 判重字段（视图列索引；空 = 全部字段）
     pub dedup_cols: Vec<usize>,
     // 筛选/拆分/文件信息 弹出窗口

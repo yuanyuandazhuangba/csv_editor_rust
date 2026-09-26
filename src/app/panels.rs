@@ -765,10 +765,15 @@ impl CsvEditorApp {
         self.log("开始提取唯一行...");
         let tx = self.tx.clone();
         self.worker = Some(Worker::spawn(tx.clone(), move |ctl| {
-            let (unique, report) = dedup::unique_rows(&model, rows.as_deref(), &cols, Some(&|p| {
-                ctl.report_progress(p as f32, "正在提取唯一行...")
-            }));
-            let _ = tx.send(BgMsg::DedupDone(unique, report));
+            // 收集「保留行 ↔ 被剔除行」对应关系，供完成后导出「重复行对应表」核对
+            let (unique, report, map) = dedup::unique_rows_with_map(
+                &model,
+                rows.as_deref(),
+                &cols,
+                Some(&|p| ctl.report_progress(p as f32, "正在提取唯一行...")),
+                true,
+            );
+            let _ = tx.send(BgMsg::DedupDone(unique, report, map, cols));
         }));
         self.set_busy("提取唯一行（去重）", "正在判重...", 0.0);
     }

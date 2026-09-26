@@ -108,6 +108,9 @@ impl CsvEditorApp {
         let mut f = std::mem::take(&mut self.dialogs.dedup_window);
         self.dialog_dedup(ctx, &mut f);
         self.dialogs.dedup_window = f;
+        let mut f = std::mem::take(&mut self.dialogs.dedup_done_window);
+        self.dialog_dedup_done(ctx, &mut f);
+        self.dialogs.dedup_done_window = f;
         // 数据行详情（双击单元格触发）
         let mut open = self.detail_row.is_some();
         self.dialog_row_detail(ctx, &mut open);
@@ -1308,6 +1311,122 @@ impl CsvEditorApp {
         *open = keep;
     }
 
+    /// 去重完成后的结果提示窗：告知统计结果，并询问是否导出「重复行对应表」
+    fn dialog_dedup_done(&mut self, ctx: &egui::Context, open: &mut bool) {
+        let mut keep = *open;
+        let mut done = false;
+        apply_dialog_pos(
+            egui::Window::new("提取唯一行完成")
+                .open(&mut keep)
+                .collapsible(false)
+                .resizable(false),
+            self.dialog_position,
+            ctx,
+        )
+        .show(ctx, |ui| {
+            let Some((dup_count, input_rows, unique_rows, key_count)) = self
+                .last_dedup
+                .as_ref()
+                .map(|d| (d.map.len(), d.input_rows, d.unique_rows, d.key_columns.len()))
+            else {
+                ui.label("没有可显示的去重结果");
+                if ui.button("关闭").clicked() {
+                    done = true;
+                }
+                return;
+            };
+
+            let removed = input_rows.saturating_sub(unique_rows);
+            ui.label(format!(
+                "判重范围 {} 行 → 唯一 {} 行，剔除重复 {} 行（按 {} 个字段判重）",
+                input_rows, unique_rows, removed, key_count
+            ));
+            ui.weak("去重结果已成为当前数据视图：之后的查看、导出、拆分都基于唯一行。");
+            ui.separator();
+            if dup_count == 0 {
+                ui.label("本次没有发现重复行，无需导出对应表。");
+                ui.add_space(4.0);
+                if ui.button("关闭").clicked() {
+                    done = true;
+                }
+            } else {
+                ui.label(format!("是否导出「重复行对应表」？（共 {dup_count} 条对应关系）"));
+                ui.weak(
+                    "表中逐条记录：保留的首次出现行号 ↔ 被剔除的重复行号，并附判重字段的取值，\
+                     便于你细致核对每条去重是否正确；行号从 1 开始（与表格显示一致）。",
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("导出为 CSV…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("CSV", &["csv"])
+                            .set_file_name("重复行对应表.csv")
+                            .save_file()
+                        {
+                            self.export_dup_map(path.to_string_lossy().into_owned(), false);
+                        }
+                        done = true;
+                    }
+                    if ui.button("导出为 XLSX…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("XLSX", &["xlsx"])
+                            .set_file_name("重复行对应表.xlsx")
+                            .save_file()
+                        {
+                            self.export_dup_map(path.to_string_lossy().into_owned(), true);
+                        }
+                        done = true;
+                    }
+                    if ui.button("暂不导出").clicked() {
+                        done = true;
+                    }
+                });
+            }
+        });
+        if done {
+            keep = false;
+        }
+        *open = keep;
+    }
+
+    /// 导出「重复行对应表」（后台线程）
+    pub fn export_dup_map(&mut self, path: String, is_xlsx: bool) {
+        if self.busy.is_some() {
+            self.log("已有任务在执行，请稍候");
+            return;
+        }
+        let Some(model) = self.model.clone() else {
+            self.log("请先加载数据");
+            return;
+        };
+        let Some(d) = self.last_dedup.as_ref() else {
+            self.log("没有可导出的重复行信息");
+            return;
+        };
+        let map = d.map.clone();
+        let key_cols = d.key_columns.clone();
+        let tx = self.tx.clone();
+        self.worker = Some(super::background::Worker::spawn(tx.clone(), move |ctl| {
+            let result = export::export_dup_map(
+                &model,
+                &map,
+                &key_cols,
+                &path,
+                is_xlsx,
+                Some(&|p| ctl.report_progress(p as f32, "正在导出重复行对应表...")),
+            );
+            match result {
+                Ok(n) => {
+                    let _ = tx.send(BgMsg::ExportDone(n, path));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::Error(format!("导出重复行对应表失败: {}", e)));
+                }
+            }
+        }));
+        self.set_busy("导出重复行对应表", "正在导出...", 0.0);
+    }
+
     /// 自愿捐助对话框（内嵌微信收款码）
     fn dialog_donate(&mut self, ctx: &egui::Context, open: &mut bool) {
         let mut keep = *open;
@@ -1479,8 +1598,8 @@ impl CsvEditorApp {
                 }))
             };
             match result {
-                Ok(count) => {
-                    let _ = tx.send(BgMsg::SplitDone(count));
+                Ok(report) => {
+                    let _ = tx.send(BgMsg::SplitDone(report));
                 }
                 Err(e) => {
                     let _ = tx.send(BgMsg::Error(format!("拆分失败: {}", e)));
