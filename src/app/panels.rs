@@ -65,6 +65,26 @@ impl CsvEditorApp {
                         self.load_sample_data();
                         ui.close_menu();
                     }
+                    ui.separator();
+                    // 显示/隐藏「数据处理」工具栏：显示时命令后带对号（固定宽度保证对号位置稳定）
+                    let label = if self.show_data_toolbar {
+                        "数据处理工具栏  ✔"
+                    } else {
+                        "数据处理工具栏    "
+                    };
+                    if ui
+                        .add_sized([176.0, 20.0], egui::Button::new(label))
+                        .clicked()
+                    {
+                        self.show_data_toolbar = !self.show_data_toolbar;
+                        let msg = if self.show_data_toolbar {
+                            "已显示数据处理工具栏"
+                        } else {
+                            "已隐藏数据处理工具栏"
+                        };
+                        self.log(msg);
+                        ui.close_menu();
+                    }
                 });
                 ui.menu_button("数据处理", |ui| {
                     if ui.button("拆分数据…").clicked() {
@@ -172,6 +192,90 @@ impl CsvEditorApp {
                     }
                 });
             });
+        });
+    }
+
+    /// 「数据处理」工具栏：把「数据处理」菜单里的每条命令做成按钮（功能与菜单完全一致）。
+    /// 由「工具 → 数据处理工具栏」控制显示/隐藏（默认显示）。
+    pub fn data_toolbar_panel(&mut self, ctx: &egui::Context) {
+        if !self.show_data_toolbar {
+            return;
+        }
+        egui::TopBottomPanel::top("data_toolbar").show(ctx, |ui| {
+            ui.add_space(2.0);
+            // 按钮较多：与主工具栏同样用横向滚动区兜底，界面放大后仍可访问全部按钮
+            egui::ScrollArea::horizontal()
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        // —— 数据拆分 ——
+                        if ui
+                            .button("📊 拆分数据…")
+                            .on_hover_text("按行数或按字段把数据拆分成多个文件")
+                            .clicked()
+                        {
+                            self.dialogs.split_window = true;
+                        }
+                        ui.separator();
+                        // —— 列操作（与「数据处理 → 列操作」子菜单一一对应）——
+                        if ui.button("✂ 拆分字段…").clicked() {
+                            self.dialogs.split_field = true;
+                        }
+                        if ui.button("🔗 合并字段…").clicked() {
+                            self.dialogs.merge_field = true;
+                        }
+                        if ui.button("🔢 生成行哈希…").clicked() {
+                            self.dialogs.generate_hash = true;
+                        }
+                        if ui.button("📋 复制列…").clicked() {
+                            self.dialogs.copy_column = true;
+                        }
+                        if ui.button("➕ 插入列…").clicked() {
+                            self.dialogs.insert_column = true;
+                        }
+                        if ui.button("➖ 删除列…").clicked() {
+                            self.dialogs.delete_column = true;
+                        }
+                        if ui.button("🕶 隐藏列…").clicked() {
+                            self.dialogs.hide_column = true;
+                        }
+                        if ui.button("👁 显示列…").clicked() {
+                            self.dialogs.show_column = true;
+                        }
+                        ui.separator();
+                        // —— 撤销 / 恢复（与菜单一致：不可用时置灰）——
+                        let (can_undo, can_redo) = self
+                            .ops
+                            .as_ref()
+                            .map_or((false, false), |o| (o.can_undo(), o.can_redo()));
+                        if ui
+                            .add_enabled(can_undo, egui::Button::new("↩ 撤销"))
+                            .clicked()
+                        {
+                            self.do_undo();
+                        }
+                        if ui
+                            .add_enabled(can_redo, egui::Button::new("↪ 恢复"))
+                            .clicked()
+                        {
+                            self.do_redo();
+                        }
+                        ui.separator();
+                        // —— 高级功能 ——
+                        if ui
+                            .button("♻ 清理筛选缓存")
+                            .on_hover_text("清除筛选结果缓存，恢复显示完整数据视图")
+                            .clicked()
+                        {
+                            self.filtered_rows = None;
+                            self.log("筛选缓存已清理");
+                        }
+                        if ui.button("ℹ 文件信息…").clicked() {
+                            self.dialogs.file_info = true;
+                        }
+                    });
+                });
+            ui.add_space(2.0);
         });
     }
 

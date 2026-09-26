@@ -55,6 +55,8 @@ pub struct CsvEditorApp {
     detail_row: Option<usize>,
     // 进程峰值内存
     peak_memory_mb: f64,
+    // 是否显示「数据处理」工具栏（「工具」菜单可切换，默认显示）
+    show_data_toolbar: bool,
     // 微信收款码纹理（首次打开捐助窗口时解码一次并缓存）
     qr_texture: Option<egui::TextureHandle>,
     // 上一次合并输出的临时文件（下次合并前清理，避免临时目录堆积）
@@ -132,6 +134,7 @@ impl CsvEditorApp {
             preview: PreviewTable::new(),
             detail_row: None,
             peak_memory_mb: 0.0,
+            show_data_toolbar: true,
             qr_texture: None,
             merged_temp: None,
             ui_zoom: cc.egui_ctx.zoom_factor().clamp(1.0, 1.5),
@@ -458,6 +461,8 @@ impl eframe::App for CsvEditorApp {
 
         self.menu_bar(ctx);
         self.controls_panel(ctx);
+        // 「数据处理」工具栏：紧跟在主工具栏下方（可经「工具」菜单隐藏）
+        self.data_toolbar_panel(ctx);
         if self.show_log {
             self.log_panel(ctx);
         }
