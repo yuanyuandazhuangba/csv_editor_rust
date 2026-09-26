@@ -284,7 +284,7 @@ impl CsvEditorApp {
                         "拆分完成：共 {} 个文件（数据来源 {} 行，均不含表头）",
                         report.files, report.source_rows
                     ));
-                    const MAX_LIST: usize = 50; // 文件很多时避免刷屏，其余汇总显示
+                    const MAX_LIST: usize = 10; // 文件很多时避免刷屏，其余汇总显示
                     for s in report.stats.iter().take(MAX_LIST) {
                         self.log(&format!("    {}：{} 行（不含表头）", s.name, s.disk_rows));
                     }
