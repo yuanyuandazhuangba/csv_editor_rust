@@ -105,6 +105,9 @@ impl CsvEditorApp {
         let mut f = std::mem::take(&mut self.dialogs.donate);
         self.dialog_donate(ctx, &mut f);
         self.dialogs.donate = f;
+        let mut f = std::mem::take(&mut self.dialogs.dedup_window);
+        self.dialog_dedup(ctx, &mut f);
+        self.dialogs.dedup_window = f;
         // 数据行详情（双击单元格触发）
         let mut open = self.detail_row.is_some();
         self.dialog_row_detail(ctx, &mut open);
@@ -1219,6 +1222,87 @@ impl CsvEditorApp {
             });
         });
         if closed {
+            keep = false;
+        }
+        *open = keep;
+    }
+
+    /// 「提取唯一行（去重）」对话框：选择判重字段后在当前筛选结果上判重
+    fn dialog_dedup(&mut self, ctx: &egui::Context, open: &mut bool) {
+        let mut keep = *open;
+        let mut done = false;
+        apply_dialog_pos(
+            egui::Window::new("提取唯一行（去重）")
+                .open(&mut keep)
+                .collapsible(false)
+                .resizable(false),
+            self.dialog_position,
+            ctx,
+        )
+        .show(ctx, |ui| {
+            let header = self.header_names();
+            if header.is_empty() {
+                ui.label("请先加载数据");
+                return;
+            }
+            let scope = match self.visible_rows() {
+                Some(v) => format!("当前筛选结果（{} 行）", v.len()),
+                None => format!(
+                    "全部数据（{} 行）",
+                    self.model.as_ref().map(|m| m.row_count()).unwrap_or(0)
+                ),
+            };
+            ui.label(format!("判重范围：{scope}"));
+            ui.weak(
+                "按所选字段的值组合判断重复行，保留每条重复记录中首次出现的行。\
+                 结果会作为新的当前数据视图，可继续导出、拆分或统计。",
+            );
+            ui.separator();
+            ui.label("判重字段（不勾选 = 按全部字段判重）:");
+            // 丢弃超出当前列数的陈旧索引（列数可能因之前的增删而变化）
+            self.dialogs.dedup_cols.retain(|&i| i < header.len());
+            let mut sel = self.dialogs.dedup_cols.clone();
+            ui.horizontal(|ui| {
+                if ui.small_button("全选").clicked() {
+                    sel = (0..header.len()).collect();
+                }
+                if ui.small_button("全不选").clicked() {
+                    sel.clear();
+                }
+                ui.weak(format!("已选 {} / {} 列", sel.len(), header.len()));
+            });
+            egui::ScrollArea::vertical()
+                .max_height(180.0)
+                .show(ui, |ui| {
+                    for (i, h) in header.iter().enumerate() {
+                        let mut on = sel.contains(&i);
+                        ui.checkbox(&mut on, h);
+                        if on && !sel.contains(&i) {
+                            sel.push(i);
+                        } else if !on {
+                            sel.retain(|&x| x != i);
+                        }
+                    }
+                });
+            self.dialogs.dedup_cols = sel.clone();
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("提取唯一行").clicked() {
+                    self.run_dedup();
+                    done = true;
+                }
+                if ui.button("取消").clicked() {
+                    done = true;
+                }
+                ui.weak(if sel.is_empty() {
+                    "将按全部字段判重"
+                } else {
+                    "将按所选字段判重"
+                });
+            });
+        });
+        if done {
             keep = false;
         }
         *open = keep;

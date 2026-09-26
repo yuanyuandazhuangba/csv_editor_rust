@@ -57,6 +57,8 @@ pub struct CsvEditorApp {
     peak_memory_mb: f64,
     // 是否显示「数据处理」工具栏（「工具」菜单可切换，默认显示）
     show_data_toolbar: bool,
+    // 是否显示「数据分析」工具栏（同上，默认显示）
+    show_analysis_toolbar: bool,
     // 微信收款码纹理（首次打开捐助窗口时解码一次并缓存）
     qr_texture: Option<egui::TextureHandle>,
     // 上一次合并输出的临时文件（下次合并前清理，避免临时目录堆积）
@@ -135,6 +137,7 @@ impl CsvEditorApp {
             detail_row: None,
             peak_memory_mb: 0.0,
             show_data_toolbar: true,
+            show_analysis_toolbar: true,
             qr_texture: None,
             merged_temp: None,
             ui_zoom: cc.egui_ctx.zoom_factor().clamp(1.0, 1.5),
@@ -294,6 +297,18 @@ impl CsvEditorApp {
                     self.dialogs.merge_headers.clear();
                     // 合并结果作为当前数据打开（复用既有加载流程）
                     self.open_file(path);
+                }
+                BgMsg::DedupDone(rows, report) => {
+                    self.busy = None;
+                    // 去重结果作为新的当前视图：后续导出/拆分/统计都基于唯一行
+                    self.filtered_rows = Some(rows);
+                    self.log(&format!(
+                        "提取唯一行完成：{} 行 → {} 行（丢弃重复 {} 行；按 {} 个字段判重）",
+                        report.input_rows,
+                        report.unique_rows,
+                        report.duplicates,
+                        report.key_columns
+                    ));
                 }
                 BgMsg::Error(e) => {
                     self.busy = None;
@@ -463,6 +478,7 @@ impl eframe::App for CsvEditorApp {
         self.controls_panel(ctx);
         // 「数据处理」工具栏：紧跟在主工具栏下方（可经「工具」菜单隐藏）
         self.data_toolbar_panel(ctx);
+        self.analysis_toolbar_panel(ctx);
         // 底部状态栏：先于右侧日志面板渲染，使其横跨窗口底部（而不是只到日志面板左侧）
         self.status_bar(ctx);
         if self.show_log {

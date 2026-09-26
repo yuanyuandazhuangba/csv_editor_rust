@@ -33,6 +33,10 @@ pub struct DialogStates {
     pub merge_scanning: bool,
     /// 表头不一致时：只保留相同字段名（交集）
     pub merge_keep_common: bool,
+    // 数据分析：提取唯一行（去重）
+    pub dedup_window: bool,
+    /// 判重字段（视图列索引；空 = 全部字段）
+    pub dedup_cols: Vec<usize>,
     // 筛选/拆分/文件信息 弹出窗口
     pub filter_window: bool,
     pub split_window: bool,

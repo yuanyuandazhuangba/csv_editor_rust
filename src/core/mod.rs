@@ -2,6 +2,7 @@
 
 pub mod column_ops;
 pub mod csv;
+pub mod dedup;
 pub mod encoding;
 pub mod export;
 pub mod filter;

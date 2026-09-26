@@ -2,6 +2,7 @@
 
 use eframe::egui;
 
+use csv_editor_rust::core::dedup;
 use csv_editor_rust::core::merge::{self, HeaderCheck, MergeMode};
 
 use super::background::{BgMsg, Worker};
@@ -85,6 +86,21 @@ impl CsvEditorApp {
                         self.log(msg);
                         ui.close_menu();
                     }
+                    let label = if self.show_analysis_toolbar {
+                        "数据分析工具栏  ✔"
+                    } else {
+                        "数据分析工具栏    "
+                    };
+                    if ui.button(label).clicked() {
+                        self.show_analysis_toolbar = !self.show_analysis_toolbar;
+                        let msg = if self.show_analysis_toolbar {
+                            "已显示数据分析工具栏"
+                        } else {
+                            "已隐藏数据分析工具栏"
+                        };
+                        self.log(msg);
+                        ui.close_menu();
+                    }
                 });
                 ui.menu_button("数据处理", |ui| {
                     if ui.button("拆分数据…").clicked() {
@@ -157,6 +173,12 @@ impl CsvEditorApp {
                         }
                     });
                 });
+                ui.menu_button("数据分析", |ui| {
+                    if ui.button("提取唯一行（去重）…").clicked() {
+                        self.dialogs.dedup_window = true;
+                        ui.close_menu();
+                    }
+                });
                 ui.menu_button("设置", |ui| {
                     ui.menu_button("弹出窗口位置", |ui| {
                         let mut changed = false;
@@ -192,6 +214,33 @@ impl CsvEditorApp {
                     }
                 });
             });
+        });
+    }
+
+    /// 「数据分析」工具栏：目前提供「提取唯一行（去重）」；
+    /// 由「工具 → 数据分析工具栏」控制显示/隐藏（默认显示）。
+    pub fn analysis_toolbar_panel(&mut self, ctx: &egui::Context) {
+        if !self.show_analysis_toolbar {
+            return;
+        }
+        egui::TopBottomPanel::top("analysis_toolbar").show(ctx, |ui| {
+            ui.add_space(2.0);
+            egui::ScrollArea::horizontal()
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("🔍 提取唯一行（去重）…")
+                            .on_hover_text(
+                                "在当前筛选结果（未筛选则为全部数据）中，按指定字段或全部字段判重，保留唯一行",
+                            )
+                            .clicked()
+                        {
+                            self.dialogs.dedup_window = true;
+                        }
+                    });
+                });
+            ui.add_space(2.0);
         });
     }
 
@@ -691,6 +740,37 @@ impl CsvEditorApp {
             }
         }));
         self.set_busy("合并CSV文件", "正在合并...", 0.0);
+    }
+
+    /// 执行「提取唯一行（去重）」（后台线程）。
+    /// 作用范围是当前筛选结果（未筛选则为全部数据）；结果作为新的当前视图，
+    /// 后续导出 / 拆分 / 统计都基于唯一行。
+    pub fn run_dedup(&mut self) {
+        if self.busy.is_some() {
+            self.log("已有任务在执行，请稍候");
+            return;
+        }
+        let Some(model) = self.model.clone() else {
+            self.log("请先加载数据");
+            return;
+        };
+        // 判重字段：视图列 → 原始列（派生列不参与，与拆分 / 行哈希保持一致）
+        let cols: Vec<usize> = self
+            .dialogs
+            .dedup_cols
+            .iter()
+            .filter_map(|&c| self.ops.as_ref().and_then(|o| o.view_to_base(c)))
+            .collect();
+        let rows = self.visible_rows().map(|v| v.to_vec());
+        self.log("开始提取唯一行...");
+        let tx = self.tx.clone();
+        self.worker = Some(Worker::spawn(tx.clone(), move |ctl| {
+            let (unique, report) = dedup::unique_rows(&model, rows.as_deref(), &cols, Some(&|p| {
+                ctl.report_progress(p as f32, "正在提取唯一行...")
+            }));
+            let _ = tx.send(BgMsg::DedupDone(unique, report));
+        }));
+        self.set_busy("提取唯一行（去重）", "正在判重...", 0.0);
     }
 
     /// 刷新预览视图：滚动回首行（表格内容本身每帧重渲染）
