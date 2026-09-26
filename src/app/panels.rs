@@ -209,6 +209,7 @@ impl CsvEditorApp {
                     if ui.button("🗑 清空数据").clicked() {
                         self.clear_data();
                     }
+                    ui.separator();
                     if ui.button("🔍 数据筛选").clicked() {
                         self.dialogs.filter_window = true;
                     }

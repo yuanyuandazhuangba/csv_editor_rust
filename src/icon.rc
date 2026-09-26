@@ -22,7 +22,7 @@ FILETYPE        0x1
       VALUE "FileDescription", "宿经03超大CSV文件实用编辑器 (Rust)"
       VALUE "FileVersion", "1.0.0"
       VALUE "InternalName", "csv_editor_rust"
-      VALUE "OriginalFilename", "CSV_Editor_Rust.exe"
+      VALUE "OriginalFilename", "宿经03超大CSV文件实用编辑器.exe"
       VALUE "ProductName", "宿经03超大CSV文件实用编辑器"
       VALUE "ProductVersion", "1.0.0"
     }
