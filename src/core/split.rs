@@ -52,8 +52,11 @@ pub struct SplitFileStat {
     pub name: String,
     /// 写入时累计的数据行数（不含表头）
     pub written_rows: usize,
-    /// 读回核对得到的落盘数据行数（不含表头）
+    /// 核对用的数据行数（不含表头）：CSV 为**读回文件重新统计**的结果；
+    /// XLSX 为压缩容器、无法低成本读回统计行数，因此退化为**写入时统计**（见 `verified`）
     pub disk_rows: usize,
+    /// 该文件的行数是否来自独立读取验证（CSV 为 true；XLSX 为 false）
+    pub verified: bool,
 }
 
 /// 拆分结果报告：用于向用户证明「导出数据完整、无遗漏」。
@@ -81,27 +84,56 @@ impl SplitReport {
         self.stats.iter().map(|s| s.disk_rows).sum()
     }
 
-    /// 完整性结论：每个文件「写入行数 == 落盘行数」，且落盘合计 == 数据来源行数
+    /// 是否所有输出文件的行数都经过独立读取验证（XLSX 输出无法读回，故为 false）
+    pub fn all_verified(&self) -> bool {
+        self.stats.iter().all(|s| s.verified)
+    }
+
+    /// 未经过读回验证的文件数（XLSX 输出）
+    pub fn unverified_files(&self) -> usize {
+        self.stats.iter().filter(|s| !s.verified).count()
+    }
+
+    /// 完整性结论：行数合计 == 数据来源行数，且已读回验证的文件「写入行数 == 落盘行数」
     pub fn is_complete(&self) -> bool {
         self.total_on_disk() == self.source_rows
-            && self.stats.iter().all(|s| s.written_rows == s.disk_rows)
+            && self
+                .stats
+                .iter()
+                .all(|s| !s.verified || s.written_rows == s.disk_rows)
+    }
+
+    /// 核对方式的说明（XLSX 无法读回统计行数时如实标注）
+    pub fn verify_note(&self) -> String {
+        let n = self.unverified_files();
+        if n == 0 {
+            "全部文件均已读回验证".to_string()
+        } else {
+            format!(
+                "其中 {} 个 XLSX 文件的行数取自写入统计（xlsx 为压缩容器，不做读回校验）",
+                n
+            )
+        }
     }
 
     /// 供日志显示的一句话核对结论
     pub fn verdict(&self) -> String {
+        let note = self.verify_note();
         if self.is_complete() {
             format!(
-                "✅ 完整性核对通过：全部输出合计 {} 行（不含表头）= 数据来源 {} 行，无遗漏",
+                "✅ 完整性核对通过：全部输出合计 {} 行（不含表头）= 数据来源 {} 行，无遗漏（{}）",
                 self.total_on_disk(),
-                self.source_rows
+                self.source_rows,
+                note
             )
         } else {
             let diff = self.source_rows as isize - self.total_on_disk() as isize;
             format!(
-                "⚠ 完整性核对未通过：全部输出合计 {} 行 ≠ 数据来源 {} 行（相差 {} 行），请检查磁盘空间与目标目录权限",
+                "⚠ 完整性核对未通过：全部输出合计 {} 行 ≠ 数据来源 {} 行（相差 {} 行），请检查磁盘空间与目标目录权限（{}）",
                 self.total_on_disk(),
                 self.source_rows,
-                diff.abs()
+                diff.abs(),
+                note
             )
         }
     }
@@ -229,6 +261,7 @@ pub fn write_split_checkfile(
     line(&mut w, &["拆分类型", split_type]).map_err(|e| e.to_string())?;
     line(&mut w, &["拆分依据", split_basis]).map_err(|e| e.to_string())?;
     line(&mut w, &["输出格式", format_label]).map_err(|e| e.to_string())?;
+    line(&mut w, &["核对方式", &report.verify_note()]).map_err(|e| e.to_string())?;
     line(&mut w, &["数据来源行数（不含表头）", &report.source_rows.to_string()])
         .map_err(|e| e.to_string())?;
     line(&mut w, &["输出文件数", &report.files.to_string()]).map_err(|e| e.to_string())?;
@@ -486,11 +519,19 @@ pub fn split_by_rows(
             opts.format.extension()
         );
         let path = format!("{}\\{}", opts.folder, name);
-        let disk_rows = count_data_rows(&path)?;
+        // CSV 才做读回验证；XLSX 是 zip 压缩容器，用「按换行统计行数」的方式读回
+        // 必然得出错误结果（曾因此误报「完整性核对未通过」），故退化为写入统计。
+        // 写入本身逐行进行，任何失败都会返回错误，因此写入行数是可信的。
+        let (disk_rows, verified) = if opts.format == OutputFormat::Xlsx {
+            (rows, false)
+        } else {
+            (count_data_rows(&path)?, true)
+        };
         stats.push(SplitFileStat {
             name,
             written_rows: rows,
             disk_rows,
+            verified,
         });
     }
     Ok(SplitReport {
@@ -631,6 +672,7 @@ fn split_by_field_csv(
             name: file_name,
             written_rows: group_rows.get(i).copied().unwrap_or(0),
             disk_rows,
+            verified: true,
         });
     }
     Ok(SplitReport {
@@ -822,7 +864,9 @@ fn split_by_field_xlsx(
         .map(|i| SplitFileStat {
             name: format!("{}.xlsx", final_names.get(i).cloned().unwrap_or_default()),
             written_rows: group_rows.get(i).copied().unwrap_or(0),
+            // 核对的是「转换时读回的中间 CSV 行数」，属于独立读取验证
             disk_rows: disk_by_group[i],
+            verified: true,
         })
         .collect();
     Ok(SplitReport {
@@ -1364,6 +1408,7 @@ mod tests {
         let text = std::fs::read_to_string(&cf).unwrap();
         for item in [
             "拆分完整性核对表",
+            "核对方式,全部文件均已读回验证",
             "按行数拆分",
             "每批 2 行",
             "数据来源行数（不含表头）,4",
@@ -1378,6 +1423,45 @@ mod tests {
         }
         // 以 BOM 开头（Excel 中文不乱码）
         assert!(std::fs::read(&cf).unwrap().starts_with(&[0xEF, 0xBB, 0xBF]));
+        cleanup(&dir);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn split_by_rows_xlsx_report_is_complete() {
+        // 回归：按行数拆分为 XLSX 时，报告不得误判为「未通过」。
+        // 早期实现对 XLSX 也用「按换行统计行数」（CSV 的核对方式）读回，而 xlsx 是
+        // zip 压缩容器，统计结果必然错误，于是结果正确却报「完整性核对未通过」。
+        let data = "ID,NAME\n1,a\n2,b\n3,c\n";
+        let p = write_temp_file(data.as_bytes(), "_xlsxrows.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let dir = temp_dir();
+        let opts = SplitOptions {
+            folder: dir.clone(),
+            format: OutputFormat::Xlsx,
+        };
+        let rep = split_by_rows(&m, None, 2, &opts, None).unwrap();
+        assert_eq!(rep.files, 2);
+        assert_eq!(rep.source_rows, 3);
+        assert!(
+            !rep.all_verified(),
+            "XLSX 无法读回统计行数，应标记为未读回验证"
+        );
+        assert_eq!(rep.unverified_files(), 2);
+        assert_eq!(rep.total_on_disk(), 3, "XLSX 应使用写入行数作为行数合计");
+        assert!(
+            rep.is_complete(),
+            "按行数拆 XLSX 不应误报未通过：{}",
+            rep.verdict()
+        );
+        // 输出文件应真实存在且非空
+        for i in 1..=2 {
+            let path = format!("{}\\split_data_part_{}.xlsx", dir, i);
+            let len = std::fs::metadata(&path)
+                .unwrap_or_else(|_| panic!("缺少 {}", path))
+                .len();
+            assert!(len > 0, "{} 应非空", path);
+        }
         cleanup(&dir);
         std::fs::remove_file(&p).ok();
     }

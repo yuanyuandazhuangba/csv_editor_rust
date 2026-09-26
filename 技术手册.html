@@ -212,7 +212,8 @@
       <li><b>按字段拆分（CSV）仍为单线程</b>，这是刻意取舍：它要求“每个分组内的行序与源文件一致”，并行写同一文件会打乱顺序；可行的并行化要么两遍扫描（先算 key 再随机读回），要么按块切分临时文件再合并（临时文件数 = 块数 × 分组数），代价与收益不成比例。该路径只做单线程内的开销优化：分组 key 写入复用缓冲，命中已有分组时用 <code>&amp;str</code> 借用查询（<code>HashMap&lt;String, _&gt;</code> 实现 <code>Borrow&lt;str&gt;</code>），只有首次出现新分组才 <code>clone</code> 一份 owned key（实测 5.62s → 5.28s）。</li>
       <li><b>CSV 写出路径</b>：<code>CsvWriter::write_row</code> 需要引号时按引号位置<b>分片写出</b>（早期实现是逐字节 <code>write_all</code>）。两条实测教训：不要在中间 <code>Vec</code> 里拼整行再写出（多一次整行拷贝，按字段拆分反而慢 14%）；<code>needs_quote</code> 保持用 <code>str::contains</code>（底层 memchr），改成手写逐字节扫描会慢约 7%。</li>
       <li><b>拆分完整性核对</b>：每次拆分后，各输出文件会被<b>读回</b>重新统计数据行数（<code>count_data_rows</code>：流式、引号感知、不建索引，对超大文件也只是一次顺序读），与写入时累计的行数<b>逐文件对照</b>，并统计「全部输出合计」是否等于「数据来源行数」；结论写入操作日志（逐文件行数 + 合计 + 核对通过/未通过）。XLSX 两阶段模式下核对的是「转换时读回的中间 CSV 行数」，XLSX 自身的行数由写出 API 逐行写入保证。相关测试：<code>count_data_rows_is_quote_aware</code>、<code>split_report_reconciles_row_counts</code>。</li>
-      <li><b>拆分完整性核对表</b>：拆分完成后在输出目录自动写出 <code>拆分完整性核对表.csv</code>（utf-8-sig，Excel 可直接打开），内容包括拆分类型、拆分依据、输出格式、数据来源行数、输出文件数、输出总行数、完整性核对结果，以及逐文件的「数据行数 / 写入行数」明细与合计行 —— 便于随数据一起归档与复核。相关测试：<code>checkfile_contains_all_required_items</code>。</li>
+      <li><b>拆分完整性核对表</b>：拆分完成后在输出目录自动写出 <code>拆分完整性核对表_&lt;时间戳&gt;.csv</code>（如 <code>拆分完整性核对表_2026-09-27_100500.csv</code>；utf-8-sig，Excel 可直接打开）。<b>文件名带时间戳</b>，因此后一次拆分不会覆盖上一次的核对表，便于按时间归档比对。内容包括：拆分类型、拆分依据、输出格式、<b>核对方式</b>、数据来源行数、输出文件数、输出总行数、完整性核对结果，以及逐文件的「数据行数 / 写入行数」明细与合计行。相关测试：<code>checkfile_contains_all_required_items</code>。</li>
+      <li><b>XLSX 输出的核对方式</b>：CSV 输出会<b>读回文件重新统计行数</b>（<code>count_data_rows</code>，引号感知）作为核对依据；XLSX 是 zip 压缩容器，用「按换行统计行数」的方式读回必然得出错误结果（曾导致结果正确却误报「完整性核对未通过」），因此 XLSX 的行数取自<b>写入统计</b>——写入逐行进行、任何失败都会返回错误，故该值可信——并在报告与核对表中如实标注「未读回验证」。按字段拆分的 XLSX 走两阶段，核对的是转换时读回的中间 CSV 行数。相关测试：<code>split_by_rows_xlsx_report_is_complete</code>。</li>
       <li>性能基准：<code>src/bin/split_bench.rs</code>（<code>cargo run --release --bin split_bench -- [行数] [重复次数]</code>），输出各场景墙钟耗时、进程 CPU 时间与平均并行度（CPU/墙钟，≈1.0 即单核）。单次测量有 ±10% 抖动，故默认重复 3 次取最小值。</li>
     </ul>
 
@@ -330,7 +331,7 @@ cargo +nightly-2025-06-23-x86_64-pc-windows-gnu build --release \
     <h2>六、构建与测试</h2>
     <h3>6.1 开发 / 测试（stable）</h3>
     <pre><code>set PATH=D:\project_xiangmu\.rust-toolchain\rust-1.88.0-x86_64-pc-windows-gnu\rustc\bin;D:\project_xiangmu\.rust-toolchain\rust-1.88.0-x86_64-pc-windows-gnu\cargo\bin;%PATH%
-cargo test          # 116 项单元测试
+cargo test          # 117 项单元测试
 cargo run --bin csv_editor_rust</code></pre>
     <h3>6.2 Win7 单文件发布</h3>
     <p>运行项目根目录的 <code>build_win7.bat</code>（或手动执行上文 5.1 命令）。</p>
@@ -338,7 +339,7 @@ cargo run --bin csv_editor_rust</code></pre>
     <h3>6.3 测试与验证工具</h3>
     <table>
       <tr><th style="width:150px;">工具</th><th>用途</th></tr>
-      <tr><td><code>cargo test</code></td><td>116 项单元测试，覆盖编码检测、行索引边界、字段切分、筛选语义、列操作、导出、多文件合并、去重、筛选与拆分并行化、IME 事件修补等。</td></tr>
+      <tr><td><code>cargo test</code></td><td>117 项单元测试，覆盖编码检测、行索引边界、字段切分、筛选语义、列操作、导出、多文件合并、去重、筛选与拆分并行化、IME 事件修补等。</td></tr>
       <tr><td><code>bin/inspect</code></td><td>打开报告：行数/列数/编码/耗时/峰值内存/采样预览。</td></tr>
       <tr><td><code>bin/verify</code></td><td>与 <code>testdata/verify_ref.py</code> 输出同结构 JSON（筛选行号 + 行哈希），验证 Rust 与 Python 语义一致。</td></tr>
       <tr><td><code>bin/filter_bench</code></td><td>筛选性能基准：不同条件类型/数量的耗时、CPU 时间与并行度（用 <code>--release</code> 运行）。</td></tr>

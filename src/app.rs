@@ -306,10 +306,7 @@ impl CsvEditorApp {
                     ));
                     self.log(&report.verdict());
                     match check {
-                        Ok(p) => self.log(&format!(
-                            "已在该目录生成「拆分完整性核对表.csv」：{}",
-                            p
-                        )),
+                        Ok(p) => self.log(&format!("已生成拆分完整性核对表：{}", p)),
                         Err(e) => self.log(&format!("⚠ 拆分完整性核对表生成失败：{}", e)),
                     }
                 }

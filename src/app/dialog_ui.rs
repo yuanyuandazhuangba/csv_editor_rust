@@ -1606,8 +1606,11 @@ impl CsvEditorApp {
         } else {
             "XLSX"
         };
-        let check_path = format!("{}\\拆分完整性核对表.csv", opts.folder);
         let generated_at = super::now_str();
+        // 文件名带时间戳（去掉空格与冒号——Windows 文件名不允许冒号），
+        // 避免后一次拆分覆盖上一次的核对表，便于按时间归档比对。
+        let stamp = generated_at.replace(' ', "_").replace(':', "");
+        let check_path = format!("{}\\拆分完整性核对表_{}.csv", opts.folder, stamp);
         let tx = self.tx.clone();
         self.worker = Some(super::background::Worker::spawn(tx.clone(), move |ctl| {
             let result = if method == 0 {
