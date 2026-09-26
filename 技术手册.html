@@ -193,7 +193,10 @@
     <ul>
       <li>10 种条件：等于/包含/不包含/大于/小于/大于等于/小于等于/不等于/空值/非空值；条件间用<b>且/或</b>组合，AND 短路。</li>
       <li><b>数值比较优先</b>：整数用 <code>i128</code> 精确比较（覆盖 19 位卡号），浮点回退 f64；双方均可数值化时数值比较，否则字符串比较（trim 后）。</li>
-      <li><b>并行分块</b>评估（<code>std::thread::scope</code>，上限 16 线程），进度回调，900 万行目标 &lt; 10 秒。</li>
+      <li><b>并行分块</b>评估（<code>std::thread::scope</code>），进度回调；并行度上限 <code>MAX_FILTER_THREADS = 32</code>。实测 200 万行 × 15 列（326MB）：单条件 0.046~0.057 秒。</li>
+      <li><b>整行只解析一次</b>（<code>RowReader</code>）：线程局部的行读取器把本行<b>所需列</b>的文本写进复用 <code>String</code>，同一行的多个条件共享这一次解析。此前每个条件各调一次 <code>model.field(row, col)</code>，每次都重新解析整行并分配 <code>Vec&lt;Vec&lt;u8&gt;&gt;</code>、每字段一个 <code>Vec&lt;u8&gt;</code> 与一个 <code>String</code>——条件越多重复解析越多，而且即使只取一列也要解析全部列。</li>
+      <li>底层解析用零分配的 <code>csv::parse_record_into</code>（复用内容缓冲 + 字段偏移表），与 <code>parse_record</code> 语义一致，并有逐字段一致性测试守护（覆盖引号、<code>""</code> 转义、空字段、字段内换行、中文字段等边界）。</li>
+      <li>实测（优化前 → 优化后，同机同期、重复 3 次取最小）：1 条件 0.258s → <b>0.051s</b>（并行度 12.8 → 27.0）；5 条件混合 0.297s → <b>0.057s</b>；CPU 时间 3.3s → 1.4s。</li>
       <li>结果行号用 <code>u32</code>（支持 ≥43 亿行）。</li>
     </ul>
 
@@ -310,7 +313,7 @@ cargo +nightly-2025-06-23-x86_64-pc-windows-gnu build --release \
     <h2>六、构建与测试</h2>
     <h3>6.1 开发 / 测试（stable）</h3>
     <pre><code>set PATH=D:\project_xiangmu\.rust-toolchain\rust-1.88.0-x86_64-pc-windows-gnu\rustc\bin;D:\project_xiangmu\.rust-toolchain\rust-1.88.0-x86_64-pc-windows-gnu\cargo\bin;%PATH%
-cargo test          # 102 项单元测试
+cargo test          # 104 项单元测试
 cargo run --bin csv_editor_rust</code></pre>
     <h3>6.2 Win7 单文件发布</h3>
     <p>运行项目根目录的 <code>build_win7.bat</code>（或手动执行上文 5.1 命令）。</p>
@@ -318,9 +321,10 @@ cargo run --bin csv_editor_rust</code></pre>
     <h3>6.3 测试与验证工具</h3>
     <table>
       <tr><th style="width:150px;">工具</th><th>用途</th></tr>
-      <tr><td><code>cargo test</code></td><td>102 项单元测试，覆盖编码检测、行索引边界、字段切分、筛选语义、列操作、导出、多文件合并、拆分并行化、IME 事件修补等。</td></tr>
+      <tr><td><code>cargo test</code></td><td>104 项单元测试，覆盖编码检测、行索引边界、字段切分、筛选语义、列操作、导出、多文件合并、筛选与拆分并行化、IME 事件修补等。</td></tr>
       <tr><td><code>bin/inspect</code></td><td>打开报告：行数/列数/编码/耗时/峰值内存/采样预览。</td></tr>
       <tr><td><code>bin/verify</code></td><td>与 <code>testdata/verify_ref.py</code> 输出同结构 JSON（筛选行号 + 行哈希），验证 Rust 与 Python 语义一致。</td></tr>
+      <tr><td><code>bin/filter_bench</code></td><td>筛选性能基准：不同条件类型/数量的耗时、CPU 时间与并行度（用 <code>--release</code> 运行）。</td></tr>
       <tr><td><code>bin/split_bench</code></td><td>拆分性能基准：各场景耗时、CPU 时间与并行度（用 <code>--release</code> 运行）。</td></tr>
       <tr><td><code>bin/e2e</code></td><td>端到端回归：打开 → 类型推断 → 筛选 → 列操作(undo/redo) → 拆分 → 导出 CSV/XLSX。</td></tr>
     </table>

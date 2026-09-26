@@ -52,7 +52,7 @@
 ### 开发/测试（stable）
 ```bat
 set PATH=D:\project_xiangmu\.rust-toolchain\rust-1.88.0-x86_64-pc-windows-gnu\rustc\bin;D:\project_xiangmu\.rust-toolchain\rust-1.88.0-x86_64-pc-windows-gnu\cargo\bin;%PATH%
-cargo test        :: 102 项单元测试
+cargo test        :: 104 项单元测试
 cargo run --bin csv_editor_rust
 ```
 

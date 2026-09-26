@@ -111,6 +111,51 @@ pub fn parse_record(line: &[u8]) -> Vec<Vec<u8>> {
     fields
 }
 
+/// 解析一行并把各字段内容依次写入复用缓冲 `scratch`，同时把每个字段的**结束偏移**
+/// 记入 `ends`，返回字段数（≥1）。两个缓冲都会先被清空。
+///
+/// 与 [`parse_record`] 语义完全一致（引号字段、`""` 转义、字段中间引号按普通字符），
+/// 区别是不分配 `Vec<Vec<u8>>`，供高频逐行路径（筛选/拆分/导出）复用缓冲使用。
+/// 第 `i` 个字段的内容为 `scratch[ends[i-1]..ends[i]]`（`i == 0` 时起点为 0）。
+pub fn parse_record_into(line: &[u8], scratch: &mut Vec<u8>, ends: &mut Vec<u32>) -> usize {
+    scratch.clear();
+    ends.clear();
+    let n = line.len();
+    let mut i = 0usize;
+    // 当前字段在 scratch 中的起点：用于判断「字段起始引号」（等价于旧实现的 cur.is_empty()）
+    let mut field_start = 0usize;
+    let mut in_quotes = false;
+    while i < n {
+        let b = line[i];
+        if in_quotes {
+            if b == b'"' {
+                if i + 1 < n && line[i + 1] == b'"' {
+                    scratch.push(b'"');
+                    i += 2;
+                } else {
+                    in_quotes = false;
+                    i += 1;
+                }
+            } else {
+                scratch.push(b);
+                i += 1;
+            }
+        } else if b == b'"' && scratch.len() == field_start {
+            in_quotes = true;
+            i += 1;
+        } else if b == b',' {
+            ends.push(scratch.len() as u32);
+            field_start = scratch.len();
+            i += 1;
+        } else {
+            scratch.push(b);
+            i += 1;
+        }
+    }
+    ends.push(scratch.len() as u32);
+    ends.len()
+}
+
 /// 解析一行文本形式的记录（便捷封装）。
 pub fn parse_record_str(line: &str) -> Vec<String> {
     parse_record(line.as_bytes())
@@ -208,6 +253,56 @@ mod tests {
         let rec = parse_record(line);
         assert_eq!(rec.len(), 3);
         assert_eq!(&rec[1], b"x\r\ny");
+    }
+
+    #[test]
+    fn parse_record_into_matches_parse_record() {
+        // 零分配版本必须与 parse_record 逐字段一致（含引号、转义、空字段、多行字段等边界）
+        let cases: Vec<&[u8]> = vec![
+            b"a,b,c",
+            b"a,\"b,c\",d",
+            b"\"he said \"\"hi\"\"\",x",
+            b"a,,c,",
+            b"ab\"cd,e",
+            b"\"a\"\"b\",c",
+            b"",
+            b",,",
+            b"\"\"",
+            b"\"multi\nline\",x",
+            b"\"\"\"\",\"\"",
+            "中文字段,另一个".as_bytes(),
+        ];
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut ends: Vec<u32> = Vec::new();
+        for line in cases {
+            let expect = parse_record(line);
+            let count = parse_record_into(line, &mut scratch, &mut ends);
+            let shown = String::from_utf8_lossy(line);
+            assert_eq!(count, expect.len(), "字段数不一致: {shown:?}");
+            let mut prev = 0usize;
+            for (i, field) in expect.iter().enumerate() {
+                let end = ends[i] as usize;
+                assert_eq!(
+                    &scratch[prev..end],
+                    &field[..],
+                    "第 {i} 个字段不一致: {shown:?}"
+                );
+                prev = end;
+            }
+            assert_eq!(prev, scratch.len(), "字段边界未覆盖全部缓冲: {shown:?}");
+        }
+    }
+
+    #[test]
+    fn parse_record_into_reuses_buffers() {
+        // 连续调用会清空并复用缓冲（不残留上一次的数据）
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut ends: Vec<u32> = Vec::new();
+        assert_eq!(parse_record_into(b"aaaa,bbbb", &mut scratch, &mut ends), 2);
+        let n = parse_record_into(b"x", &mut scratch, &mut ends);
+        assert_eq!(n, 1);
+        assert_eq!(&scratch[..], b"x");
+        assert_eq!(ends, vec![1]);
     }
 
     #[test]

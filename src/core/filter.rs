@@ -12,6 +12,11 @@ use std::cmp::Ordering;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use super::model::DataModel;
+use super::reader::RowReader;
+
+/// 筛选并行度上限。筛选是纯 CPU + 内存带宽密集型（不像拆分那样受写入 IO 限制），
+/// 但并发过高会让内存带宽成为瓶颈、收益递减；且行数很少时也没必要开满。
+const MAX_FILTER_THREADS: usize = 32;
 
 /// 条件间逻辑关系
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,14 +90,19 @@ pub struct FilterCondition {
     pub logic: Logic,
 }
 
-/// 评估单行是否命中（逐条件累积，带 AND 短路）
-fn eval_row(model: &DataModel, row: usize, conds: &[FilterCondition]) -> bool {
-    let mut acc = eval_one(model, row, &conds[0]);
+/// 评估单行是否命中（逐条件累积，带 AND 短路）。
+///
+/// 字段值来自已载入的行缓存 `reader`：**整行只解析一次**，同行的多个条件共享结果。
+/// 此前每个条件各调一次 `model.field(row, col)`，每次都要重新解析整行
+/// （分配 `Vec<Vec<u8>>`、每字段一个 `Vec<u8>` 与一个 `String`），
+/// 条件越多重复解析越多（即使只取一列也要解析全部列）。
+fn eval_row(reader: &RowReader, conds: &[FilterCondition]) -> bool {
+    let mut acc = eval_one(reader, &conds[0]);
     for c in &conds[1..] {
         if c.logic == Logic::And && !acc {
             return false; // AND 短路
         }
-        let sub = eval_one(model, row, c);
+        let sub = eval_one(reader, c);
         acc = match c.logic {
             Logic::And => acc && sub,
             Logic::Or => acc || sub,
@@ -101,9 +111,9 @@ fn eval_row(model: &DataModel, row: usize, conds: &[FilterCondition]) -> bool {
     acc
 }
 
-/// 单条件评估
-fn eval_one(model: &DataModel, row: usize, c: &FilterCondition) -> bool {
-    let v = model.field(row, c.column);
+/// 单条件评估（字段值取自行缓存）
+fn eval_one(reader: &RowReader, c: &FilterCondition) -> bool {
+    let v = reader.value(c.column);
     let v = v.trim();
     match c.op {
         FilterOp::IsEmpty => v.is_empty(),
@@ -184,10 +194,14 @@ pub fn apply_filter(
         return (0..n as u32).collect();
     }
 
+    // 本次筛选涉及的所有列（去重后交给每线程的行读取器，做到每行只解析一次）
+    let need_cols: Vec<usize> = conds.iter().map(|c| c.column).collect();
+
     let threads = std::thread::available_parallelism()
         .map(|x| x.get())
         .unwrap_or(4)
-        .min(16);
+        .min(MAX_FILTER_THREADS)
+        .min(n);
     let chunk = (n / threads).max(1);
     let done = AtomicUsize::new(0);
 
@@ -199,12 +213,16 @@ pub fn apply_filter(
             let end = (start + chunk).min(n);
             let model_ref = model;
             let conds_ref = conds;
+            let cols = need_cols.clone();
             let done_ref = &done;
             let prog = progress;
             handles.push(s.spawn(move || {
+                // 线程局部的行读取器：解析缓冲与字段文本都在线程内复用（零分配）
+                let mut reader = RowReader::new(cols);
                 let mut out = Vec::new();
                 for row in start..end {
-                    if eval_row(model_ref, row, conds_ref) {
+                    reader.load(model_ref.file(), row);
+                    if eval_row(&reader, conds_ref) {
                         out.push(row as u32);
                     }
                 }

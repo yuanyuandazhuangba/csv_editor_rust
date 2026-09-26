@@ -251,6 +251,84 @@ impl CsvFile {
     }
 }
 
+/// 逐行读取指定列文本的复用读取器（零分配）。
+///
+/// 供筛选这类「对每行反复取字段」的高频路径使用：
+/// - **整行只解析一次**（`parse_record_into` 写入复用缓冲），同一行的多个条件共享结果；
+/// - 所需列的文本写入复用 `String`（`String::clear` 保留容量），不产生每行分配。
+pub struct RowReader {
+    /// 解析后的字段内容（连续存放）
+    scratch: Vec<u8>,
+    /// 各字段的结束偏移
+    ends: Vec<u32>,
+    /// 需要读取的列（升序去重）与 `values` 一一对应
+    need_cols: Vec<usize>,
+    /// 与 `need_cols` 对应的字段文本（复用容量）
+    values: Vec<String>,
+    /// 已解析的行号（None = 尚无数据）
+    parsed: Option<usize>,
+}
+
+impl RowReader {
+    /// `need_cols` 为本次筛选用到的所有列（内部会排序去重）
+    pub fn new(mut need_cols: Vec<usize>) -> Self {
+        need_cols.sort_unstable();
+        need_cols.dedup();
+        let n = need_cols.len();
+        Self {
+            scratch: Vec::with_capacity(1024),
+            ends: Vec::with_capacity(64),
+            need_cols,
+            values: (0..n).map(|_| String::with_capacity(64)).collect(),
+            parsed: None,
+        }
+    }
+
+    /// 载入某一行的所需列（该行已载入时直接返回）
+    pub fn load(&mut self, file: &CsvFile, row: usize) {
+        if self.parsed == Some(row) {
+            return;
+        }
+        let raw = trim_line_ending(file.row_bytes(row));
+        let count = super::csv::parse_record_into(raw, &mut self.scratch, &mut self.ends);
+        for i in 0..self.need_cols.len() {
+            let col = self.need_cols[i];
+            let value = &mut self.values[i];
+            value.clear();
+            if col < count {
+                let start = if col == 0 {
+                    0usize
+                } else {
+                    self.ends[col - 1] as usize
+                };
+                let end = self.ends[col] as usize;
+                decode_into(&self.scratch[start..end], file.encoding, value);
+            }
+        }
+        self.parsed = Some(row);
+    }
+
+    /// 取某列的文本（列不在 `need_cols` 中时返回空串）
+    pub fn value(&self, col: usize) -> &str {
+        match self.need_cols.binary_search(&col) {
+            Ok(i) => self.values[i].as_str(),
+            Err(_) => "",
+        }
+    }
+}
+
+/// 把字段字节解码为 UTF-8 文本并追加到 `out`（复用 `out` 容量，不分配）
+fn decode_into(bytes: &[u8], encoding: CsvEncoding, out: &mut String) {
+    match encoding {
+        CsvEncoding::Gb18030 => {
+            let (cow, _, _) = encoding_rs::GB18030.decode(bytes);
+            out.push_str(&cow);
+        }
+        // UTF-8 / UTF-8 BOM / UTF-16（打开时已整体转码为 UTF-8）可直接借用
+        _ => out.push_str(&String::from_utf8_lossy(bytes)),
+    }
+}
+
 /// 去掉行尾换行符（\r\n、\n、\r）。
 fn trim_line_ending(mut line: &[u8]) -> &[u8] {
     while line.last() == Some(&b'\n') || line.last() == Some(&b'\r') {
