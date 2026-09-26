@@ -12,7 +12,7 @@
 mod app;
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use app::CsvEditorApp;
 use eframe::egui;
@@ -81,6 +81,25 @@ fn log_path() -> PathBuf {
     std::env::temp_dir().join("csv_editor_rust.log")
 }
 
+/// 诊断日志文件的大小上限：超过则归档为 `.1`（只保留一份历史），
+/// 避免长期反复启动把文件无限写大（该文件每次启动都会追加十几行）。
+const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// 超过上限时轮转：`csv_editor_rust.log` → `csv_editor_rust.log.1`（覆盖旧的 .1）
+fn rotate_log_if_needed(path: &Path) {
+    let too_big = std::fs::metadata(path)
+        .map(|m| m.len() > LOG_MAX_BYTES)
+        .unwrap_or(false);
+    if !too_big {
+        return;
+    }
+    let mut bak = path.as_os_str().to_owned();
+    bak.push(".1");
+    let bak = PathBuf::from(bak);
+    let _ = std::fs::remove_file(&bak);
+    let _ = std::fs::rename(path, &bak);
+}
+
 /// 直接向日志文件追加一行（不依赖 log crate；用于 hook/首行）
 fn log_line(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -122,6 +141,7 @@ impl log::Log for FileLogger {
 /// 安装诊断：文件 logger + panic hook。必须在任何可能失败的初始化前调用。
 fn install_diagnostics() {
     let path = log_path();
+    rotate_log_if_needed(&path);
     log_line("==================== csv_editor_rust 启动诊断 ====================");
     log_line(&format!("日志文件：{}", path.display()));
     log_line(&format!(

@@ -495,13 +495,19 @@ impl CsvEditorApp {
                         self.export_log();
                     }
                 });
+                // 虚拟化渲染：日志上限是 5000 条，若每帧为全部条目创建文本布局，
+                // 在放大界面时会有明显开销。show_rows 只渲染可见的若干行，
+                // 滚动时再按需布局，因此日志再多也不影响帧率。
+                let row_height = 14.0;
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
                     .max_height(ui.available_height() - 14.0)
-                    .show(ui, |ui| {
-                        for line in &self.log {
-                            ui.monospace(egui::RichText::new(line).size(11.0));
+                    .show_rows(ui, row_height, self.log.len(), |ui, range| {
+                        for i in range {
+                            if let Some(line) = self.log.get(i) {
+                                ui.monospace(egui::RichText::new(line).size(11.0));
+                            }
                         }
                     });
             });

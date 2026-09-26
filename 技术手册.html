@@ -268,6 +268,7 @@
       <li>加宽滚动条，避免数据预览区滚动条过窄难操作。</li>
       <li>弹出窗口位置可配置（居中/右侧/左侧/中间/记忆位置），egui <code>persistence</code> 记忆。</li>
       <li>进程峰值内存用 <code>GetProcessMemoryInfo</code>（winapi）实时显示。</li>
+      <li><b>操作日志的两道护栏（为什么不需要日志数据库）</b>：内存日志有 <b>5000 条硬上限</b>（超出丢弃最旧，约 0.4MB），且日志是「操作级」而非「行级」——一次千万行拆分最多也只产生 51 条（50 条逐文件行数 + 1 条汇总），<b>日志量与数据规模无关</b>；日志面板用 <code>ScrollArea::show_rows</code> 虚拟化渲染，只布局可见行。启动诊断日志（exe 同目录 <code>csv_editor_rust.log</code>）超过 2MB 自动轮转为 <code>.log.1</code>。<br><b>结论：不引入 SQLite 等日志数据库。</b><code>rusqlite</code> 的 bundled 特性需用 C 工具链编译 SQLite，与本项目 Win7 自包含链接链（<code>rust-lld</code> + <code>-C link-self-contained=yes</code> + <code>build-std</code>）冲突且验证成本高；动态链接 <code>sqlite3.dll</code> 则在 Win7 上并不存在，会直接破坏「单文件、无外部 DLL 依赖」这一核心特性；纯 Rust 实现尚不成熟。几百到几千条日志用文本搜索已足够，数据库属于过度设计。</li>
       <li><b>底部状态栏</b>（<code>TopBottomPanel::bottom</code>）：显示总行数 / 筛选后行数 / 列数 / 进程峰值内存，以及文件名、大小与编码。它先于右侧日志面板渲染，因此横跨窗口底部全宽。</li>
       <li><b>三条工具栏</b>：主工具栏（打开/合并/导出/筛选/清除筛选/界面缩放/自愿捐助等）、「数据处理」工具栏（拆分数据、8 项列操作、撤销/恢复、清理筛选缓存、文件信息）、「数据分析」工具栏（提取唯一行/去重）。后两条由「工具 → 数据处理工具栏 / 数据分析工具栏」切换显示，<b>默认显示</b>；菜单项以对号标记当前状态，两态文本等长（尾部空格占位）以保证与其它菜单项左对齐、且宽度不跳动。三条工具栏都包在 <code>ScrollArea::horizontal</code> 中，界面放大到 1.5 倍时仍可横向滚动访问全部按钮。</li>
       <li><b>进度窗口必须 <code>constrain_to(screen)</code></b>：该窗口用 <code>egui::Area</code> 实现，而 <code>Area</code> 默认 <code>constrain = false</code>（不夹取到屏幕内），位置又取自持久化的“上次拖动位置”。界面缩放（按钮大小）或窗口尺寸变化后逻辑屏幕变小，记忆位置可能落到可视区之外，进度窗口便“消失”。对话框用 <code>Window</code>（默认 <code>constrain = true</code>）故不受影响——这正是“只有进度条不见了、对话框都正常”的原因。</li>
