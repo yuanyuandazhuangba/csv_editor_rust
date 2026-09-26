@@ -463,6 +463,8 @@ impl eframe::App for CsvEditorApp {
         self.controls_panel(ctx);
         // 「数据处理」工具栏：紧跟在主工具栏下方（可经「工具」菜单隐藏）
         self.data_toolbar_panel(ctx);
+        // 底部状态栏：先于右侧日志面板渲染，使其横跨窗口底部（而不是只到日志面板左侧）
+        self.status_bar(ctx);
         if self.show_log {
             self.log_panel(ctx);
         }

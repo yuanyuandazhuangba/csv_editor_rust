@@ -474,6 +474,9 @@ impl CsvEditorApp {
                     return;
                 }
                 ui.label("选择要删除的列:");
+                // 丢弃超出当前列数的陈旧索引：列数会因之前的删除/撤销/生成列而变化，
+                // 若把旧索引原样提交，delete_columns 会报「列索引 N 不存在」。
+                self.dialogs.delete_cols.retain(|&i| i < header.len());
                 let mut sel = self.dialogs.delete_cols.clone();
                 egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
                     for (i, h) in header.iter().enumerate() {
@@ -492,7 +495,12 @@ impl CsvEditorApp {
                         self.log("请选择要删除的列");
                     } else if let Some(ops) = self.ops_mut() {
                         match ops.delete_columns(&sel) {
-                            Ok(()) => self.log(&format!("删除列完成: {} 列", sel.len())),
+                            Ok(()) => {
+                                self.log(&format!("删除列完成: {} 列", sel.len()));
+                                // 删除后必须清空选中：否则这些列索引残留到下次打开，
+                                // 列数已变少时会越界（曾表现为「删除列失败：列索引 N 不存在」）。
+                                self.dialogs.delete_cols.clear();
+                            }
                             Err(e) => self.log(&format!("删除列失败: {}", e)),
                         }
                     }

@@ -66,16 +66,16 @@ impl CsvEditorApp {
                         ui.close_menu();
                     }
                     ui.separator();
-                    // 显示/隐藏「数据处理」工具栏：显示时命令后带对号（固定宽度保证对号位置稳定）
+                    // 显示/隐藏「数据处理」工具栏：显示时命令后带对号。
+                    // 用「尾部空格占位」而不是 add_sized 固定宽度：add_sized 会把文字居中，
+                    // 而菜单项应与「加载示例数据」一样左对齐；两态文本长度相同，
+                    // 因此对号出现/消失时菜单宽度也不会跳动。
                     let label = if self.show_data_toolbar {
                         "数据处理工具栏  ✔"
                     } else {
                         "数据处理工具栏    "
                     };
-                    if ui
-                        .add_sized([176.0, 20.0], egui::Button::new(label))
-                        .clicked()
-                    {
+                    if ui.button(label).clicked() {
                         self.show_data_toolbar = !self.show_data_toolbar;
                         let msg = if self.show_data_toolbar {
                             "已显示数据处理工具栏"
@@ -192,6 +192,44 @@ impl CsvEditorApp {
                     }
                 });
             });
+        });
+    }
+
+    /// 底部状态栏：总行数 / 筛选后行数 / 列数 / 内存占用 / 文件信息。
+    /// （原先显示在主工具栏第二行，现移到底部，避免占用工具栏垂直空间。）
+    pub fn status_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                let total = self.model.as_ref().map(|m| m.row_count()).unwrap_or(0);
+                let filtered = self.visible_rows().map(|v| v.len()).unwrap_or(total);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "总行数: {}  |  筛选后: {}  |  列数: {}  |  内存: {:.0} MB",
+                        total,
+                        filtered,
+                        self.ops.as_ref().map(|o| o.column_count()).unwrap_or(0),
+                        self.peak_memory_mb
+                    ))
+                    .color(egui::Color32::from_rgb(0, 110, 200)),
+                );
+                if let Some(fi) = &self.file_info {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "文件: {} ({:.1} MB, {})",
+                            std::path::Path::new(&fi.path)
+                                .file_name()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            fi.size_bytes as f64 / 1024.0 / 1024.0,
+                            fi.encoding
+                        ))
+                        .color(egui::Color32::from_rgb(90, 150, 90)),
+                    );
+                }
+            });
+            ui.add_space(2.0);
         });
     }
 
@@ -370,40 +408,6 @@ impl CsvEditorApp {
                     });
                 });
             ui.add_space(2.0);
-            // 统计信息
-            ui.horizontal(|ui| {
-                let total = self.model.as_ref().map(|m| m.row_count()).unwrap_or(0);
-                let filtered = self
-                    .visible_rows()
-                    .map(|v| v.len())
-                    .unwrap_or(total);
-                ui.label(
-                    egui::RichText::new(format!(
-                        "总行数: {}  |  筛选后: {}  |  列数: {}  |  内存: {:.0} MB",
-                        total,
-                        filtered,
-                        self.ops.as_ref().map(|o| o.column_count()).unwrap_or(0),
-                        self.peak_memory_mb
-                    ))
-                    .color(egui::Color32::from_rgb(0, 110, 200)),
-                );
-                if let Some(fi) = &self.file_info {
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "文件: {} ({:.1} MB, {})",
-                            std::path::Path::new(&fi.path)
-                                .file_name()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_default(),
-                            fi.size_bytes as f64 / 1024.0 / 1024.0,
-                            fi.encoding
-                        ))
-                        .color(egui::Color32::from_rgb(90, 150, 90)),
-                    );
-                }
-            });
-            ui.add_space(4.0);
         });
     }
 

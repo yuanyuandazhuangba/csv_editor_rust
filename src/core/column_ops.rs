@@ -599,6 +599,35 @@ mod tests {
     }
 
     #[test]
+    fn delete_derived_hash_columns_all_algorithms() {
+        // 回归：4 种算法生成的哈希列都应能正常删除（曾出现「MD5 哈希列删不掉、
+        // 报列索引不存在」的报告——那是界面把陈旧的列索引原样提交所致，
+        // 核心层对各算法一视同仁；这里把这条语义固定下来）。
+        let m = model();
+        let base = m.column_count();
+        for (i, algo) in [HashAlgo::Md5, HashAlgo::Sha1, HashAlgo::Sha256, HashAlgo::Sha512]
+            .into_iter()
+            .enumerate()
+        {
+            let mut ops = ColumnOps::new(m.header());
+            let name = format!("hash_{i}");
+            ops.generate_hash(&[0], &name, algo).unwrap();
+            assert_eq!(ops.column_count(), base + 1, "生成后应多一列");
+            // 新列是派生列（无对应原始列）
+            assert_eq!(ops.view_to_base(base), None);
+            // 删除刚生成的哈希列（位于末尾）
+            ops.delete_columns(&[base]).unwrap();
+            assert_eq!(ops.column_count(), base, "哈希列应可删除");
+            // 删除后原列引用保持正确
+            assert_eq!(ops.view_to_base(base - 1), Some(base - 1));
+            // 再用刚刚删除的索引删除 → 越界应报错（核心层保持严格校验；
+            // 界面侧必须过滤陈旧索引，见 dialog_delete_column）
+            let err = ops.delete_columns(&[base]).unwrap_err();
+            assert!(err.contains("不存在"), "越界应给出明确错误: {err}");
+        }
+    }
+
+    #[test]
     fn generate_hash_column() {
         let m = model();
         let mut ops = ColumnOps::new(m.header());
