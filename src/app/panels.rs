@@ -180,12 +180,10 @@ impl CsvEditorApp {
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             ui.add_space(4.0);
             // 工具栏按钮较多，界面放大到 1.5 倍时可能超出窗口宽度：
-            // 用横向滚动区域包住——未溢出时右侧组仍贴最右，溢出时可横向滚动访问。
-            let avail_width = ui.available_width();
+            // 用横向滚动区域包住，溢出时可横向滚动访问（保证各按钮始终可达）。
             egui::ScrollArea::horizontal()
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    ui.set_min_width(avail_width);
                     ui.horizontal(|ui| {
                     // 文件操作
                     if ui.button("📂 选择CSV文件").clicked() {
@@ -228,33 +226,30 @@ impl CsvEditorApp {
                     if ui.button("日志").clicked() {
                         self.show_log = !self.show_log;
                     }
-                    // 工具栏最右侧：自愿捐助 + 按钮大小（等比缩放，右对齐）
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // right_to_left 下先添加的靠右，故先放数值框 → 再“倍” → 再“按钮大小”，
-                        // 视觉顺序即「按钮大小 [1.0] 倍」
-                        let mut zoom = ui.ctx().zoom_factor();
-                        let resp = ui.add(
-                            egui::DragValue::new(&mut zoom)
-                                .clamp_range(1.0f32..=1.5f32)
-                                .speed(0.01)
-                                .fixed_decimals(1),
-                        );
-                        if resp.changed() {
-                            let z = zoom.clamp(1.0, 1.5);
-                            ui.ctx().set_zoom_factor(z);
-                            self.log(&format!("按钮大小：{:.1} 倍（界面等比缩放）", z));
-                        }
-                        ui.label("倍");
-                        ui.label("按钮大小");
-                        ui.separator();
-                        if ui
-                            .button("❤ 自愿捐助")
-                            .on_hover_text("扫码支持开发者，万分感谢")
-                            .clicked()
-                        {
-                            self.dialogs.donate = true;
-                        }
-                    });
+                    // 自愿捐助 + 按钮大小：顺序排在工具栏按钮之后（不右对齐）
+                    ui.separator();
+                    if ui
+                        .button("❤ 自愿捐助")
+                        .on_hover_text("扫码支持开发者，万分感谢")
+                        .clicked()
+                    {
+                        self.dialogs.donate = true;
+                    }
+                    ui.separator();
+                    ui.label("按钮大小");
+                    let mut zoom = ui.ctx().zoom_factor();
+                    let resp = ui.add(
+                        egui::DragValue::new(&mut zoom)
+                            .clamp_range(1.0f32..=1.5f32)
+                            .speed(0.01)
+                            .fixed_decimals(1),
+                    );
+                    if resp.changed() {
+                        let z = zoom.clamp(1.0, 1.5);
+                        ui.ctx().set_zoom_factor(z);
+                        self.log(&format!("按钮大小：{:.1} 倍（界面等比缩放）", z));
+                    }
+                    ui.label("倍");
                     });
                 });
             ui.add_space(2.0);
