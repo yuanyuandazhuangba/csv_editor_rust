@@ -344,6 +344,128 @@ fn main() {
         println!("WARN 无可用于频次分布的列，跳过统计");
     }
 
+    // 9. 重复情况统计：找重复键、各重复几次、重复行占比，并给出可落回视图的行号
+    let dup_key_col = col_of("交易方户名").or(group_col);
+    if let Some(c_key) = dup_key_col {
+        let t = Instant::now();
+        match stats::duplicate_stats(&m, filtered.as_deref(), &[c_key], 100, None) {
+            Ok(rep) => {
+                // 内置核对：
+                //   1) 不同键 + 重复行 == 统计范围行数（恒等式）
+                //   2) 「重复涉及行」∪「唯一行」恰好覆盖统计范围全部行
+                let mut all: Vec<u32> = rep
+                    .dup_rows
+                    .iter()
+                    .chain(rep.unique_rows.iter())
+                    .copied()
+                    .collect();
+                all.sort_unstable();
+                all.dedup();
+                let ok = rep.distinct_keys + rep.duplicate_rows == rep.input_rows
+                    && all.len() == rep.input_rows
+                    && rep.unique_rows.len() == rep.distinct_keys;
+                println!(
+                    "OK  重复情况 {}: {}，可落回视图（重复 {} 行 / 唯一 {} 行），核对 {} ({:.2}s)",
+                    if filtered.is_some() { "(当前筛选结果)" } else { "(全量)" },
+                    rep.summary(),
+                    rep.dup_rows.len(),
+                    rep.unique_rows.len(),
+                    if ok { "通过" } else { "未通过" },
+                    t.elapsed().as_secs_f64()
+                );
+                if let Some(top) = rep.table.rows.first() {
+                    println!("      重复最多的键：{:?}", top);
+                }
+                if !ok {
+                    fails += 1;
+                }
+                let sc = format!("{}\\e2e_dup.csv", out_dir);
+                match export::export_rows_csv(&sc, &rep.table.headers, rep.table.rows.iter().cloned())
+                {
+                    Ok(n) => println!("OK  导出重复情况 CSV: {} 项 -> {}", n, sc),
+                    Err(e) => {
+                        println!("FAIL 导出重复情况 CSV: {}", e);
+                        fails += 1;
+                    }
+                }
+                let sx = format!("{}\\e2e_dup.xlsx", out_dir);
+                match export::export_rows_xlsx(&sx, &rep.table.headers, rep.table.rows.iter().cloned())
+                {
+                    Ok(n) => println!("OK  导出重复情况 XLSX: {} 项 -> {}", n, sx),
+                    Err(e) => {
+                        println!("FAIL 导出重复情况 XLSX: {}", e);
+                        fails += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                println!("FAIL 重复情况统计: {}", e);
+                fails += 1;
+            }
+        }
+    } else {
+        println!("WARN 无可用于判重的列，跳过重复情况统计");
+    }
+
+    // 10. 空值与数据质量统计：逐列体检（这里取前若干列）
+    let quality_cols: Vec<usize> = (0..m.column_count().min(8)).collect();
+    if !quality_cols.is_empty() {
+        let t = Instant::now();
+        match stats::describe_quality(&m, filtered.as_deref(), &quality_cols, None) {
+            Ok(tb) => {
+                // 内置核对：空值率 = (空值数 + 纯空白数) / 行数；最长长度 ≥ 最短长度
+                let rows_total = tb.input_rows as f64;
+                let ok = tb.rows.iter().all(|r| {
+                    let empty: f64 = r[2].parse().unwrap_or(0.0);
+                    let blank: f64 = r[3].parse().unwrap_or(0.0);
+                    let rate: f64 = r[4].parse().unwrap_or(-1.0);
+                    let min_len: f64 = r[6].parse().unwrap_or(0.0);
+                    let max_len: f64 = r[7].parse().unwrap_or(0.0);
+                    let expect = if rows_total > 0.0 {
+                        (empty + blank) * 100.0 / rows_total
+                    } else {
+                        0.0
+                    };
+                    (rate - expect).abs() < 0.05 && max_len >= min_len
+                });
+                println!(
+                    "OK  数据质量 {}: {} 行 × {} 列，核对 {} ({:.2}s)",
+                    if filtered.is_some() { "(当前筛选结果)" } else { "(全量)" },
+                    tb.input_rows,
+                    tb.rows.len(),
+                    if ok { "通过" } else { "未通过" },
+                    t.elapsed().as_secs_f64()
+                );
+                for note in tb.notes.iter().take(2) {
+                    println!("      {}", note);
+                }
+                if !ok {
+                    fails += 1;
+                }
+                let sc = format!("{}\\e2e_quality.csv", out_dir);
+                match export::export_rows_csv(&sc, &tb.headers, tb.rows.iter().cloned()) {
+                    Ok(n) => println!("OK  导出数据质量 CSV: {} 列 -> {}", n, sc),
+                    Err(e) => {
+                        println!("FAIL 导出数据质量 CSV: {}", e);
+                        fails += 1;
+                    }
+                }
+                let sx = format!("{}\\e2e_quality.xlsx", out_dir);
+                match export::export_rows_xlsx(&sx, &tb.headers, tb.rows.iter().cloned()) {
+                    Ok(n) => println!("OK  导出数据质量 XLSX: {} 列 -> {}", n, sx),
+                    Err(e) => {
+                        println!("FAIL 导出数据质量 XLSX: {}", e);
+                        fails += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                println!("FAIL 数据质量统计: {}", e);
+                fails += 1;
+            }
+        }
+    }
+
     if fails == 0 {
         println!("=== 端到端回归: 全部通过 ===");    } else {
         println!("=== 端到端回归: {} 项失败 ===", fails);

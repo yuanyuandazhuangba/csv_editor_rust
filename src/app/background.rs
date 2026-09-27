@@ -7,7 +7,7 @@ use csv_editor_rust::core::dedup::DedupReport;
 use csv_editor_rust::core::merge::{FileHeader, HeaderCheck, MergeReport};
 use csv_editor_rust::core::model::DataModel;
 use csv_editor_rust::core::split::SplitReport;
-use csv_editor_rust::core::stats::StatsTable;
+use csv_editor_rust::core::stats::{DuplicateReport, StatsTable};
 
 /// 后台 → UI 消息
 pub enum BgMsg {
@@ -27,8 +27,10 @@ pub enum BgMsg {
     Merged(MergeReport),
     /// 提取唯一行完成（唯一行号, 统计, 重复行对应关系, 判重字段原始列索引）
     DedupDone(Vec<u32>, DedupReport, Vec<(u32, u32)>, Vec<usize>),
-    /// 统计完成（分组汇总 / 数值列统计；结果表用 Arc 便于结果窗每帧零成本共享）
+    /// 统计完成（分组汇总 / 列统计 / 频次分布 / 数据质量；结果表用 Arc 便于结果窗每帧零成本共享）
     StatsDone(std::sync::Arc<StatsTable>),
+    /// 重复情况统计完成（含明细表与可直接落回视图的行号）
+    DuplicateDone(std::sync::Arc<DuplicateReport>),
     /// 错误
     Error(String),
 }

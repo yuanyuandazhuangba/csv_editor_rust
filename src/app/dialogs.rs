@@ -64,6 +64,16 @@ pub struct DialogStates {
     pub freq_cols: Vec<usize>,
     /// 每列显示前 N 项（0 = 尚未初始化，界面按 20 处理）
     pub freq_top_n: usize,
+    // 数据分析：重复情况统计
+    pub dup_window: bool,
+    /// 判重字段（视图列索引；空 = 全部字段）
+    pub dup_cols: Vec<usize>,
+    /// 明细列出前 N 个重复键（0 = 尚未初始化，界面按 100 处理）
+    pub dup_top_n: usize,
+    // 数据分析：空值与数据质量统计
+    pub quality_window: bool,
+    /// 要检查的列（视图列索引）
+    pub quality_cols: Vec<usize>,
     // 筛选/拆分/文件信息 弹出窗口
     pub filter_window: bool,
     pub split_window: bool,

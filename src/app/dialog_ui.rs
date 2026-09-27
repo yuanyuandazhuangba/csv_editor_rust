@@ -138,6 +138,12 @@ impl CsvEditorApp {
         let mut f = std::mem::take(&mut self.dialogs.freq_window);
         self.dialog_value_frequency(ctx, &mut f);
         self.dialogs.freq_window = f;
+        let mut f = std::mem::take(&mut self.dialogs.dup_window);
+        self.dialog_duplicate_stats(ctx, &mut f);
+        self.dialogs.dup_window = f;
+        let mut f = std::mem::take(&mut self.dialogs.quality_window);
+        self.dialog_quality_stats(ctx, &mut f);
+        self.dialogs.quality_window = f;
         let mut f = std::mem::take(&mut self.dialogs.stats_result_window);
         self.dialog_stats_result(ctx, &mut f);
         self.dialogs.stats_result_window = f;
@@ -1236,16 +1242,18 @@ impl CsvEditorApp {
                         ui.label("• 输入或拖动数值即可把菜单、菜单命令、工具栏按钮、表格文字整体等比放大，方便视力不佳的用户；");
                         ui.weak("设置会被记住，下次启动仍然生效。");
                     });
-                    ui.collapsing("九、数据分析（去重 / 分组汇总 / 列统计 / 频次分布）", |ui| {
-                        ui.label("四条命令都在「数据分析」工具栏与菜单「数据分析」下；作用范围都是当前筛选结果（未筛选则为全部数据）。");
+                    ui.collapsing("九、数据分析（去重 / 分组汇总 / 列统计 / 频次分布 / 重复情况 / 数据质量）", |ui| {
+                        ui.label("六条命令都在「数据分析」工具栏与菜单「数据分析」下；作用范围都是当前筛选结果（未筛选则为全部数据）。");
                         ui.label("• 提取唯一行（去重）：勾选判重字段（一个都不勾 = 按整行判重），执行后保留唯一行并作为当前视图，可继续导出、拆分、统计；完成后可导出「重复行对应表」。");
                         ui.label("• 字段分组汇总：选 1~3 个分组字段，再为若干列添加汇总方式（求和/均值/最大/最小/计数/去重计数/空值数），点「开始汇总」；结果是每组一行的汇总表（含「行数」）。");
                         ui.label("• 数值列统计：勾选要统计的列（可多选），点「开始统计」；给出每列的行数、计数、空值数、非数值数、求和、均值、中位数、最小、最大、标准差（总体）。");
-                        ui.label("• 频次分布 / Top-N：勾选列并设置「每列显示前 N 项」，点「开始统计」；列出各取值的出现次数与占比（按次数从多到少），空值作为「(空)」一类参与排名，超出前 N 项的汇总为一行「(其余 M 个取值)」，因此各行占比之和是 100%。常用法：找出卡号/账号出现次数最多的前 20 条。注意：若某列不同取值过多（超过内存上限）会提示先用筛选缩小范围，不会给出不完整的频次结果。");
+                        ui.label("• 频次分布 / Top-N：勾选列并设置「每列显示前 N 项」，点「开始统计」；列出各取值的出现次数与占比（按次数从多到少），空值作为「(空)」一类参与排名，超出前 N 项的汇总为一行「(其余 M 个取值)」，末行「(合计)」用于核对总量（占比 100%）。常用法：找出卡号/账号出现次数最多的前 20 条。");
+                        ui.label("• 重复情况统计：选判重字段（不勾 = 按整行判重），点「开始统计」；给出不同键/重复键个数与重复行占比，明细按重复次数降序列出前 N 个重复键。结果窗里可一键「只看重复的行」或「只看唯一行」，把结果直接落到当前数据视图（用工具栏「清除筛选」可恢复全部）。");
+                        ui.label("• 空值与数据质量统计：勾选列（想知道整份数据质量就点「全选」），点「开始检查」；逐列给出空值数、纯空白数、空值率、含控制字符数、最短/最长/平均长度、超长值数（>255 字符）。");
                         ui.label("    金额等按数值精确计算（定点十进制累加，两位小数的合计不会出现 3613134567.580001 这类多余尾数）；某列若混有文字会被跳过，并在结果窗提示「N 个非数值未参与计算」；");
                         ui.label("    中位数需要保留该列的原始数值：数据量特别大时（超过用内存上限）该列中位数显示「—」，并提示先用筛选缩小范围；");
                         ui.label("    结果窗可「最小化」成一条标题栏（结果不丢），稍后点标题栏左侧三角展开即可继续查看或导出；");
-                        ui.weak("统计不改变当前数据视图；只能选原始列统计（拆分/合并/复制/哈希产生的新列不参与）；分组数超过 2 万会提示改用取值较少的字段。");
+                        ui.weak("除「重复情况统计」的一键筛选外，统计本身不改变当前数据视图；只能选原始列统计（拆分/合并/复制/哈希产生的新列不参与）；分组数或不同取值超过上限时会提示改用取值较少的字段或先筛选缩小范围。");
                     });
                     ui.collapsing("十、常见问题", |ui| {
                         ui.label("• 打开很慢或卡住？ 读文件在后台进行，请看进度窗口与右下「操作日志」面板；");
@@ -1737,6 +1745,202 @@ impl CsvEditorApp {
         *open = keep;
     }
 
+    /// 「重复情况统计」参数对话框：选判重字段（不勾 = 全部字段）+ 明细前 N 项。
+    fn dialog_duplicate_stats(&mut self, ctx: &egui::Context, open: &mut bool) {
+        let mut keep = *open;
+        let mut done = false;
+        apply_dialog_pos(
+            egui::Window::new("重复情况统计")
+                .open(&mut keep)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([600.0, 540.0]),
+            self.dialog_position,
+            ctx,
+        )
+        .show(ctx, |ui| {
+            let header = self.header_names();
+            if header.is_empty() {
+                ui.label("请先加载数据");
+                return;
+            }
+            let base_ok: Vec<bool> = (0..header.len())
+                .map(|i| self.ops.as_ref().and_then(|o| o.view_to_base(i)).is_some())
+                .collect();
+            let scope = match self.visible_rows() {
+                Some(v) => format!("当前筛选结果（{} 行）", v.len()),
+                None => format!(
+                    "全部数据（{} 行）",
+                    self.model.as_ref().map(|m| m.row_count()).unwrap_or(0)
+                ),
+            };
+            ui.label(format!("统计范围：{scope}"));
+            ui.weak(
+                "按所选字段的取值组合找出重复的键：各重复几次、重复行占比，明细按重复次数降序。\
+                 执行后可在结果窗里一键「只看重复的行」或「只看唯一行」把结果落到当前视图。\
+                 判重口径与「提取唯一行（去重）」完全一致（按原值比较，保留首次出现的行）。",
+            );
+            ui.separator();
+
+            ui.label("判重字段（不勾选 = 按整行判重）:");
+            self.dialogs
+                .dup_cols
+                .retain(|&i| i < header.len() && base_ok[i]);
+            let mut sel = self.dialogs.dup_cols.clone();
+            let selectable = base_ok.iter().filter(|b| **b).count();
+            ui.horizontal(|ui| {
+                if ui.small_button("全选").clicked() {
+                    sel = (0..header.len()).filter(|&i| base_ok[i]).collect();
+                }
+                if ui.small_button("全不选").clicked() {
+                    sel.clear();
+                }
+                ui.weak(format!("已选 {} / {} 列", sel.len(), selectable));
+            });
+            egui::ScrollArea::vertical()
+                .max_height(220.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (i, h) in header.iter().enumerate() {
+                        if !base_ok[i] {
+                            continue; // 派生列不列出
+                        }
+                        let mut on = sel.contains(&i);
+                        ui.checkbox(&mut on, h);
+                        if on && !sel.contains(&i) {
+                            sel.push(i);
+                        } else if !on {
+                            sel.retain(|&x| x != i);
+                        }
+                    }
+                });
+            self.dialogs.dup_cols = sel.clone();
+
+            ui.separator();
+            if self.dialogs.dup_top_n == 0 {
+                self.dialogs.dup_top_n = 100; // 懒初始化默认值
+            }
+            ui.horizontal(|ui| {
+                ui.label("明细列出前");
+                ui.add(
+                    egui::DragValue::new(&mut self.dialogs.dup_top_n)
+                        .clamp_range(1..=stats::MAX_DUP_TOP_N)
+                        .speed(1.0),
+                );
+                ui.label("个重复键（按重复次数降序；其余汇总为一行）");
+            });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("开始统计").clicked() {
+                    self.run_duplicate_stats();
+                    done = true;
+                }
+                if ui.button("取消").clicked() {
+                    done = true;
+                }
+                ui.weak(if sel.is_empty() {
+                    "将按整行判重"
+                } else {
+                    "将按所选字段判重"
+                });
+            });
+        });
+        if done {
+            keep = false;
+        }
+        *open = keep;
+    }
+
+    /// 「空值与数据质量统计」参数对话框：勾选要体检的列（可全选）。
+    fn dialog_quality_stats(&mut self, ctx: &egui::Context, open: &mut bool) {
+        let mut keep = *open;
+        let mut done = false;
+        apply_dialog_pos(
+            egui::Window::new("空值与数据质量统计")
+                .open(&mut keep)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([600.0, 540.0]),
+            self.dialog_position,
+            ctx,
+        )
+        .show(ctx, |ui| {
+            let header = self.header_names();
+            if header.is_empty() {
+                ui.label("请先加载数据");
+                return;
+            }
+            let base_ok: Vec<bool> = (0..header.len())
+                .map(|i| self.ops.as_ref().and_then(|o| o.view_to_base(i)).is_some())
+                .collect();
+            let scope = match self.visible_rows() {
+                Some(v) => format!("当前筛选结果（{} 行）", v.len()),
+                None => format!(
+                    "全部数据（{} 行）",
+                    self.model.as_ref().map(|m| m.row_count()).unwrap_or(0)
+                ),
+            };
+            ui.label(format!("统计范围：{scope}"));
+            ui.weak(
+                "逐列体检：空值数、纯空白数、空值率、含控制字符数（制表符/换行等）、\
+                 最短/最长/平均长度（按字符数）、超长值数（>255 字符）。\
+                 想知道整份数据的质量，点「全选」再统计即可。派生列不参与统计。",
+            );
+            ui.separator();
+
+            ui.label("选择要检查的列:");
+            self.dialogs
+                .quality_cols
+                .retain(|&i| i < header.len() && base_ok[i]);
+            let mut sel = self.dialogs.quality_cols.clone();
+            let selectable = base_ok.iter().filter(|b| **b).count();
+            ui.horizontal(|ui| {
+                if ui.small_button("全选").clicked() {
+                    sel = (0..header.len()).filter(|&i| base_ok[i]).collect();
+                }
+                if ui.small_button("全不选").clicked() {
+                    sel.clear();
+                }
+                ui.weak(format!("已选 {} / {} 列（可检查列）", sel.len(), selectable));
+            });
+            egui::ScrollArea::vertical()
+                .max_height(240.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (i, h) in header.iter().enumerate() {
+                        if !base_ok[i] {
+                            continue; // 派生列不列出
+                        }
+                        let mut on = sel.contains(&i);
+                        ui.checkbox(&mut on, h);
+                        if on && !sel.contains(&i) {
+                            sel.push(i);
+                        } else if !on {
+                            sel.retain(|&x| x != i);
+                        }
+                    }
+                });
+            self.dialogs.quality_cols = sel.clone();
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("开始检查").clicked() {
+                    self.run_quality_stats();
+                    done = true;
+                }
+                if ui.button("取消").clicked() {
+                    done = true;
+                }
+                ui.weak(format!("已选 {} 列", sel.len()));
+            });
+        });
+        if done {
+            keep = false;
+        }
+        *open = keep;
+    }
+
     /// 「取值频次分布 / Top-N」参数对话框：勾选要统计的列 + 每列显示前 N 项。
     fn dialog_value_frequency(&mut self, ctx: &egui::Context, open: &mut bool) {
         let mut keep = *open;
@@ -1849,6 +2053,9 @@ impl CsvEditorApp {
         let mut keep = *open;
         let mut done = false;
         let mut export: Option<(String, bool)> = None;
+        // 「重复情况统计」才有的行号集合（用于把结果落到当前数据视图）
+        let filter_rows = self.stats_filter_rows.clone();
+        let mut apply_rows: Option<(Vec<u32>, &'static str)> = None;
         // 结果类型决定窗口标题（标题同时是 egui 窗口 Id）
         let kind = self.last_stats.as_ref().map(|t| t.kind).unwrap_or_default();
         let title = kind.title();
@@ -1903,6 +2110,29 @@ impl CsvEditorApp {
                         .save_file()
                     {
                         export = Some((path.to_string_lossy().into_owned(), true));
+                    }
+                }
+                // 重复情况统计：一键把结果落到当前数据视图（与「清除筛选」配合可恢复）
+                if let Some(rows) = filter_rows.as_ref() {
+                    if ui
+                        .button("只看重复的行")
+                        .on_hover_text(format!(
+                            "把当前视图切换为「重复键涉及的全部行」（{} 行，含首次出现的那行）",
+                            rows.dup.len()
+                        ))
+                        .clicked()
+                    {
+                        apply_rows = Some((rows.dup.clone(), "重复的行"));
+                    }
+                    if ui
+                        .button("只看唯一行")
+                        .on_hover_text(format!(
+                            "把当前视图切换为「每个键首次出现的行」（{} 行，等同「提取唯一行（去重）」的结果）",
+                            rows.unique.len()
+                        ))
+                        .clicked()
+                    {
+                        apply_rows = Some((rows.unique.clone(), "唯一行"));
                     }
                 }
                 if ui
@@ -1981,6 +2211,14 @@ impl CsvEditorApp {
         if let Some((path, is_xlsx)) = export {
             // 导出是「额外动作」：结果窗保持打开，方便继续查看或再导出另一种格式
             self.export_stats(path, is_xlsx);
+        }
+        if let Some((rows, what)) = apply_rows {
+            let n = rows.len();
+            self.filtered_rows = Some(rows);
+            self.log(&format!(
+                "已把当前数据视图切换为「只看{}」：{} 行（用工具栏「清除筛选」可恢复全部）",
+                what, n
+            ));
         }
         if done {
             keep = false;

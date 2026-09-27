@@ -233,6 +233,43 @@ fn main() {
         },
     ));
 
+    // 重复情况统计（单线程：键表需全局唯一、首次出现行号依赖全局顺序）
+    let dup = |cols: &[usize], top_n: usize| -> String {
+        match csv_editor_rust::core::stats::duplicate_stats(&m, None, cols, top_n, None) {
+            Ok(r) => format!(
+                "不同键 {} / 重复键 {} / 重复行 {}",
+                r.distinct_keys, r.duplicate_keys, r.duplicate_rows
+            ),
+            Err(e) => format!(
+                "失败：{}",
+                e.chars().take(20).collect::<String>()
+            ),
+        }
+    };
+    results.push(bench("重复情况：按银行（20 键）判重", repeat, || {
+        dup(&[1], 100)
+    }));
+    results.push(bench("重复情况：按城市×备注1（700 键）判重", repeat, || {
+        dup(&[6, 11], 100)
+    }));
+    results.push(bench("重复情况：按整行判重（15 列，几乎全唯一）", repeat, || {
+        dup(&[], 100)
+    }));
+
+    // 空值与数据质量统计（一次并行扫描，逐列 O(1) 状态）
+    let quality = |cols: &[usize]| -> String {
+        match csv_editor_rust::core::stats::describe_quality(&m, None, cols, None) {
+            Ok(t) => format!("{} 列", t.rows.len()),
+            Err(e) => format!("失败：{}", e),
+        }
+    };
+    results.push(bench("数据质量：5 列", repeat, || {
+        quality(&[0, 1, 2, 3, 4])
+    }));
+    results.push(bench("数据质量：15 列（全部）", repeat, || {
+        quality(&(0..15).collect::<Vec<_>>())
+    }));
+
     println!(
         "\n{:<44} {:>9} {:>9} {:>8}  {}",
         "场景", "耗时(s)", "CPU(s)", "并行度", "产出"

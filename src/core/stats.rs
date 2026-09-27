@@ -133,6 +133,10 @@ pub enum StatsKind {
     ColumnSummary,
     /// 取值频次分布 / Top-N
     ValueFrequency,
+    /// 重复情况统计（哪些键重复、各重复几次、重复行占比）
+    DuplicateCheck,
+    /// 空值与数据质量统计
+    DataQuality,
 }
 
 impl StatsKind {
@@ -142,6 +146,8 @@ impl StatsKind {
             StatsKind::GroupBy => "分组汇总",
             StatsKind::ColumnSummary => "列统计",
             StatsKind::ValueFrequency => "频次分布",
+            StatsKind::DuplicateCheck => "重复情况",
+            StatsKind::DataQuality => "数据质量",
         }
     }
 
@@ -151,6 +157,8 @@ impl StatsKind {
             StatsKind::GroupBy => "分组汇总结果",
             StatsKind::ColumnSummary => "列统计结果",
             StatsKind::ValueFrequency => "频次分布结果",
+            StatsKind::DuplicateCheck => "重复情况结果",
+            StatsKind::DataQuality => "数据质量结果",
         }
     }
 
@@ -160,6 +168,8 @@ impl StatsKind {
             StatsKind::GroupBy => "分组汇总",
             StatsKind::ColumnSummary => "列统计",
             StatsKind::ValueFrequency => "频次分布",
+            StatsKind::DuplicateCheck => "重复情况",
+            StatsKind::DataQuality => "数据质量",
         }
     }
 }
@@ -195,6 +205,8 @@ impl StatsTable {
             StatsKind::GroupBy => "组",
             StatsKind::ColumnSummary => "列",
             StatsKind::ValueFrequency => "项",
+            StatsKind::DuplicateCheck => "项",
+            StatsKind::DataQuality => "列",
         }
     }
 
@@ -217,6 +229,14 @@ impl StatsTable {
                 self.aggs,
                 self.rows.len()
             ),
+            StatsKind::DuplicateCheck => format!(
+                "统计范围 {} 行 → {} 项的重复明细（按重复次数降序）",
+                self.input_rows,
+                self.rows.len()
+            ),
+            StatsKind::DataQuality => {
+                format!("统计范围 {} 行 → {} 列", self.input_rows, self.rows.len())
+            }
         }
     }
 }
@@ -832,6 +852,534 @@ fn value_frequency_with_cap(
         p(1.0);
     }
     Ok(table)
+}
+
+/// 重复情况统计可容纳的不同键个数上限（超出报错，提示先筛选缩小范围）
+const MAX_DUP_KEYS: usize = 2_000_000;
+/// 重复情况明细表允许的最大 Top-N
+pub const MAX_DUP_TOP_N: usize = 1000;
+
+/// 「重复情况统计」的结果：统计数字 + 明细表 + 可直接落回视图的行号
+#[derive(Debug, Clone)]
+pub struct DuplicateReport {
+    /// 明细表（每个重复键一行，按重复次数降序；可直接导出）
+    pub table: StatsTable,
+    /// 统计范围行数
+    pub input_rows: usize,
+    /// 不同键个数（= 去重后的行数）
+    pub distinct_keys: usize,
+    /// 出现次数 > 1 的键个数
+    pub duplicate_keys: usize,
+    /// 重复行数 = 统计范围行数 − 不同键个数
+    pub duplicate_rows: usize,
+    /// **重复键涉及的全部行号**（升序，0 起始，含各键首次出现的那行）——「只看重复的行」用。
+    /// 注意与 [`DuplicateReport::duplicate_rows`] 的区别：这里含首次出现行，便于直接对比。
+    pub dup_rows: Vec<u32>,
+    /// 每个键首次出现的行号（升序，0 起始）——「只看唯一行」用（与去重结果一致）
+    pub unique_rows: Vec<u32>,
+}
+
+impl DuplicateReport {
+    /// 重复行占比（%）
+    pub fn duplicate_rate(&self) -> f64 {
+        if self.input_rows == 0 {
+            0.0
+        } else {
+            self.duplicate_rows as f64 * 100.0 / self.input_rows as f64
+        }
+    }
+
+    /// 一句话摘要（结果窗与日志用）
+    pub fn summary(&self) -> String {
+        format!(
+            "统计范围 {} 行 → 不同键 {} 个，其中重复键 {} 个；重复行 {} 行（占 {}%）",
+            self.input_rows,
+            self.distinct_keys,
+            self.duplicate_keys,
+            self.duplicate_rows,
+            fmt_pct(self.duplicate_rate())
+        )
+    }
+}
+
+/// 重复情况统计：找出哪些键出现多次、各重复几次、重复行占比。
+///
+/// 与 [`super::dedup::unique_rows`] 的关系：**判重口径完全一致**（同一套键构建规则、
+/// 同样保留首次出现），但这里给出的是「重复的分布」而非去重结果 ——
+/// `unique_rows` 与去重的输出逐行相同（有交叉测试守护），另附 `dup_rows` 供「只看重复的行」。
+///
+/// 单线程（与去重同理）：键表需要全局唯一、首次出现行号依赖全局顺序，并行合并虽可行但收益有限。
+/// `columns` 为空表示按全部字段判重；越界列被忽略（与去重一致）。
+pub fn duplicate_stats(
+    model: &DataModel,
+    rows: Option<&[u32]>,
+    columns: &[usize],
+    top_n: usize,
+    progress: Option<&(dyn Fn(f64) + Sync)>,
+) -> Result<DuplicateReport, String> {
+    duplicate_stats_with_max_keys(model, rows, columns, top_n, MAX_DUP_KEYS, progress)
+}
+
+/// [`duplicate_stats`] 的内部实现（`max_keys` 显式传入，便于测试用小上限驱动超限路径）
+fn duplicate_stats_with_max_keys(
+    model: &DataModel,
+    rows: Option<&[u32]>,
+    columns: &[usize],
+    top_n: usize,
+    max_keys: usize,
+    progress: Option<&(dyn Fn(f64) + Sync)>,
+) -> Result<DuplicateReport, String> {
+    let column_count = model.column_count();
+    // 空表示「全部字段」；同时丢弃越界列（与去重一致的语义）
+    let cols: Vec<usize> = if columns.is_empty() {
+        (0..column_count).collect()
+    } else {
+        let mut v: Vec<usize> = columns
+            .iter()
+            .copied()
+            .filter(|&c| c < column_count)
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        if v.is_empty() {
+            (0..column_count).collect()
+        } else {
+            v
+        }
+    };
+    if cols.is_empty() {
+        return Err("没有可用于判重的列（表头为空？）".to_string());
+    }
+    let top_n = top_n.clamp(1, MAX_DUP_TOP_N);
+
+    let total = rows.map(|v| v.len()).unwrap_or_else(|| model.row_count());
+    // 表头：判重字段各一列 + 出现次数 / 重复行数 / 占行数(%) / 首次出现行号
+    let mut headers: Vec<String> = cols.iter().map(|&c| column_name(model, c)).collect();
+    headers.push("出现次数".to_string());
+    headers.push("重复行数".to_string());
+    headers.push("占行数(%)".to_string());
+    headers.push("首次出现行号".to_string());
+
+    let mut table = StatsTable {
+        kind: StatsKind::DuplicateCheck,
+        headers,
+        rows: Vec::new(),
+        input_rows: total,
+        group_columns: cols.len(),
+        aggs: 0,
+        notes: Vec::new(),
+    };
+
+    // 键 → 出现次数 / 首次出现行号 / 后续出现行号
+    struct KeyStat {
+        count: u64,
+        first: u32,
+        rest: Vec<u32>,
+    }
+    let mut map: HashMap<String, KeyStat> = HashMap::with_capacity(1024);
+    let mut reader = RowReader::new(cols.clone());
+    let mut key = String::with_capacity(256);
+    for i in 0..total {
+        let row = match rows {
+            Some(list) => list[i] as usize,
+            None => i,
+        };
+        reader.load(model.file(), row);
+        key.clear();
+        for (k, &c) in cols.iter().enumerate() {
+            if k > 0 {
+                key.push('\u{1F}');
+            }
+            key.push_str(reader.value(c));
+        }
+        match map.get_mut(key.as_str()) {
+            Some(st) => {
+                st.count += 1;
+                st.rest.push(row as u32);
+            }
+            None => {
+                if map.len() >= max_keys {
+                    return Err(format!(
+                        "判重键的不同取值超过上限 {}（统计范围 {} 行）：请先用筛选缩小范围，\
+                         或减少判重字段，再重新执行",
+                        max_keys, total
+                    ));
+                }
+                map.insert(
+                    key.clone(),
+                    KeyStat {
+                        count: 1,
+                        first: row as u32,
+                        rest: Vec::new(),
+                    },
+                );
+            }
+        }
+        if let Some(p) = progress {
+            if i % 50_000 == 0 {
+                p(i as f64 / total.max(1) as f64);
+            }
+        }
+    }
+    if let Some(p) = progress {
+        p(1.0);
+    }
+
+    // 汇总：唯一行 = 各键首次出现；重复行 = 首次 + 后续出现
+    let mut unique_rows: Vec<u32> = Vec::with_capacity(map.len());
+    let mut dup_rows: Vec<u32> = Vec::new();
+    // 明细候选：(键, 出现次数, 首次行号)
+    let mut detail: Vec<(String, u64, u32)> = Vec::new();
+    for (k, st) in map.drain() {
+        unique_rows.push(st.first);
+        if st.count > 1 {
+            dup_rows.push(st.first);
+            dup_rows.extend_from_slice(&st.rest);
+            detail.push((k, st.count, st.first));
+        }
+    }
+    unique_rows.sort_unstable();
+    dup_rows.sort_unstable();
+
+    // 明细：重复次数降序，次数相同按键升序（稳定可复现）
+    detail.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let duplicate_keys = detail.len();
+    let shown = top_n.min(duplicate_keys);
+    let pct = |n: u64| fmt_pct(n as f64 * 100.0 / total.max(1) as f64);
+    for (k, count, first) in detail.iter().take(shown) {
+        let mut row: Vec<String> = Vec::with_capacity(cols.len() + 4);
+        for part in k.splitn(cols.len(), '\u{1F}') {
+            row.push(part.to_string());
+        }
+        while row.len() < cols.len() {
+            row.push(String::new());
+        }
+        row.push(count.to_string());
+        row.push((count - 1).to_string());
+        row.push(pct(*count));
+        row.push((*first as u64 + 1).to_string()); // 行号从 1 开始（与表格显示一致）
+        table.rows.push(row);
+    }
+    if duplicate_keys > shown {
+        let rest_keys = duplicate_keys - shown;
+        let rest_rows: u64 = detail[shown..].iter().map(|(_, c, _)| *c).sum();
+        let mut row: Vec<String> = Vec::with_capacity(cols.len() + 4);
+        row.push(format!("(其余 {} 个重复键)", rest_keys));
+        while row.len() < cols.len() {
+            row.push(String::new());
+        }
+        row.push(rest_rows.to_string());
+        row.push((rest_rows - rest_keys as u64).to_string());
+        row.push(pct(rest_rows));
+        row.push(String::new());
+        table.rows.push(row);
+    }
+    if duplicate_keys == 0 {
+        table.notes.push(
+            "统计范围内没有重复键（每个键只出现一次）：重复行 0，可切换到「只看唯一行」查看全部。"
+                .to_string(),
+        );
+    } else if duplicate_keys > shown {
+        table.notes.push(format!(
+            "共 {} 个重复键，明细已列出前 {} 个（按重复次数降序），其余 {} 个见「(其余 …)」行",
+            duplicate_keys, shown, duplicate_keys - shown
+        ));
+    }
+    table.notes.push(
+        "「重复行数」= 出现次数 − 1（即多出来的行）；「占行数(%)」= 该键行数 ÷ 统计范围行数，\
+         按 4 位有效数字显示；行号从 1 开始（与表格显示一致）。"
+            .to_string(),
+    );
+    table.notes.push(
+        "「只看重复的行」会筛出重复键涉及的全部行（含首次出现的那行），便于逐条对比。".to_string(),
+    );
+    table.notes.push(
+        "判重口径与「提取唯一行（去重）」完全一致（按原值组合，保留首次出现的行）。".to_string(),
+    );
+
+    let distinct_keys = unique_rows.len();
+    Ok(DuplicateReport {
+        table,
+        input_rows: total,
+        distinct_keys,
+        duplicate_keys,
+        // 重复行数 = 多出来的那部分（统计范围行数 − 不同键个数）；
+        // 注意与 `dup_rows` 区分：后者是「重复键涉及的全部行」（含首次出现），
+        // 用于「只看重复的行」——看的时候需要连首次出现一起看才能比对
+        duplicate_rows: total.saturating_sub(distinct_keys),
+        dup_rows,
+        unique_rows,
+    })
+}
+
+/// 「空值与数据质量统计」的指标表头（每列一行）
+const QUALITY_HEADERS: [&str; 10] = [
+    "列名",
+    "行数",
+    "空值数",
+    "纯空白数",
+    "空值率(%)",
+    "含控制字符数",
+    "最短长度",
+    "最长长度",
+    "平均长度",
+    "超长值数(>255)",
+];
+
+/// 视为「超长值」的字符数阈值（Excel 单元格/多数系统字段的经验上限）
+pub const LONG_VALUE_LEN: u32 = 255;
+
+/// 空值与数据质量统计：逐列给出
+/// 空值数、纯空白数、空值率、含控制字符数、最短/最长/平均长度、超长值数。
+///
+/// 口径（都写进 `notes`）：
+/// - **空值数** = 长度为 0 的值；**纯空白数** = `trim` 后为空但长度 > 0（全是空格/制表符等）；
+///   **空值率** = (空值数 + 纯空白数) ÷ 行数 —— 业务上"只有空白"与"空"通常等价，故合并计率；
+/// - **含控制字符数** = 值里出现 Unicode 控制字符（`char::is_control()`，含制表符 `\t`、
+///   换行、以及 `0x7F`）的行数 —— 银行 CSV 常见的尾随制表符会在这里显形；
+/// - **长度**按**字符数**统计（中文算 1 个字符，不是字节数）；最短/最长/平均只统计非空值；
+/// - **超长值数** = 字符数 > [`LONG_VALUE_LEN`] 的值的个数。
+///
+/// 一次并行扫描算完所有列（每列 O(1) 状态，无需保留原始值）。
+pub fn describe_quality(
+    model: &DataModel,
+    rows: Option<&[u32]>,
+    cols: &[usize],
+    progress: Option<&(dyn Fn(f64) + Sync)>,
+) -> Result<StatsTable, String> {
+    let column_count = model.column_count();
+    let mut list: Vec<usize> = Vec::new();
+    for &c in cols {
+        if c < column_count && !list.contains(&c) {
+            list.push(c);
+        }
+    }
+    if list.is_empty() {
+        return Err("请至少选择一个有效的列（列可能已删除或隐藏）".to_string());
+    }
+
+    let total = rows.map(|v| v.len()).unwrap_or_else(|| model.row_count());
+    let mut table = StatsTable {
+        kind: StatsKind::DataQuality,
+        headers: QUALITY_HEADERS.iter().map(|s| s.to_string()).collect(),
+        rows: Vec::new(),
+        input_rows: total,
+        group_columns: 0,
+        aggs: list.len(),
+        notes: Vec::new(),
+    };
+    if total == 0 {
+        for &c in &list {
+            let acc = QualityAcc::new();
+            table.rows.push(acc.finish(model, c, 0));
+        }
+        if let Some(p) = progress {
+            p(1.0);
+        }
+        return Ok(table);
+    }
+
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(MAX_STATS_THREADS)
+        .min(total);
+    let chunk = (total / threads).max(1);
+    let done = AtomicUsize::new(0);
+    let mut blocks: Vec<Vec<QualityAcc>> = Vec::new();
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        let mut start = 0usize;
+        while start < total {
+            let end = (start + chunk).min(total);
+            let model_ref = model;
+            let list_ref = &list;
+            let rows_ref = rows;
+            let done_ref = &done;
+            let prog = progress;
+            handles.push(s.spawn(move || {
+                let mut reader = RowReader::new(list_ref.clone());
+                let mut accs: Vec<QualityAcc> = list_ref.iter().map(|_| QualityAcc::new()).collect();
+                for i in start..end {
+                    let row = match rows_ref {
+                        Some(l) => l[i] as usize,
+                        None => i,
+                    };
+                    reader.load(model_ref.file(), row);
+                    for (acc, &c) in accs.iter_mut().zip(list_ref.iter()) {
+                        acc.push(reader.value(c));
+                    }
+                }
+                done_ref.fetch_add(end - start, AtomicOrdering::Relaxed);
+                if let Some(p) = prog {
+                    p(done_ref.load(AtomicOrdering::Relaxed) as f64 / total as f64);
+                }
+                accs
+            }));
+            start = end;
+        }
+        for h in handles {
+            blocks.push(h.join().unwrap_or_default());
+        }
+    });
+
+    let mut accs: Vec<QualityAcc> = list.iter().map(|_| QualityAcc::new()).collect();
+    for block in blocks {
+        for (a, b) in accs.iter_mut().zip(block.iter()) {
+            a.merge(b);
+        }
+    }
+    let mut bad_empty = 0usize;
+    let mut bad_control = 0usize;
+    let mut bad_long = 0usize;
+    for acc in accs.iter() {
+        if acc.empty + acc.blank > 0 {
+            bad_empty += 1;
+        }
+        if acc.control > 0 {
+            bad_control += 1;
+        }
+        if acc.long_count > 0 {
+            bad_long += 1;
+        }
+    }
+    for (acc, &c) in accs.iter_mut().zip(list.iter()) {
+        table.rows.push(acc.finish(model, c, total as u64));
+    }
+    table.notes.push(format!(
+        "共统计 {} 列：其中 {} 列存在空值或纯空白、{} 列含控制字符、{} 列有超长值（>{} 字符）",
+        list.len(),
+        bad_empty,
+        bad_control,
+        bad_long,
+        LONG_VALUE_LEN
+    ));
+    table.notes.push(
+        "空值率 = (空值数 + 纯空白数) ÷ 行数（业务上「只有空白」通常等同于空），按 4 位有效数字显示。"
+            .to_string(),
+    );
+    table.notes.push(
+        "含控制字符 = 值里出现制表符/换行/其它 Unicode 控制字符的行数；长度按字符数统计（中文算 1 个）。"
+            .to_string(),
+    );
+    if let Some(p) = progress {
+        p(1.0);
+    }
+    Ok(table)
+}
+
+/// 单列的数据质量累加器（O(1) 状态，不保留原始值）
+#[derive(Debug, Clone)]
+struct QualityAcc {
+    /// 统计范围行数
+    rows: u64,
+    /// 空值数（长度为 0）
+    empty: u64,
+    /// 纯空白数（trim 后为空但长度 > 0）
+    blank: u64,
+    /// 含控制字符的行数
+    control: u64,
+    /// 非空值个数（长度统计的分母）
+    non_empty: u64,
+    /// 最短长度（非空值；`u32::MAX` 表示尚无样本）
+    min_len: u32,
+    /// 最长长度（非空值）
+    max_len: u32,
+    /// 长度合计（非空值）
+    sum_len: u64,
+    /// 超长值个数（字符数 > [`LONG_VALUE_LEN`]）
+    long_count: u64,
+}
+
+impl QualityAcc {
+    fn new() -> Self {
+        Self {
+            rows: 0,
+            empty: 0,
+            blank: 0,
+            control: 0,
+            non_empty: 0,
+            min_len: u32::MAX,
+            max_len: 0,
+            sum_len: 0,
+            long_count: 0,
+        }
+    }
+
+    fn push(&mut self, value: &str) {
+        self.rows += 1;
+        if value.is_empty() {
+            self.empty += 1;
+            return;
+        }
+        // 一次遍历同时得到字符数与是否含控制字符
+        let mut len: u32 = 0;
+        let mut has_control = false;
+        for ch in value.chars() {
+            len += 1;
+            if !has_control && ch.is_control() {
+                has_control = true;
+            }
+        }
+        if has_control {
+            self.control += 1;
+        }
+        if value.trim().is_empty() {
+            self.blank += 1;
+        }
+        self.non_empty += 1;
+        self.min_len = self.min_len.min(len);
+        self.max_len = self.max_len.max(len);
+        self.sum_len += len as u64;
+        if len > LONG_VALUE_LEN {
+            self.long_count += 1;
+        }
+    }
+
+    fn merge(&mut self, other: &QualityAcc) {
+        self.rows += other.rows;
+        self.empty += other.empty;
+        self.blank += other.blank;
+        self.control += other.control;
+        self.non_empty += other.non_empty;
+        self.min_len = self.min_len.min(other.min_len);
+        self.max_len = self.max_len.max(other.max_len);
+        self.sum_len += other.sum_len;
+        self.long_count += other.long_count;
+    }
+
+    fn finish(&self, model: &DataModel, col: usize, rows: u64) -> Vec<String> {
+        let has_value = self.non_empty > 0;
+        let empty_rate = if rows == 0 {
+            0.0
+        } else {
+            (self.empty + self.blank) as f64 * 100.0 / rows as f64
+        };
+        vec![
+            column_name(model, col),
+            rows.to_string(),
+            self.empty.to_string(),
+            self.blank.to_string(),
+            fmt_pct(empty_rate),
+            self.control.to_string(),
+            if has_value {
+                self.min_len.to_string()
+            } else {
+                String::new()
+            },
+            if has_value {
+                self.max_len.to_string()
+            } else {
+                String::new()
+            },
+            if has_value {
+                fmt_float(self.sum_len as f64 / self.non_empty as f64)
+            } else {
+                String::new()
+            },
+            self.long_count.to_string(),
+        ]
+    }
 }
 
 /// 一个行块内、所有统计列的频次表
@@ -1673,6 +2221,264 @@ mod tests {
         assert_eq!(parse_dec(""), None);
         assert_eq!(parse_dec("."), None);
         assert_eq!(parse_dec("1.0000000001"), None); // 10 位小数 → 回退
+    }
+
+    // ===== 重复情况统计（duplicate_stats）=====
+
+    #[test]
+    fn duplicate_stats_finds_repeated_keys() {
+        // A 2 次、B 1 次、C 3 次 → 重复键 2 个（C、A），重复行 3（多出来的那 3 行）
+        let p = write_temp(
+            "卡号\nA\nA\nB\nC\nC\nC\n".as_bytes(),
+            "_dup1.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let r = duplicate_stats(&m, None, &[], 100, None).unwrap();
+        assert_eq!(r.input_rows, 6);
+        assert_eq!(r.distinct_keys, 3);
+        assert_eq!(r.duplicate_keys, 2);
+        assert_eq!(r.duplicate_rows, 3);
+        assert!((r.duplicate_rate() - 50.0).abs() < 1e-9);
+        // 明细按次数降序：C(3) 在前，A(2) 在后；首次出现行号从 1 开始
+        assert_eq!(r.table.rows[0], vec!["C", "3", "2", "50", "4"]);
+        assert_eq!(r.table.rows[1], vec!["A", "2", "1", "33.33", "1"]);
+        // 可筛选的行号：重复涉及行 = A/C 的全部行（0 起始 0,1,3,4,5）；唯一行 = 各键首次出现
+        assert_eq!(r.dup_rows, vec![0, 1, 3, 4, 5]);
+        assert_eq!(r.unique_rows, vec![0, 2, 3]);
+        assert!(r.summary().contains("重复行 3 行（占 50%）"), "{}", r.summary());
+        // （dup_rows 是「重复键涉及的全部行」：A 的 2 行 + C 的 3 行 = 5 行，含首次出现）
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn duplicate_stats_matches_dedup_engine() {
+        // 判重口径必须与「提取唯一行（去重）」逐行一致（交叉验证两套实现）
+        let p = write_temp(
+            "A,B\nx,1\ny,2\nx,1\nz,3\nx,1\ny,2\n".as_bytes(),
+            "_dup2.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let r = duplicate_stats(&m, None, &[], 100, None).unwrap();
+        let (dedup_unique, report) = crate::core::dedup::unique_rows(&m, None, &[], None);
+        assert_eq!(r.unique_rows, dedup_unique);
+        assert_eq!(r.distinct_keys, report.unique_rows);
+        assert_eq!(r.duplicate_rows, report.duplicates);
+        assert_eq!(r.input_rows, report.input_rows);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn duplicate_stats_by_selected_columns_and_row_subset() {
+        let p = write_temp(
+            "ID,城市\n1,北京\n2,北京\n3,上海\n4,上海\n".as_bytes(),
+            "_dup3.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        // 只按城市判重：北京 2 行、上海 2 行 → 2 个重复键、2 行重复
+        let r = duplicate_stats(&m, None, &[1], 100, None).unwrap();
+        assert_eq!(r.table.group_columns, 1);
+        assert_eq!(r.duplicate_keys, 2);
+        assert_eq!(r.duplicate_rows, 2);
+        assert_eq!(r.dup_rows, vec![0, 1, 2, 3]);
+        assert_eq!(r.unique_rows, vec![0, 2]);
+        // 判重字段同时作为表头第一列（列名 = 字段名）
+        assert_eq!(r.table.headers[0], "城市");
+        // 行子集：只看第 0、3 行（北京 + 上海）→ 无重复
+        let r2 = duplicate_stats(&m, Some(&[0, 3]), &[1], 100, None).unwrap();
+        assert_eq!(r2.input_rows, 2);
+        assert_eq!(r2.duplicate_keys, 0);
+        assert!(r2.dup_rows.is_empty());
+        assert!(r2.table.notes.iter().any(|n| n.contains("没有重复键")));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn duplicate_stats_top_n_truncates_with_rest_row() {
+        // 4 个键各 2 次 → Top-2 只列 2 个，其余汇总为一行
+        let p = write_temp(
+            "K\na\na\nb\nb\nc\nc\nd\nd\n".as_bytes(),
+            "_dup4.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let r = duplicate_stats(&m, None, &[], 2, None).unwrap();
+        assert_eq!(r.duplicate_keys, 4);
+        assert_eq!(r.table.rows.len(), 3); // 2 项 + 其余
+        assert_eq!(r.table.rows[0], vec!["a", "2", "1", "25", "1"]);
+        assert_eq!(r.table.rows[1], vec!["b", "2", "1", "25", "3"]);
+        assert_eq!(r.table.rows[2], vec!["(其余 2 个重复键)", "4", "2", "50", ""]);
+        assert!(r.table.notes.iter().any(|n| n.contains("共 4 个重复键")));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn duplicate_stats_chinese_quoted_and_key_ambiguity() {
+        // 中文与含逗号的引号字段；键用 \x1F 连接避免 ("ab","c") 与 ("a","bc") 混淆
+        let p = write_temp(
+            "城市,备注\n北京,\"a,b\"\n北京,\"a,b\"\nab,c\na,bc\nab,c\n".as_bytes(),
+            "_dup5.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let r = duplicate_stats(&m, None, &[], 100, None).unwrap();
+        assert_eq!(r.distinct_keys, 3, "拼接歧义会导致误判为重复");
+        assert_eq!(r.duplicate_keys, 2);
+        // 明细里能看到中文字段与含逗号的值
+        assert!(r.table.rows.iter().any(|row| row[0] == "北京" && row[1] == "a,b"));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn duplicate_stats_rejects_too_many_keys() {
+        let p = write_temp("K\n1\n2\n3\n".as_bytes(), "_dup6.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let err = duplicate_stats_with_max_keys(&m, None, &[], 100, 2, None).unwrap_err();
+        assert!(err.contains("超过上限 2"), "{err}");
+        // 上限内正常
+        let ok = duplicate_stats_with_max_keys(&m, None, &[], 100, 3, None).unwrap();
+        assert_eq!(ok.distinct_keys, 3);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn duplicate_stats_empty_range_and_kind_metadata() {
+        let p = write_temp("K\n1\n1\n".as_bytes(), "_dup7.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let r = duplicate_stats(&m, Some(&[]), &[], 100, None).unwrap();
+        assert_eq!(r.input_rows, 0);
+        assert_eq!(r.distinct_keys, 0);
+        assert_eq!(r.duplicate_keys, 0);
+        assert_eq!(r.duplicate_rate(), 0.0);
+        assert!(r.table.rows.is_empty());
+        assert_eq!(r.table.kind, StatsKind::DuplicateCheck);
+        assert_eq!(r.table.kind.file_stem(), "重复情况");
+        assert_eq!(r.table.kind.title(), "重复情况结果");
+        assert_eq!(r.table.kind.label(), "重复情况");
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ===== 空值与数据质量统计（describe_quality）=====
+
+    #[test]
+    fn quality_counts_empty_blank_and_control_chars() {
+        // 值：10 / 空 / 三个空格 / "abc\t" / abc
+        // → 空值 1、纯空白 1、含控制字符 1（尾随制表符）、最短 2、最长 4、平均 3
+        let p = write_temp("备注\n10\n\n   \nabc\t\nabc\n".as_bytes(), "_q1.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = describe_quality(&m, None, &[0], None).unwrap();
+        assert_eq!(t.kind, StatsKind::DataQuality);
+        let r = &t.rows[0];
+        assert_eq!(t.headers[4], "空值率(%)");
+        assert_eq!(r[0], "备注");
+        assert_eq!(r[1], "5", "行数");
+        assert_eq!(r[2], "1", "空值数");
+        assert_eq!(r[3], "1", "纯空白数");
+        assert_eq!(r[4], "40", "空值率 = (1+1)/5");
+        assert_eq!(r[5], "1", "含控制字符数（尾随制表符）");
+        assert_eq!(r[6], "2", "最短长度（10）");
+        assert_eq!(r[7], "4", "最长长度（abc\\t 是 4 个字符）");
+        assert_eq!(r[8], "3", "平均长度 (2+3+4+3)/4");
+        assert_eq!(r[9], "0", "无超长值");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn quality_lengths_are_char_counts() {
+        // 中文按字符数（不是字节数）；最短/最长/平均只算非空值
+        let p = write_temp("城市\n北京\n上海市\n深圳市\n".as_bytes(), "_q2.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = describe_quality(&m, None, &[0], None).unwrap();
+        let r = &t.rows[0];
+        assert_eq!(r[2], "0", "空值数");
+        assert_eq!(r[3], "0", "纯空白数");
+        assert_eq!(r[4], "0", "空值率");
+        assert_eq!(r[5], "0", "含控制字符数");
+        assert_eq!(r[6], "2", "最短长度（北京）");
+        assert_eq!(r[7], "3", "最长长度（上海市/深圳市）");
+        assert_eq!(r[8], "2.666667", "平均长度（字符数）");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn quality_flags_overlong_values() {
+        // 超长值（> 255 字符）单独计数
+        let mut data = String::from("内容\n");
+        data.push_str(&"x".repeat(300));
+        data.push('\n');
+        data.push_str(&"y".repeat(255));
+        data.push('\n');
+        data.push_str("短\n");
+        let p = write_temp(data.as_bytes(), "_q3.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = describe_quality(&m, None, &[0], None).unwrap();
+        let r = &t.rows[0];
+        assert_eq!(r[7], "300", "最长长度");
+        assert_eq!(r[9], "1", "超长值数（只有 300 字符那个 > 255）");
+        assert!(
+            t.notes.iter().any(|n| n.contains("1 列有超长值")),
+            "{:?}",
+            t.notes
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn quality_multi_column_subset_and_empty_range() {
+        let p = write_temp("A,B,C\n1,x,\n2,,\n3,,z\n".as_bytes(), "_q4.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = describe_quality(&m, None, &[0, 2], None).unwrap();
+        assert_eq!(t.aggs, 2);
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[0][0], "A");
+        assert_eq!(t.rows[0][2], "0", "A 列无空值");
+        assert_eq!(t.rows[1][0], "C");
+        assert_eq!(t.rows[1][2], "2", "C 列两个空值");
+        assert_eq!(t.rows[1][4], "66.67", "C 列空值率 2/3");
+        // 行子集：只看第 0 行（A=1，C=空）
+        let t2 = describe_quality(&m, Some(&[0]), &[0, 2], None).unwrap();
+        assert_eq!(t2.input_rows, 1);
+        assert_eq!(t2.rows[1][2], "1");
+        // 空范围：每列一行，指标为 0（长度列留空）
+        let t3 = describe_quality(&m, Some(&[]), &[0, 2], None).unwrap();
+        assert_eq!(t3.rows[0], vec!["A", "0", "0", "0", "0", "0", "", "", "", "0"]);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn quality_rejects_invalid_columns() {
+        let p = write_temp("A\n1\n".as_bytes(), "_q5.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        assert!(describe_quality(&m, None, &[], None).is_err());
+        assert!(describe_quality(&m, None, &[99], None).is_err());
+        let t = describe_quality(&m, None, &[0, 42], None).unwrap();
+        assert_eq!(t.rows.len(), 1, "越界列被忽略");
+        assert_eq!(t.kind.file_stem(), "数据质量");
+        assert_eq!(t.kind.title(), "数据质量结果");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn quality_parallel_merge_matches_expected() {
+        // 多分块（12000 行）：空值/空白/控制字符/长度的合并结果正确
+        let mut data = String::from("值\n");
+        for i in 0..12000u32 {
+            match i % 4 {
+                0 => data.push('\n'),                        // 空值
+                1 => data.push_str("  \n"),                  // 纯空白
+                2 => data.push_str("abc\t\n"),               // 含控制字符（3 字符 + 制表符）
+                _ => data.push_str("北京\n"),                // 2 字符
+            }
+        }
+        let p = write_temp(data.as_bytes(), "_q6.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = describe_quality(&m, None, &[0], None).unwrap();
+        let r = &t.rows[0];
+        assert_eq!(r[1], "12000");
+        assert_eq!(r[2], "3000", "空值数");
+        assert_eq!(r[3], "3000", "纯空白数");
+        assert_eq!(r[4], "50", "空值率");
+        assert_eq!(r[5], "3000", "含控制字符数");
+        assert_eq!(r[6], "2", "最短长度（北京）");
+        assert_eq!(r[7], "4", "最长长度（abc\\t）");
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]

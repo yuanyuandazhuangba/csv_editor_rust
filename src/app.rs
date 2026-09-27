@@ -68,8 +68,10 @@ pub struct CsvEditorApp {
     merged_temp: Option<String>,
     /// 最近一次「提取唯一行」的结果（重复行对应表 + 判重字段）
     last_dedup: Option<LastDedup>,
-    /// 最近一次「字段分组汇总」的结果表（结果窗渲染与导出共用）
+    /// 最近一次统计的结果表（结果窗渲染与导出共用）
     last_stats: Option<Arc<stats::StatsTable>>,
+    /// 最近一次「重复情况统计」可直接落回当前视图的行号（有结果窗内的「只看…」按钮用）
+    stats_filter_rows: Option<Arc<StatsFilterRows>>,
     /// 是否把操作日志追加写入 exe 同目录的「操作日志.txt」（默认关闭）
     log_to_file: bool,
     // 界面缩放（按钮大小）的唯一真值源。拖动过程中不立即应用缩放：
@@ -78,6 +80,14 @@ pub struct CsvEditorApp {
     ui_zoom: f32,
     /// 缩放控件当前是否处于拖动中（拖动期间不应用缩放，松手后一次性应用）
     zoom_dragging: bool,
+}
+
+/// 「重复情况统计」结果里可直接落回当前视图的行号集合
+pub struct StatsFilterRows {
+    /// 重复键涉及的全部行（含各键首次出现的那行）
+    pub dup: Vec<u32>,
+    /// 每个键首次出现的行（与「提取唯一行（去重）」的结果一致）
+    pub unique: Vec<u32>,
 }
 
 /// 最近一次「提取唯一行」的结果信息（供结果弹窗与「导出重复行对应表」使用）
@@ -163,6 +173,7 @@ impl CsvEditorApp {
             merged_temp: None,
             last_dedup: None,
             last_stats: None,
+            stats_filter_rows: None,
             log_to_file: cc.egui_ctx.memory(|m| {
                 m.data
                     .get_temp::<bool>(egui::Id::new("ops_log_to_file"))
@@ -271,6 +282,7 @@ impl CsvEditorApp {
                     self.filter_conditions.clear();
                     // 换了数据源：上一次的统计结果不再对应当前数据，清掉
                     self.last_stats = None;
+                    self.stats_filter_rows = None;
                     self.dialogs.stats_result_window = false;
                     self.model = Some(Arc::new(model));
                     self.log(&format!(
@@ -396,7 +408,24 @@ impl CsvEditorApp {
                         self.log(&format!("    注意：{}", note));
                     }
                     self.last_stats = Some(table);
+                    // 换了一次非重复情况统计：结果窗里的「只看重复行/唯一行」不再适用
+                    self.stats_filter_rows = None;
                     // 新结果 → 结果窗打开并（若上次被最小化）强制展开
+                    self.dialogs.stats_result_expand_pending = true;
+                    self.dialogs.stats_result_window = true;
+                }
+                BgMsg::DuplicateDone(report) => {
+                    self.busy = None;
+                    self.log(&format!("重复情况统计完成：{}", report.summary()));
+                    for note in &report.table.notes {
+                        self.log(&format!("    注意：{}", note));
+                    }
+                    // 保留行号，供结果窗里的「只看重复的行 / 只看唯一行」直接落回视图
+                    self.stats_filter_rows = Some(Arc::new(StatsFilterRows {
+                        dup: report.dup_rows.clone(),
+                        unique: report.unique_rows.clone(),
+                    }));
+                    self.last_stats = Some(Arc::new(report.table.clone()));
                     self.dialogs.stats_result_expand_pending = true;
                     self.dialogs.stats_result_window = true;
                 }
@@ -433,6 +462,7 @@ impl CsvEditorApp {
         self.filter_conditions.clear();
         self.filtered_rows = None;
         self.last_stats = None;
+        self.stats_filter_rows = None;
         self.dialogs.stats_result_window = false;
         self.log("已清空所有数据");
     }

@@ -191,6 +191,14 @@ impl CsvEditorApp {
                         self.dialogs.freq_window = true;
                         ui.close_menu();
                     }
+                    if ui.button("重复情况统计…").clicked() {
+                        self.dialogs.dup_window = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("空值与数据质量统计…").clicked() {
+                        self.dialogs.quality_window = true;
+                        ui.close_menu();
+                    }
                     // 结果窗被关掉后仍可回看上次的统计结果（无需重跑）
                     let has_stats = self.last_stats.is_some();
                     if ui
@@ -318,6 +326,24 @@ impl CsvEditorApp {
                             .clicked()
                         {
                             self.dialogs.freq_window = true;
+                        }
+                        if ui
+                            .button("🔁 重复情况…")
+                            .on_hover_text(
+                                "按指定字段（或整行）找出重复的键：各重复几次、重复行占比，并可一键「只看重复的行 / 只看唯一行」",
+                            )
+                            .clicked()
+                        {
+                            self.dialogs.dup_window = true;
+                        }
+                        if ui
+                            .button("🔬 数据质量…")
+                            .on_hover_text(
+                                "逐列体检：空值数/纯空白数/空值率、含控制字符数、最短/最长/平均长度、超长值数",
+                            )
+                            .clicked()
+                        {
+                            self.dialogs.quality_window = true;
                         }
                     });
                 });
@@ -1062,6 +1088,107 @@ impl CsvEditorApp {
             }
         }));
         self.set_busy("频次分布 / Top-N", "正在统计出现次数...", 0.0);
+    }
+
+    /// 执行「重复情况统计」（后台线程）：找重复键、各重复几次、重复行占比，
+    /// 并保留「重复涉及行 / 唯一行」的行号供结果窗一键落回当前视图。
+    pub fn run_duplicate_stats(&mut self) {
+        if self.busy.is_some() {
+            self.log("已有任务在执行，请稍候");
+            return;
+        }
+        let Some(model) = self.model.clone() else {
+            self.log("请先加载数据");
+            return;
+        };
+        // 判重字段：视图列 → 原始列（派生列不参与，与去重一致）；空 = 全部字段
+        let cols: Vec<usize> = self
+            .dialogs
+            .dup_cols
+            .iter()
+            .filter_map(|&c| self.ops.as_ref().and_then(|o| o.view_to_base(c)))
+            .collect();
+        let top_n = if self.dialogs.dup_top_n == 0 {
+            100
+        } else {
+            self.dialogs.dup_top_n.clamp(1, stats::MAX_DUP_TOP_N)
+        };
+        self.dialogs.dup_top_n = top_n;
+        let field_desc = if cols.is_empty() {
+            format!("全部 {} 个字段", model.column_count())
+        } else {
+            cols.iter()
+                .filter_map(|&c| model.header().get(c).cloned())
+                .collect::<Vec<_>>()
+                .join("、")
+        };
+        let scope = match self.visible_rows() {
+            Some(v) => format!("当前筛选结果 {} 行", v.len()),
+            None => format!("全部数据 {} 行", model.row_count()),
+        };
+        self.log(&format!(
+            "开始重复情况统计：按 [{}] 判重；明细前 {} 项；范围 {}",
+            field_desc, top_n, scope
+        ));
+        let rows = self.visible_rows().map(|v| v.to_vec());
+        let tx = self.tx.clone();
+        self.worker = Some(Worker::spawn(tx.clone(), move |ctl| {
+            let result = stats::duplicate_stats(&model, rows.as_deref(), &cols, top_n, Some(&|p| {
+                ctl.report_progress(p as f32, "正在判重...")
+            }));
+            match result {
+                Ok(report) => {
+                    let _ = tx.send(BgMsg::DuplicateDone(std::sync::Arc::new(report)));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::Error(format!("重复情况统计失败：{}", e)));
+                }
+            }
+        }));
+        self.set_busy("重复情况统计", "正在判重...", 0.0);
+    }
+
+    /// 执行「空值与数据质量统计」（后台线程）：逐列给出空值/纯空白/控制字符/长度等指标。
+    pub fn run_quality_stats(&mut self) {
+        if self.busy.is_some() {
+            self.log("已有任务在执行，请稍候");
+            return;
+        }
+        let Some(model) = self.model.clone() else {
+            self.log("请先加载数据");
+            return;
+        };
+        let cols: Vec<usize> = self
+            .dialogs
+            .quality_cols
+            .iter()
+            .filter_map(|&c| self.ops.as_ref().and_then(|o| o.view_to_base(c)))
+            .collect();
+        if cols.is_empty() {
+            self.log("请至少选择一个要检查的列（派生列不能统计）");
+            return;
+        }
+        let scope = match self.visible_rows() {
+            Some(v) => format!("当前筛选结果 {} 行", v.len()),
+            None => format!("全部数据 {} 行", model.row_count()),
+        };
+        self.log(&format!("开始数据质量统计：{} 列；范围 {}", cols.len(), scope));
+        let rows = self.visible_rows().map(|v| v.to_vec());
+        let tx = self.tx.clone();
+        self.worker = Some(Worker::spawn(tx.clone(), move |ctl| {
+            let result = stats::describe_quality(&model, rows.as_deref(), &cols, Some(&|p| {
+                ctl.report_progress(p as f32, "正在检查各列...")
+            }));
+            match result {
+                Ok(table) => {
+                    let _ = tx.send(BgMsg::StatsDone(std::sync::Arc::new(table)));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::Error(format!("数据质量统计失败：{}", e)));
+                }
+            }
+        }));
+        self.set_busy("空值与数据质量统计", "正在检查各列...", 0.0);
     }
 
     /// 刷新预览视图：滚动回首行（表格内容本身每帧重渲染）
