@@ -276,20 +276,27 @@ fn main() {
         let t = Instant::now();
         match stats::value_frequency(&m, filtered.as_deref(), &cols, 20, None) {
             Ok(tb) => {
-                // 内置一致性核对：每列各行的「出现次数」之和 == 统计范围行数
-                // （同一列的项在结果表中连续排列，因此按列名变化分段累加即可）
+                // 内置一致性核对（每列分别校验）：
+                //   1) 各取值行（含「(其余 M 个取值)」）的出现次数之和 == 统计范围行数
+                //   2) 末行「(合计)」的出现次数 == 统计范围行数（占比 100%）
+                // 同一列的项在结果表中连续排列，因此按列名变化分段累加即可。
                 let mut sums: Vec<u64> = Vec::new();
+                let mut totals: Vec<u64> = Vec::new();
                 let mut cur: Option<String> = None;
                 for r in &tb.rows {
                     if cur.as_deref() != Some(r[0].as_str()) {
                         cur = Some(r[0].clone());
                         sums.push(0);
                     }
-                    if let Ok(n) = r[3].parse::<u64>() {
+                    let n = r[3].parse::<u64>().unwrap_or(0);
+                    if r[2] == "(合计)" {
+                        totals.push(n);
+                    } else {
                         *sums.last_mut().unwrap() += n;
                     }
                 }
-                let rows_ok = sums.iter().all(|s| *s as usize == tb.input_rows);
+                let rows_ok = sums.iter().all(|s| *s as usize == tb.input_rows)
+                    && totals.iter().all(|s| *s as usize == tb.input_rows);
                 println!(
                     "OK  频次分布 {}: 统计范围 {} 行 × {} 列，共 {} 项，计数核对 {} ({:.2}s)",
                     if filtered.is_some() { "(当前筛选结果)" } else { "(全量)" },

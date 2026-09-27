@@ -771,7 +771,7 @@ fn value_frequency_with_cap(
         items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let distinct = items.len();
         let shown = top_n.min(distinct);
-        let pct = |n: u64| format!("{:.2}", n as f64 * 100.0 / total as f64);
+        let pct = |n: u64| fmt_pct(n as f64 * 100.0 / total as f64);
         for (rank, (value, count)) in items.iter().take(shown).enumerate() {
             table.rows.push(vec![
                 name.clone(),
@@ -791,6 +791,16 @@ fn value_frequency_with_cap(
                 pct(rest_count),
             ]);
         }
+        // 合计行：让「总量对得上」一眼可见（出现次数 == 统计范围行数、占比 100%），
+        // 也顺带核对上面各行没有漏算
+        let total_count: u64 = items.iter().map(|(_, c)| *c).sum();
+        table.rows.push(vec![
+            name.clone(),
+            String::new(),
+            "(合计)".to_string(),
+            total_count.to_string(),
+            pct(total_count),
+        ]);
         if empties[i] > 0 {
             table.notes.push(format!(
                 "{}：{} 行为空值（已作为「(空)」参与频次与占比）",
@@ -799,7 +809,7 @@ fn value_frequency_with_cap(
         }
         table.notes.push(if distinct > shown {
             format!(
-                "{}：共 {} 个不同取值，已列出前 {} 项，其余 {} 个汇总为「(其余 …)」一行",
+                "{}：共 {} 个不同取值，已列出前 {} 项，其余 {} 个未逐项列出（汇总为一行）",
                 name,
                 distinct,
                 shown,
@@ -809,9 +819,15 @@ fn value_frequency_with_cap(
             format!("{}：共 {} 个不同取值（已全部列出）", name, distinct)
         });
     }
-    table
-        .notes
-        .push("占比分母是统计范围行数（含空值行）；按原值统计（区分大小写与首尾空格，与去重一致）。".to_string());
+    table.notes.push(
+        "占比 = 出现次数 ÷ 统计范围行数（含空值行），按 4 位有效数字显示（去掉尾随零）；\
+         每列末行的「(合计)」出现次数应等于统计范围行数、占比 100%，可据此核对总量。"
+            .to_string(),
+    );
+    table.notes.push(
+        "按原值统计（区分大小写与首尾空格，与去重一致）；逐行占比因舍入相加可能与 100% 略有出入。"
+            .to_string(),
+    );
     if let Some(p) = progress {
         p(1.0);
     }
@@ -1354,6 +1370,31 @@ fn pow10_f64(n: u32) -> f64 {
     10f64.powi(n as i32)
 }
 
+/// 占比输出：保留 **4 位有效数字**并去掉尾随零（如 `12.35` / `0.0475` / `0.00475`）。
+///
+/// 固定 2 位小数会把低频取值全部显示成 `0.00`（例如 115 万行里出现 55 次的取值，
+/// 真实占比 0.00475%），相邻名次看不出差别；按有效数字输出既能看清量级又能区分。
+fn fmt_pct(v: f64) -> String {
+    if !v.is_finite() {
+        return v.to_string();
+    }
+    if v == 0.0 {
+        return "0".to_string();
+    }
+    let exp = v.abs().log10().floor() as i32; // v ≥ 1 时为非负
+    let decimals = (3 - exp).clamp(0, 12) as usize; // 4 位有效数字
+    let mut s = format!("{:.*}", decimals, v);
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+    s
+}
+
 /// 解析十进制字面量（可选正负号 + 数字 + 最多一个小数点），
 /// 返回 `(按小数位数放大后的整数, 小数位数)`。
 ///
@@ -1632,6 +1673,21 @@ mod tests {
         assert_eq!(parse_dec(""), None);
         assert_eq!(parse_dec("."), None);
         assert_eq!(parse_dec("1.0000000001"), None); // 10 位小数 → 回退
+    }
+
+    #[test]
+    fn fmt_pct_keeps_four_significant_digits() {
+        // 固定 2 位小数会把低频占比全压成 0.00（用户实测反馈）：改按 4 位有效数字输出
+        assert_eq!(fmt_pct(100.0), "100");
+        assert_eq!(fmt_pct(50.0), "50");
+        assert_eq!(fmt_pct(33.333333), "33.33");
+        assert_eq!(fmt_pct(37.5), "37.5");
+        assert_eq!(fmt_pct(0.0475), "0.0475");
+        assert_eq!(fmt_pct(55.0 * 100.0 / 1158418.0), "0.004748");
+        assert_eq!(fmt_pct(95.0 * 100.0 / 1158418.0), "0.008201");
+        assert_eq!(fmt_pct(0.0), "0");
+        // 极小占比仍能看出量级（不会退化成 0）
+        assert_eq!(fmt_pct(1.0 * 100.0 / 1e9), "0.0000001");
     }
 
     #[test]
@@ -2102,10 +2158,12 @@ mod tests {
         assert_eq!(t.kind, StatsKind::ValueFrequency);
         assert_eq!(t.headers, vec!["列名", "排名", "取值", "出现次数", "占比(%)"]);
         assert_eq!(t.input_rows, 6);
-        assert_eq!(t.rows[0], vec!["城市", "1", "c", "3", "50.00"]);
+        assert_eq!(t.rows[0], vec!["城市", "1", "c", "3", "50"]);
         assert_eq!(t.rows[1], vec!["城市", "2", "a", "2", "33.33"]);
         assert_eq!(t.rows[2], vec!["城市", "3", "b", "1", "16.67"]);
-        assert_eq!(t.rows.len(), 3);
+        // 末行为合计：次数 == 统计范围行数、占比 100%
+        assert_eq!(t.rows[3], vec!["城市", "", "(合计)", "6", "100"]);
+        assert_eq!(t.rows.len(), 4);
         std::fs::remove_file(&p).ok();
     }
 
@@ -2118,15 +2176,18 @@ mod tests {
         );
         let m = DataModel::open(&p, 100).unwrap();
         let t = freq(&m, &[0], 2);
-        assert_eq!(t.rows.len(), 3); // 2 名 + 其余
-        assert_eq!(t.rows[0], vec!["卡号", "1", "A", "3", "37.50"]);
+        assert_eq!(t.rows.len(), 4); // 2 名 + 其余 + 合计
+        assert_eq!(t.rows[0], vec!["卡号", "1", "A", "3", "37.5"]);
         // B 与 D 都是 2 次 → 按取值升序，B 在前
-        assert_eq!(t.rows[1], vec!["卡号", "2", "B", "2", "25.00"]);
-        assert_eq!(t.rows[2], vec!["卡号", "", "(其余 2 个取值)", "3", "37.50"]);
-        // 各「出现次数」之和 == 统计范围行数（占比之和 100%）
+        assert_eq!(t.rows[1], vec!["卡号", "2", "B", "2", "25"]);
+        assert_eq!(t.rows[2], vec!["卡号", "", "(其余 2 个取值)", "3", "37.5"]);
+        // 合计行：出现次数 == 统计范围行数（占比 100%）
+        assert_eq!(t.rows[3], vec!["卡号", "", "(合计)", "8", "100"]);
+        // 去掉合计行后，各「出现次数」之和同样是统计范围行数
         let sum: u64 = t
             .rows
             .iter()
+            .filter(|r| r[2] != "(合计)")
             .map(|r| r[3].parse::<u64>().unwrap())
             .sum();
         assert_eq!(sum, 8);
@@ -2143,8 +2204,9 @@ mod tests {
         let m = DataModel::open(&p, 100).unwrap();
         let t = freq(&m, &[0], 10);
         assert_eq!(t.input_rows, 5);
-        assert_eq!(t.rows[0], vec!["备注", "1", "(空)", "3", "60.00"]);
-        assert_eq!(t.rows[1], vec!["备注", "2", "x", "2", "40.00"]);
+        assert_eq!(t.rows[0], vec!["备注", "1", "(空)", "3", "60"]);
+        assert_eq!(t.rows[1], vec!["备注", "2", "x", "2", "40"]);
+        assert_eq!(t.rows[2], vec!["备注", "", "(合计)", "5", "100"]);
         assert!(t.notes.iter().any(|n| n.contains("3 行为空值")), "{:?}", t.notes);
         std::fs::remove_file(&p).ok();
     }
@@ -2161,16 +2223,18 @@ mod tests {
         assert_eq!(t.aggs, 2);
         assert_eq!(t.row_unit(), "项");
         // 城市：北京 2/4 = 50%；渠道：网银 2 次居首，其余各 1 次按取值升序（手机 < 柜面）
-        assert_eq!(t.rows[0], vec!["城市", "1", "北京", "2", "50.00"]);
-        assert_eq!(t.rows[1], vec!["城市", "2", "上海", "1", "25.00"]);
-        assert_eq!(t.rows[2], vec!["城市", "3", "深圳", "1", "25.00"]);
-        assert_eq!(t.rows[3], vec!["渠道", "1", "网银", "2", "50.00"]);
-        assert_eq!(t.rows[4], vec!["渠道", "2", "手机", "1", "25.00"]);
-        assert_eq!(t.rows[5], vec!["渠道", "3", "柜面", "1", "25.00"]);
+        assert_eq!(t.rows[0], vec!["城市", "1", "北京", "2", "50"]);
+        assert_eq!(t.rows[1], vec!["城市", "2", "上海", "1", "25"]);
+        assert_eq!(t.rows[2], vec!["城市", "3", "深圳", "1", "25"]);
+        assert_eq!(t.rows[3], vec!["城市", "", "(合计)", "4", "100"]);
+        assert_eq!(t.rows[4], vec!["渠道", "1", "网银", "2", "50"]);
+        assert_eq!(t.rows[5], vec!["渠道", "2", "手机", "1", "25"]);
+        assert_eq!(t.rows[6], vec!["渠道", "3", "柜面", "1", "25"]);
+        assert_eq!(t.rows[7], vec!["渠道", "", "(合计)", "4", "100"]);
         // 行子集：只看第 0、2 行（都是北京）
         let t2 = value_frequency(&m, Some(&[0, 2]), &[0], 10, None).unwrap();
         assert_eq!(t2.input_rows, 2);
-        assert_eq!(t2.rows[0], vec!["城市", "1", "北京", "2", "100.00"]);
+        assert_eq!(t2.rows[0], vec!["城市", "1", "北京", "2", "100"]);
         std::fs::remove_file(&p).ok();
     }
 
@@ -2190,6 +2254,7 @@ mod tests {
         assert_eq!(t.rows[1][3], "1");
         let t2 = freq(&m, &[0], 10);
         assert_eq!(t2.rows[0], vec!["备注", "1", "a,b", "2", "66.67"]);
+        assert_eq!(t2.rows.last().unwrap(), &vec!["备注", "", "(合计)", "3", "100"]);
         std::fs::remove_file(&p).ok();
     }
 
@@ -2203,12 +2268,13 @@ mod tests {
         let p = write_temp(data.as_bytes(), "_fq6.csv");
         let m = DataModel::open(&p, 100).unwrap();
         let t = freq(&m, &[0], 10);
-        assert_eq!(t.rows.len(), 7);
-        for (i, r) in t.rows.iter().enumerate() {
+        assert_eq!(t.rows.len(), 8); // 7 个取值 + 合计
+        for (i, r) in t.rows.iter().take(7).enumerate() {
             assert_eq!(r[2], format!("g{}", i), "并列时按取值升序");
             let expect = (0..12000).filter(|x| x % 7 == i as u32).count();
             assert_eq!(r[3], expect.to_string());
         }
+        assert_eq!(t.rows[7], vec!["组", "", "(合计)", "12000", "100"]);
         std::fs::remove_file(&p).ok();
     }
 
@@ -2237,7 +2303,7 @@ mod tests {
         assert!(err.contains("超过上限 2"), "{err}");
         // 上限内正常返回
         let ok = value_frequency_with_cap(&m, None, &[0], 10, 3, None).unwrap();
-        assert_eq!(ok.rows.len(), 3);
+        assert_eq!(ok.rows.len(), 4); // 3 个取值 + 合计行
 
         // 块级：超过 cap 时只保留 cap 个不同取值（内存有界），已有取值继续计数
         let mut block = FreqBlock::new(1);
@@ -2260,9 +2326,11 @@ mod tests {
         let p = write_temp("城市\n北京\n上海\n".as_bytes(), "_fq9.csv");
         let m = DataModel::open(&p, 100).unwrap();
         let t = freq(&m, &[0], 20);
-        assert_eq!(t.summary(), "统计范围 2 行 → 1 列的取值频次（共 2 项）");
+        // 2 个取值 + 合计行 = 3 项
+        assert_eq!(t.summary(), "统计范围 2 行 → 1 列的取值频次（共 3 项）");
         assert!(t.notes.iter().any(|n| n.contains("2 个不同取值")));
-        assert!(t.notes.iter().any(|n| n.contains("占比分母")));
+        assert!(t.notes.iter().any(|n| n.contains("4 位有效数字")));
+        assert!(t.notes.iter().any(|n| n.contains("核对总量")));
         assert_eq!(t.kind.file_stem(), "频次分布");
         assert_eq!(t.kind.title(), "频次分布结果");
         std::fs::remove_file(&p).ok();

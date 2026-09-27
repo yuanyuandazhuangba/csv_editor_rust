@@ -290,6 +290,8 @@
     <h3>3.12 取值频次分布 / Top-N（stats.rs::value_frequency）</h3>
     <ul>
       <li><b>指标</b>：选定列各取值的 出现次数 与 占比(%)，按次数降序取前 N（默认 20，界面可调到 1000，引擎侧再兜底 <code>MAX_FREQ_TOP_N</code>）；结果表列固定为 列名 / 排名 / 取值 / 出现次数 / 占比(%)，多列时按列分段，一次扫描算完所有列。</li>
+      <li><b>占比按 4 位有效数字输出（去掉尾随零）</b>：<code>fmt_pct</code> 按 <code>floor(log10)</code> 推算所需小数位（<code>decimals = 3 − exp</code>，上限 12），得到 <code>50</code> / <code>33.33</code> / <code>0.0475</code> / <code>0.004748</code> 这类结果。<b>踩过的坑（用户实测反馈）</b>：最初用固定 2 位小数（<code>{:.2}</code>），115 万行的频次表里"出现 95 次"与"出现 55 次"分别显示为 <code>0.01</code> / <code>0.00</code>，相邻名次完全无法区分 —— 低频占比必须按有效数字显示（回归测试 <code>fmt_pct_keeps_four_significant_digits</code>，含 55/1158418 → <code>0.004748</code> 的真实用例）。</li>
+      <li><b>每列末行是「(合计)」</b>：出现次数 = 该列各取值计数之和（等于统计范围行数）、占比 100%，用于直观核对"总量对得上"；<code>e2e</code> 同时校验「各取值行的次数之和 == 统计范围行数」与「合计行 == 统计范围行数」。逐行占比因舍入相加可能略偏离 100%，合计行给的是精确值，notes 中也写明了这一点。</li>
       <li><b>排序规则</b>：次数降序，次数相同按取值升序 —— 结果稳定、可复现（<code>frequency_ranks_by_count_desc_then_value</code> 守护）。</li>
       <li><b>空值也是一类</b>：<code>trim</code> 后为空的行计入 <code>(空)</code>，参与排名与占比（数据质量信息不该被丢掉）；占比分母是<b>统计范围行数</b>（含空值行），因此各列各行的占比之和恒为 100%。</li>
       <li><b>「(其余 M 个取值)」行</b>：超出 Top-N 的取值不逐个列出，而是汇总成一行（次数与占比合计），这样结果表既短又不丢总量 —— 拿着结果做"各类占比"的核对也不会漏项（<code>frequency_top_n_truncates_with_rest_row</code> 里断言「次数合计 == 统计范围行数」）。</li>
@@ -389,7 +391,7 @@ cargo +nightly-2025-06-23-x86_64-pc-windows-gnu build --release \
     <h2>六、构建与测试</h2>
     <h3>6.1 开发 / 测试（stable）</h3>
     <pre><code>set PATH=D:\project_xiangmu\.rust-toolchain\rust-1.88.0-x86_64-pc-windows-gnu\rustc\bin;D:\project_xiangmu\.rust-toolchain\rust-1.88.0-x86_64-pc-windows-gnu\cargo\bin;%PATH%
-cargo test          # 159 项单元测试（153 lib + 6 bin）
+cargo test          # 160 项单元测试（154 lib + 6 bin）
 cargo run --bin csv_editor_rust</code></pre>
     <h3>6.2 Win7 单文件发布</h3>
     <p>运行项目根目录的 <code>build_win7.bat</code>（或手动执行上文 5.1 命令）。</p>
@@ -397,7 +399,7 @@ cargo run --bin csv_editor_rust</code></pre>
     <h3>6.3 测试与验证工具</h3>
     <table>
       <tr><th style="width:150px;">工具</th><th>用途</th></tr>
-      <tr><td><code>cargo test</code></td><td>150 项单元测试（144 lib + 6 bin），覆盖编码检测、行索引边界、字段切分、筛选语义、列操作、导出、多文件合并、去重、分组汇总（定点十进制求和精度、f64 累加误差对照、跨行块小数位对齐与合并、均值分母口径、NaN/inf 判定、越界列容错、分组数上限、去重计数上限）、数值列统计（中位数/标准差/极值/空值与非数值计数、跨块 Welford 合并、中位数上限、多列单遍扫描、行子集与空范围）、频次分布（排序与并列、Top-N 截断与「其余」行、空值归类、多列与行子集、原值/空格区分、跨块合并、上限拒绝）、筛选与拆分并行化、IME 事件修补、结果窗最小化的窗口 Id 约定等。</td></tr>
+      <tr><td><code>cargo test</code></td><td>160 项单元测试（154 lib + 6 bin），覆盖编码检测、行索引边界、字段切分、筛选语义、列操作、导出、多文件合并、去重、分组汇总（定点十进制求和精度、f64 累加误差对照、跨行块小数位对齐与合并、均值分母口径、NaN/inf 判定、越界列容错、分组数上限、去重计数上限）、数值列统计（中位数/标准差/极值/空值与非数值计数、跨块 Welford 合并、中位数上限、多列单遍扫描、行子集与空范围）、频次分布（排序与并列、Top-N 截断与「其余」行、合计行与 4 位有效数字占比格式、空值归类、多列与行子集、原值/空格区分、跨块合并、上限拒绝）、筛选与拆分并行化、IME 事件修补、结果窗最小化的窗口 Id 约定等。</td></tr>
       <tr><td><code>bin/inspect</code></td><td>打开报告：行数/列数/编码/耗时/峰值内存/采样预览。</td></tr>
       <tr><td><code>bin/verify</code></td><td>与 <code>testdata/verify_ref.py</code> 输出同结构 JSON（筛选行号 + 行哈希），验证 Rust 与 Python 语义一致。</td></tr>
       <tr><td><code>bin/filter_bench</code></td><td>筛选性能基准：不同条件类型/数量的耗时、CPU 时间与并行度（用 <code>--release</code> 运行）。</td></tr>
