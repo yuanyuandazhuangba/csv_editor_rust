@@ -146,8 +146,8 @@ impl PreviewTable {
     }
 }
 
-/// 截断超长单元格文本
-fn truncate_cell(s: &str, max_chars: usize) -> String {
+/// 截断超长单元格文本（预览表格与统计结果表共用）
+pub(super) fn truncate_cell(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         return s.to_string();
     }

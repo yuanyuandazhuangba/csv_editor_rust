@@ -11,3 +11,4 @@ pub mod merge;
 pub mod model;
 pub mod reader;
 pub mod split;
+pub mod stats;

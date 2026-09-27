@@ -8,6 +8,7 @@ use csv_editor_rust::core::export;
 use csv_editor_rust::core::filter::{apply_filter, FilterCondition, FilterOp, Logic};
 use csv_editor_rust::core::model::DataModel;
 use csv_editor_rust::core::split::{self, OutputFormat, SplitOptions};
+use csv_editor_rust::core::stats::{self, AggKind, AggSpec};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -125,9 +126,79 @@ fn main() {
         }
     }
 
-    if fails == 0 {
-        println!("=== 端到端回归: 全部通过 ===");
+    // 6. 统计分析：字段分组汇总（按银行名称分组，对交易金额求和/均值/最大/最小）
+    let group_col = col_of("数据来源_银行名称").or_else(|| col_of("银行"));
+    let value_col = col_of("交易金额").or_else(|| col_of("ID"));
+    if let (Some(c_g), Some(c_v)) = (group_col, value_col) {
+        let aggs = [
+            AggSpec {
+                column: c_v,
+                kind: AggKind::Sum,
+            },
+            AggSpec {
+                column: c_v,
+                kind: AggKind::Avg,
+            },
+            AggSpec {
+                column: c_v,
+                kind: AggKind::Max,
+            },
+            AggSpec {
+                column: c_v,
+                kind: AggKind::Min,
+            },
+        ];
+        let t = Instant::now();
+        match stats::group_by(&m, filtered.as_deref(), &[c_g], &aggs, None) {
+            Ok(tb) => {
+                // 内置一致性核对：各组「行数」之和应等于统计范围行数
+                let sum_rows: u64 = tb
+                    .rows
+                    .iter()
+                    .filter_map(|r| r.get(tb.group_columns).and_then(|v| v.parse::<u64>().ok()))
+                    .sum();
+                let rows_ok = sum_rows as usize == tb.input_rows;
+                println!(
+                    "OK  分组汇总 {}: {} 行 → {} 组（分组字段「{}」），行数核对 {} ({:.2}s)",
+                    if filtered.is_some() { "(当前筛选结果)" } else { "(全量)" },
+                    tb.input_rows,
+                    tb.group_count(),
+                    header.get(c_g).cloned().unwrap_or_default(),
+                    if rows_ok { "通过" } else { "未通过" },
+                    t.elapsed().as_secs_f64()
+                );
+                if !rows_ok {
+                    fails += 1;
+                }
+                // 统计结果导出：CSV 与 XLSX
+                let sc = format!("{}\\e2e_stats.csv", out_dir);
+                match export::export_rows_csv(&sc, &tb.headers, tb.rows.iter().cloned()) {
+                    Ok(n) => println!("OK  导出统计结果 CSV: {} 组 -> {}", n, sc),
+                    Err(e) => {
+                        println!("FAIL 导出统计结果 CSV: {}", e);
+                        fails += 1;
+                    }
+                }
+                let sx = format!("{}\\e2e_stats.xlsx", out_dir);
+                match export::export_rows_xlsx(&sx, &tb.headers, tb.rows.iter().cloned()) {
+                    Ok(n) => println!("OK  导出统计结果 XLSX: {} 组 -> {}", n, sx),
+                    Err(e) => {
+                        println!("FAIL 导出统计结果 XLSX: {}", e);
+                        fails += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                println!("FAIL 分组汇总: {}", e);
+                fails += 1;
+            }
+        }
     } else {
+        println!("WARN 无可用于分组汇总的列，跳过统计");
+    }
+
+    if fails == 0 {
+        println!("=== 端到端回归: 全部通过 ===");    } else {
         println!("=== 端到端回归: {} 项失败 ===", fails);
         std::process::exit(1);
     }

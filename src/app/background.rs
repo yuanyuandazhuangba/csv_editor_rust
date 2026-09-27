@@ -5,8 +5,9 @@ use std::thread::JoinHandle;
 
 use csv_editor_rust::core::dedup::DedupReport;
 use csv_editor_rust::core::merge::{FileHeader, HeaderCheck, MergeReport};
-use csv_editor_rust::core::split::SplitReport;
 use csv_editor_rust::core::model::DataModel;
+use csv_editor_rust::core::split::SplitReport;
+use csv_editor_rust::core::stats::StatsTable;
 
 /// 后台 → UI 消息
 pub enum BgMsg {
@@ -26,6 +27,8 @@ pub enum BgMsg {
     Merged(MergeReport),
     /// 提取唯一行完成（唯一行号, 统计, 重复行对应关系, 判重字段原始列索引）
     DedupDone(Vec<u32>, DedupReport, Vec<(u32, u32)>, Vec<usize>),
+    /// 字段分组汇总完成（结果表；用 Arc 便于结果窗每帧零成本共享）
+    StatsDone(std::sync::Arc<StatsTable>),
     /// 错误
     Error(String),
 }

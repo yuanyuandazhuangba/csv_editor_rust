@@ -4,6 +4,7 @@ use eframe::egui;
 
 use csv_editor_rust::core::dedup;
 use csv_editor_rust::core::merge::{self, HeaderCheck, MergeMode};
+use csv_editor_rust::core::stats::{self, AggSpec};
 
 use super::background::{BgMsg, Worker};
 use super::{CsvEditorApp, DialogPosition};
@@ -178,6 +179,24 @@ impl CsvEditorApp {
                         self.dialogs.dedup_window = true;
                         ui.close_menu();
                     }
+                    if ui.button("字段分组汇总…").clicked() {
+                        self.dialogs.stats_window = true;
+                        ui.close_menu();
+                    }
+                    // 结果窗被关掉后仍可回看上次的汇总结果（无需重跑）
+                    let has_stats = self.last_stats.is_some();
+                    if ui
+                        .add_enabled(
+                            has_stats,
+                            egui::Button::new("查看上次汇总结果…"),
+                        )
+                        .on_hover_text("重新打开上一次「字段分组汇总」的结果窗（若被最小化则同时展开）")
+                        .clicked()
+                    {
+                        self.dialogs.stats_result_expand_pending = true;
+                        self.dialogs.stats_result_window = true;
+                        ui.close_menu();
+                    }
                 });
                 ui.menu_button("设置", |ui| {
                     ui.menu_button("弹出窗口位置", |ui| {
@@ -244,7 +263,7 @@ impl CsvEditorApp {
         });
     }
 
-    /// 「数据分析」工具栏：目前提供「提取唯一行（去重）」；
+    /// 「数据分析」工具栏：目前提供「提取唯一行（去重）」与「字段分组汇总」；
     /// 由「工具 → 数据分析工具栏」控制显示/隐藏（默认显示）。
     pub fn analysis_toolbar_panel(&mut self, ctx: &egui::Context) {
         if !self.show_analysis_toolbar {
@@ -264,6 +283,15 @@ impl CsvEditorApp {
                             .clicked()
                         {
                             self.dialogs.dedup_window = true;
+                        }
+                        if ui
+                            .button("📊 分组汇总…")
+                            .on_hover_text(
+                                "按 1~3 个字段分组，对数值列做行数/求和/均值/最大/最小/去重计数等汇总，结果可查看并导出 CSV/XLSX",
+                            )
+                            .clicked()
+                        {
+                            self.dialogs.stats_window = true;
                         }
                     });
                 });
@@ -809,6 +837,89 @@ impl CsvEditorApp {
             let _ = tx.send(BgMsg::DedupDone(unique, report, map, cols));
         }));
         self.set_busy("提取唯一行（去重）", "正在判重...", 0.0);
+    }
+
+    /// 执行「字段分组汇总」（后台线程）。
+    /// 作用范围是当前筛选结果（未筛选则为全部数据）；结果为一张汇总表，
+    /// 在结果窗中查看并可导出 CSV / XLSX（**不**改变当前数据视图）。
+    pub fn run_stats(&mut self) {
+        if self.busy.is_some() {
+            self.log("已有任务在执行，请稍候");
+            return;
+        }
+        let Some(model) = self.model.clone() else {
+            self.log("请先加载数据");
+            return;
+        };
+        // 视图列 → 原始列（派生列不参与统计：其值不是文件里的原始数据）
+        let to_base = |c: usize| self.ops.as_ref().and_then(|o| o.view_to_base(c));
+        let gcols: Vec<usize> = self
+            .dialogs
+            .stats_group_cols
+            .iter()
+            .filter_map(|&c| to_base(c))
+            .collect();
+        let aggs: Vec<AggSpec> = self
+            .dialogs
+            .stats_aggs
+            .iter()
+            .filter_map(|&(c, kind)| to_base(c).map(|b| AggSpec { column: b, kind }))
+            .collect();
+        if gcols.is_empty() {
+            self.log("请至少选择一个分组字段（派生列不能作为分组字段）");
+            return;
+        }
+        if aggs.is_empty() {
+            self.log("请至少为一个列添加聚合方式（求和/均值/最大/最小/计数/去重计数/空值数）");
+            return;
+        }
+        // 日志先记录本次统计的参数（分组字段、聚合方式、范围），便于事后审计
+        let names = |cols: &[usize]| -> String {
+            cols.iter()
+                .filter_map(|&c| model.header().get(c).cloned())
+                .collect::<Vec<_>>()
+                .join("、")
+        };
+        let agg_desc = self
+            .dialogs
+            .stats_aggs
+            .iter()
+            .filter_map(|&(c, k)| to_base(c).map(|b| (b, k)))
+            .map(|(b, k)| {
+                format!(
+                    "{}({})",
+                    model.header().get(b).cloned().unwrap_or_default(),
+                    k.label()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("、");
+        let scope = match self.visible_rows() {
+            Some(v) => format!("当前筛选结果 {} 行", v.len()),
+            None => format!("全部数据 {} 行", model.row_count()),
+        };
+        self.log(&format!(
+            "开始分组汇总：按 [{}] 分组；聚合 [{}]；范围 {}",
+            names(&gcols),
+            agg_desc,
+            scope
+        ));
+        let rows = self.visible_rows().map(|v| v.to_vec());
+        let tx = self.tx.clone();
+        self.worker = Some(Worker::spawn(tx.clone(), move |ctl| {
+            let result = stats::group_by(&model, rows.as_deref(), &gcols, &aggs, Some(&|p| {
+                ctl.report_progress(p as f32, "正在分组汇总...")
+            }));
+            match result {
+                Ok(table) => {
+                    let _ = tx.send(BgMsg::StatsDone(std::sync::Arc::new(table)));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::Error(format!("分组汇总失败：{}", e)));
+                }
+            }
+        }));
+        self.set_busy("字段分组汇总", "正在分组统计...", 0.0);
     }
 
     /// 刷新预览视图：滚动回首行（表格内容本身每帧重渲染）

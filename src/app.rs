@@ -18,6 +18,7 @@ use csv_editor_rust::core::column_ops::ColumnOps;
 
 use csv_editor_rust::core::filter::{apply_filter, FilterCondition};
 use csv_editor_rust::core::model::DataModel;
+use csv_editor_rust::core::stats;
 
 
 pub mod background;
@@ -67,6 +68,8 @@ pub struct CsvEditorApp {
     merged_temp: Option<String>,
     /// 最近一次「提取唯一行」的结果（重复行对应表 + 判重字段）
     last_dedup: Option<LastDedup>,
+    /// 最近一次「字段分组汇总」的结果表（结果窗渲染与导出共用）
+    last_stats: Option<Arc<stats::StatsTable>>,
     /// 是否把操作日志追加写入 exe 同目录的「操作日志.txt」（默认关闭）
     log_to_file: bool,
     // 界面缩放（按钮大小）的唯一真值源。拖动过程中不立即应用缩放：
@@ -159,6 +162,7 @@ impl CsvEditorApp {
             qr_texture: None,
             merged_temp: None,
             last_dedup: None,
+            last_stats: None,
             log_to_file: cc.egui_ctx.memory(|m| {
                 m.data
                     .get_temp::<bool>(egui::Id::new("ops_log_to_file"))
@@ -265,6 +269,8 @@ impl CsvEditorApp {
                     self.ops = Some(ColumnOps::new(model.header()));
                     self.filtered_rows = None;
                     self.filter_conditions.clear();
+                    // 换了数据源：上一次的统计结果不再对应当前数据，清掉
+                    self.last_stats = None;
                     self.model = Some(Arc::new(model));
                     self.log(&format!(
                         "文件读取完成，总行数: {}，列数: {}",
@@ -377,6 +383,28 @@ impl CsvEditorApp {
                     });
                     self.dialogs.dedup_done_window = true;
                 }
+                BgMsg::StatsDone(table) => {
+                    self.busy = None;
+                    // 记录参数与结果规模（便于事后审计），并弹出结果窗
+                    self.log(&format!(
+                        "分组汇总完成：统计范围 {} 行 → {} 组（分组字段 {} 个，聚合列 {} 个）",
+                        table.input_rows,
+                        table.group_count(),
+                        table.group_columns,
+                        table.aggs
+                    ));
+                    for (i, n) in table.non_numeric.iter().enumerate() {
+                        if *n > 0 {
+                            if let Some(h) = table.headers.get(table.group_columns + 1 + i) {
+                                self.log(&format!("    注意：{} 有 {} 个非数值未参与计算", h, n));
+                            }
+                        }
+                    }
+                    self.last_stats = Some(table);
+                    // 新结果 → 结果窗打开并（若上次被最小化）强制展开
+                    self.dialogs.stats_result_expand_pending = true;
+                    self.dialogs.stats_result_window = true;
+                }
                 BgMsg::Error(e) => {
                     self.busy = None;
                     self.log(&format!("错误: {}", e));
@@ -409,6 +437,7 @@ impl CsvEditorApp {
         self.file_info = None;
         self.filter_conditions.clear();
         self.filtered_rows = None;
+        self.last_stats = None;
         self.log("已清空所有数据");
     }
 }

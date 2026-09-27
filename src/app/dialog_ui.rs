@@ -1,18 +1,40 @@
 //! 对话框与动作：拆分字段/合并/哈希/复制/插入/删除/隐藏/关于/导出/拆分执行。
 
 use eframe::egui;
+use egui_extras::{Column, TableBuilder};
 
 use csv_editor_rust::core::column_ops::{HashAlgo, InsertPosition};
 use csv_editor_rust::core::export;
 use csv_editor_rust::core::filter::{FilterCondition, FilterOp, Logic};
 use csv_editor_rust::core::merge::{self, HeaderCheck};
 use csv_editor_rust::core::split::{self, OutputFormat, SplitOptions};
+use csv_editor_rust::core::stats::{self, AggKind};
 
 use super::background::BgMsg;
+use super::table::truncate_cell;
 use super::{CsvEditorApp, DialogPosition};
 
 /// 内嵌的微信收款码（自愿捐助窗口用；单文件发布无法依赖外部图片）
 const WECHAT_QR_PNG: &[u8] = include_bytes!("../../assets/wechat_qr.png");
+
+/// 「分组汇总结果」窗口标题。它同时是 egui 窗口的 Id（`Window::new(title)`），
+/// 因此改这里时必须同步 `set_window_collapsed` 的调用，否则最小化/展开会失配。
+const STATS_RESULT_TITLE: &str = "分组汇总结果";
+
+/// 程序化设置某个 egui 窗口的「折叠（最小化）」状态。
+///
+/// egui 0.27 的 `Window` 只有 `collapsible`，没有公开的 `minimized()`；
+/// 它的折叠状态实际存在 `Id::new(标题).with("collapsing")` 的 `CollapsingState` 里
+/// （见 egui `containers/window.rs`，窗口用 `area_id.with("collapsing")` 存取），
+/// 这里按同一约定读写：折叠后窗口只剩标题栏，点标题栏左侧箭头可再展开。
+/// `title` 必须与 `Window::new(..)` 的标题完全一致。
+fn set_window_collapsed(ctx: &egui::Context, title: &str, collapsed: bool) {
+    let id = egui::Id::new(title).with("collapsing");
+    let mut state =
+        egui::containers::collapsing_header::CollapsingState::load_with_default_open(ctx, id, true);
+    state.set_open(!collapsed);
+    state.store(ctx);
+}
 
 /// 筛选操作符到下拉列表索引
 fn filter_op_idx(op: FilterOp) -> usize {
@@ -111,6 +133,12 @@ impl CsvEditorApp {
         let mut f = std::mem::take(&mut self.dialogs.dedup_done_window);
         self.dialog_dedup_done(ctx, &mut f);
         self.dialogs.dedup_done_window = f;
+        let mut f = std::mem::take(&mut self.dialogs.stats_window);
+        self.dialog_stats(ctx, &mut f);
+        self.dialogs.stats_window = f;
+        let mut f = std::mem::take(&mut self.dialogs.stats_result_window);
+        self.dialog_stats_result(ctx, &mut f);
+        self.dialogs.stats_result_window = f;
         // 数据行详情（双击单元格触发）
         let mut open = self.detail_row.is_some();
         self.dialog_row_detail(ctx, &mut open);
@@ -1206,14 +1234,23 @@ impl CsvEditorApp {
                         ui.label("• 输入或拖动数值即可把菜单、菜单命令、工具栏按钮、表格文字整体等比放大，方便视力不佳的用户；");
                         ui.weak("设置会被记住，下次启动仍然生效。");
                     });
-                    ui.collapsing("九、常见问题", |ui| {
+                    ui.collapsing("九、数据分析（消除重复行 / 分组汇总）", |ui| {
+                        ui.label("两条命令都在「数据分析」工具栏与菜单「数据分析」下；作用范围都是当前筛选结果（未筛选则为全部数据）。");
+                        ui.label("• 提取唯一行（去重）：勾选判重字段（一个都不勾 = 按整行判重），执行后保留唯一行并作为当前视图，可继续导出、拆分、统计；完成后可导出「重复行对应表」，逐条核对「保留行 ↔ 被剔除行」。");
+                        ui.label("• 字段分组汇总：选 1~3 个分组字段，再为若干列添加汇总方式（求和/均值/最大/最小/计数/去重计数/空值数，同一列可添加多个），点「开始汇总」；");
+                        ui.label("    结果是每组一行的汇总表（含「行数」），在弹窗中虚拟化查看，可「导出 CSV / 导出 XLSX」；");
+                        ui.label("    金额等按数值精确计算（定点十进制累加，两位小数的合计不会出现 3613134567.580001 这类多余尾数）；某列若混有文字会被跳过，并在结果窗提示「N 个非数值未参与计算」；");
+                        ui.label("    结果窗可「最小化」成一条标题栏（结果不丢），稍后点标题栏左侧三角展开即可继续查看或导出；");
+                        ui.weak("汇总不改变当前数据视图；只能选原始列统计（拆分/合并/复制/哈希产生的新列不参与）；分组数超过 2 万会提示改用取值较少的字段。");
+                    });
+                    ui.collapsing("十、常见问题", |ui| {
                         ui.label("• 打开很慢或卡住？ 读文件在后台进行，请看进度窗口与右下「操作日志」面板；");
                         ui.label("• 中文显示乱码？ 编码由软件自动识别；若结果异常，请在日志中确认识别到的编码；");
                         ui.label("• 中文输入只出现第一个字？ 该问题已在当前版本修复（若仍出现请反馈输入法名称）；");
                         ui.label("• 拆分产生文件太多？ 改用「按行数拆分」，或先筛选缩小数据范围；");
                         ui.label("• 程序启动无反应？ 请查看 exe 同目录的 csv_editor_rust.log（记录启动诊断信息）。");
                     });
-                    ui.collapsing("十、支持开发者", |ui| {
+                    ui.collapsing("十一、支持开发者", |ui| {
                         ui.label("工具栏「❤ 自愿捐助」按钮中有微信收款码，感谢您的支持。");
                     });
                 });
@@ -1425,6 +1462,369 @@ impl CsvEditorApp {
             }
         }));
         self.set_busy("导出重复行对应表", "正在导出...", 0.0);
+    }
+
+    /// 「字段分组汇总」参数对话框：选 1~3 个分组字段，并为若干列选择聚合方式。
+    /// 派生列（拆分/合并/复制/哈希等新列）不作为统计字段：其值不是文件里的原始数据，
+    /// 且统计走的是 `RowReader` 的零拷贝原列读取。
+    fn dialog_stats(&mut self, ctx: &egui::Context, open: &mut bool) {
+        let mut keep = *open;
+        let mut done = false;
+        apply_dialog_pos(
+            egui::Window::new("字段分组汇总")
+                .open(&mut keep)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([680.0, 540.0]),
+            self.dialog_position,
+            ctx,
+        )
+        .show(ctx, |ui| {
+            let header = self.header_names();
+            if header.is_empty() {
+                ui.label("请先加载数据");
+                return;
+            }
+            // 可作为统计字段的视图列（派生列 = false）
+            let base_ok: Vec<bool> = (0..header.len())
+                .map(|i| self.ops.as_ref().and_then(|o| o.view_to_base(i)).is_some())
+                .collect();
+            let scope = match self.visible_rows() {
+                Some(v) => format!("当前筛选结果（{} 行）", v.len()),
+                None => format!(
+                    "全部数据（{} 行）",
+                    self.model.as_ref().map(|m| m.row_count()).unwrap_or(0)
+                ),
+            };
+            ui.label(format!("统计范围：{scope}"));
+            ui.weak(
+                "按 1~3 个字段分组，对选定的列做聚合；每组都给出「行数」。\
+                 整数用 i128 精确求和（大额金额/长数字不丢精度）；结果可查看并导出 CSV / XLSX。\
+                 派生列不参与统计。",
+            );
+            ui.separator();
+
+            // —— 分组字段（固定 3 个槽位，便于增删改）——
+            ui.label("分组字段（1~3 个）:");
+            let cur = self.dialogs.stats_group_cols.clone();
+            let mut slots: Vec<Option<usize>> = Vec::with_capacity(stats::MAX_GROUP_COLUMNS);
+            for i in 0..stats::MAX_GROUP_COLUMNS {
+                // 丢弃越界/陈旧/派生列索引（列数可能因之前的增删而变化）
+                slots.push(
+                    cur.get(i)
+                        .copied()
+                        .filter(|&c| c < header.len() && base_ok[c]),
+                );
+            }
+            for (slot_i, slot) in slots.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("分组 {}", slot_i + 1));
+                    let text = match *slot {
+                        Some(c) => header[c].clone(),
+                        None => "（不使用）".to_string(),
+                    };
+                    egui::ComboBox::from_id_source(("stats_gcol", slot_i))
+                        .selected_text(text)
+                        .width(220.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(slot, None, "（不使用）");
+                            for (i, h) in header.iter().enumerate() {
+                                if !base_ok[i] {
+                                    continue; // 派生列不列出
+                                }
+                                ui.selectable_value(slot, Some(i), h);
+                            }
+                        });
+                });
+            }
+            // 回写：滤掉「不使用」与重复选中的列，保持槽位顺序（第一个槽位 = 主分组字段）
+            let mut picked: Vec<usize> = Vec::new();
+            for s in slots.iter().flatten() {
+                if !picked.contains(s) {
+                    picked.push(*s);
+                }
+            }
+            self.dialogs.stats_group_cols = picked;
+
+            ui.separator();
+            // —— 聚合列（一列 × 一种聚合 = 一个条目）——
+            ui.label("聚合列（同一列可添加多个聚合方式，如同时求和与去重计数）:");
+            let mut aggs = std::mem::take(&mut self.dialogs.stats_aggs);
+            // 丢弃越界/陈旧/派生列的条目（列数可能已变化）
+            aggs.retain(|&(c, _)| c < header.len() && base_ok[c]);
+            let mut remove: Option<usize> = None;
+            egui::ScrollArea::vertical()
+                .max_height(180.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    if aggs.is_empty() {
+                        ui.weak("（暂无聚合列：请在下方选择列与聚合方式，再点「+ 添加」）");
+                    }
+                    for i in 0..aggs.len() {
+                        ui.horizontal(|ui| {
+                            ui.label(header[aggs[i].0].clone());
+                            let mut kind = aggs[i].1;
+                            egui::ComboBox::from_id_source(("stats_agg_kind", i))
+                                .selected_text(kind.label())
+                                .width(96.0)
+                                .show_ui(ui, |ui| {
+                                    for k in AggKind::ALL {
+                                        ui.selectable_value(&mut kind, k, k.label());
+                                    }
+                                });
+                            aggs[i].1 = kind;
+                            if ui.button("×").on_hover_text("删除此聚合").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                        ui.separator();
+                    }
+                });
+            if let Some(i) = remove {
+                aggs.remove(i);
+            }
+            self.dialogs.stats_aggs = aggs;
+
+            // 新增一个聚合条目
+            ui.horizontal(|ui| {
+                let first_ok = (0..header.len()).find(|&i| base_ok[i]);
+                let mut col = self.dialogs.stats_new_col;
+                if col >= header.len() || !base_ok[col] {
+                    col = first_ok.unwrap_or(0);
+                }
+                egui::ComboBox::from_id_source("stats_new_col")
+                    .selected_text(header.get(col).cloned().unwrap_or_default())
+                    .width(200.0)
+                    .show_ui(ui, |ui| {
+                        for (i, h) in header.iter().enumerate() {
+                            if !base_ok[i] {
+                                continue;
+                            }
+                            ui.selectable_value(&mut col, i, h);
+                        }
+                    });
+                self.dialogs.stats_new_col = col;
+                let mut k = self.dialogs.stats_new_kind.min(AggKind::ALL.len() - 1);
+                egui::ComboBox::from_id_source("stats_new_kind")
+                    .selected_text(AggKind::ALL[k].label())
+                    .width(96.0)
+                    .show_ui(ui, |ui| {
+                        for (i, kind) in AggKind::ALL.iter().enumerate() {
+                            ui.selectable_value(&mut k, i, kind.label());
+                        }
+                    });
+                self.dialogs.stats_new_kind = k;
+                if ui.button("+ 添加").clicked() {
+                    self.dialogs.stats_aggs.push((col, AggKind::ALL[k]));
+                }
+            });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("开始汇总").clicked() {
+                    self.run_stats();
+                    done = true;
+                }
+                if ui.button("取消").clicked() {
+                    done = true;
+                }
+                ui.weak(format!(
+                    "已选 {} 个分组字段 / {} 个聚合",
+                    self.dialogs.stats_group_cols.len(),
+                    self.dialogs.stats_aggs.len()
+                ));
+            });
+        });
+        if done {
+            keep = false;
+        }
+        *open = keep;
+    }
+
+    /// 分组汇总结果窗：虚拟化表格展示 + 导出 CSV / XLSX（可最小化为标题栏稍后再导出）
+    fn dialog_stats_result(&mut self, ctx: &egui::Context, open: &mut bool) {
+        let mut keep = *open;
+        let mut done = false;
+        let mut export: Option<(String, bool)> = None;
+        // 新结果、或用户点「查看上次汇总结果…」时，强制从最小化状态展开
+        if self.dialogs.stats_result_expand_pending {
+            self.dialogs.stats_result_expand_pending = false;
+            set_window_collapsed(ctx, STATS_RESULT_TITLE, false);
+        }
+        // Arc：结果窗每帧渲染都共享同一份结果表，不复制数据
+        let table = self.last_stats.clone();
+        apply_dialog_pos(
+            egui::Window::new(STATS_RESULT_TITLE)
+                .open(&mut keep)
+                .collapsible(true)
+                .default_open(true)
+                .resizable(true)
+                .default_size([780.0, 540.0]),
+            self.dialog_position,
+            ctx,
+        )
+        .show(ctx, |ui| {
+            let Some(table) = table.as_ref() else {
+                ui.label("没有可显示的统计结果");
+                if ui.button("关闭").clicked() {
+                    done = true;
+                }
+                return;
+            };
+            ui.label(format!(
+                "统计范围 {} 行 → {} 组（分组字段 {} 个，聚合列 {} 个）",
+                table.input_rows,
+                table.group_count(),
+                table.group_columns,
+                table.aggs
+            ));
+            if table.has_non_numeric() {
+                for (i, n) in table.non_numeric.iter().enumerate() {
+                    if *n == 0 {
+                        continue;
+                    }
+                    if let Some(h) = table.headers.get(table.group_columns + 1 + i) {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "⚠ {}：{} 个非数值未参与求和/均值/最大/最小",
+                                h, n
+                            ))
+                            .color(egui::Color32::from_rgb(200, 120, 0)),
+                        );
+                    }
+                }
+            }
+            ui.horizontal(|ui| {
+                if ui.button("导出 CSV…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("CSV", &["csv"])
+                        .set_file_name("分组汇总.csv")
+                        .save_file()
+                    {
+                        export = Some((path.to_string_lossy().into_owned(), false));
+                    }
+                }
+                if ui.button("导出 XLSX…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("XLSX", &["xlsx"])
+                        .set_file_name("分组汇总.xlsx")
+                        .save_file()
+                    {
+                        export = Some((path.to_string_lossy().into_owned(), true));
+                    }
+                }
+                if ui
+                    .button("最小化")
+                    .on_hover_text(
+                        "把结果窗收起成一条标题栏（统计结果仍保留在程序里）；以后点标题栏左侧的三角或双击标题栏即可展开，继续导出",
+                    )
+                    .clicked()
+                {
+                    set_window_collapsed(ctx, STATS_RESULT_TITLE, true);
+                }
+                if ui.button("关闭").clicked() {
+                    done = true;
+                }
+                ui.weak("行号从 1 开始；表格可拖动列宽、滚动查看全部行");
+            });
+            ui.separator();
+
+            // 结果行数可能上万：沿用预览表的虚拟化渲染（只布局可见行）
+            let row_height = 20.0;
+            egui::ScrollArea::horizontal()
+                .auto_shrink([true, false])
+                .show(ui, |ui| {
+                    let mut tb = TableBuilder::new(ui)
+                        .striped(true)
+                        .resizable(true)
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                        .column(Column::initial(60.0).at_least(40.0).clip(true))
+                        .min_scrolled_height(200.0);
+                    for _ in &table.headers {
+                        tb = tb.column(Column::initial(110.0).at_least(50.0).clip(true));
+                    }
+                    tb.header(row_height + 6.0, |mut header_row| {
+                        header_row.col(|ui| {
+                            ui.strong("#");
+                        });
+                        for h in &table.headers {
+                            header_row.col(|ui| {
+                                ui.strong(h);
+                            });
+                        }
+                    })
+                    .body(|body| {
+                        body.rows(row_height, table.rows.len(), |mut row| {
+                            let i = row.index();
+                            row.col(|ui| {
+                                ui.monospace(
+                                    egui::RichText::new((i + 1).to_string()).weak(),
+                                );
+                            });
+                            if let Some(r) = table.rows.get(i) {
+                                for v in r {
+                                    // 限制单元格显示长度，避免超长文本拖慢渲染
+                                    let shown = truncate_cell(v, 80);
+                                    let trimmed = v.trim();
+                                    let is_numeric = !trimmed.is_empty()
+                                        && trimmed
+                                            .bytes()
+                                            .all(|b| b.is_ascii_digit() || b == b'-' || b == b'+' || b == b'.');
+                                    let mut text = egui::RichText::new(shown);
+                                    if is_numeric {
+                                        text = text.monospace();
+                                    }
+                                    row.col(|ui| {
+                                        ui.label(text);
+                                    });
+                                }
+                            }
+                        });
+                    });
+                });
+            if table.rows.is_empty() {
+                ui.label("（没有分组结果：统计范围内没有数据行）");
+            }
+        });
+        if let Some((path, is_xlsx)) = export {
+            // 导出是「额外动作」：结果窗保持打开，方便继续查看或再导出另一种格式
+            self.export_stats(path, is_xlsx);
+        }
+        if done {
+            keep = false;
+        }
+        *open = keep;
+    }
+
+    /// 导出分组汇总结果（后台线程）
+    pub fn export_stats(&mut self, path: String, is_xlsx: bool) {
+        if self.busy.is_some() {
+            self.log("已有任务在执行，请稍候");
+            return;
+        }
+        let Some(table) = self.last_stats.clone() else {
+            self.log("没有可导出的统计结果");
+            return;
+        };
+        let tx = self.tx.clone();
+        self.worker = Some(super::background::Worker::spawn(tx.clone(), move |ctl| {
+            ctl.report_progress(0.1, "正在写出统计结果...");
+            // 结果表本来就是文本：直接按行写出（CSV 带公式注入防护、XLSX 全文本）
+            let result = if is_xlsx {
+                export::export_rows_xlsx(&path, &table.headers, table.rows.iter().cloned())
+            } else {
+                export::export_rows_csv(&path, &table.headers, table.rows.iter().cloned())
+            };
+            match result {
+                Ok(n) => {
+                    let _ = tx.send(BgMsg::ExportDone(n, path));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::Error(format!("导出统计结果失败: {}", e)));
+                }
+            }
+        }));
+        self.set_busy("导出统计结果", "正在导出...", 0.0);
     }
 
     /// 自愿捐助对话框（内嵌微信收款码）
@@ -1642,5 +2042,56 @@ impl CsvEditorApp {
             }
         }));
         self.set_busy("拆分数据", "正在拆分...", 0.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// headless 渲染：返回 `Some(内容)` = 窗口展开了；`None` = 处于最小化（折叠）状态。
+    fn render(collapsed: bool) -> Option<bool> {
+        let ctx = egui::Context::default();
+        set_window_collapsed(&ctx, STATS_RESULT_TITLE, collapsed);
+        let mut inner = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let r = egui::Window::new(STATS_RESULT_TITLE)
+                .collapsible(true)
+                .default_open(true)
+                .show(ctx, |ui| {
+                    ui.label("分组汇总结果内容");
+                    true
+                });
+            inner = r.and_then(|r| r.inner);
+        });
+        inner
+    }
+
+    #[test]
+    fn set_window_collapsed_matches_egui_window_id_convention() {
+        // 「最小化」依赖 egui 把折叠状态存在 `Id::new(标题).with("collapsing")` 这一约定，
+        // 用 headless 渲染验证：折叠 ⇒ 不渲染内容，展开 ⇒ 渲染内容（守护该约定的正确性）
+        assert_eq!(render(false), Some(true), "展开状态应渲染窗口内容");
+        assert_eq!(render(true), None, "最小化后应只剩标题栏（不渲染内容）");
+    }
+
+    #[test]
+    fn collapse_state_persists_across_frames() {
+        // 同一 Context 连续渲染：状态由 egui memory 记忆（窗口不会自己弹回展开）
+        let ctx = egui::Context::default();
+        let mut shown = Vec::new();
+        for collapsed in [true, true, false, true] {
+            set_window_collapsed(&ctx, STATS_RESULT_TITLE, collapsed);
+            let mut inner = None;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                let r = egui::Window::new(STATS_RESULT_TITLE)
+                    .collapsible(true)
+                    .default_open(true)
+                    .show(ctx, |_ui| true);
+                inner = r.and_then(|r| r.inner);
+            });
+            shown.push(inner.is_some());
+        }
+        assert_eq!(shown, vec![false, false, true, false]);
     }
 }

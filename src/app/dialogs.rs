@@ -1,6 +1,7 @@
 //! 对话框状态（egui 即时模式：以布尔标志控制对话框显示）。
 
 use csv_editor_rust::core::merge::{FileHeader, HeaderCheck};
+use csv_editor_rust::core::stats::AggKind;
 
 /// 各操作对话框的显示标志与输入状态
 #[derive(Default)]
@@ -39,6 +40,20 @@ pub struct DialogStates {
     pub dedup_done_window: bool,
     /// 判重字段（视图列索引；空 = 全部字段）
     pub dedup_cols: Vec<usize>,
+    // 数据分析：字段分组汇总
+    pub stats_window: bool,
+    /// 分组汇总结果窗
+    pub stats_result_window: bool,
+    /// 下一帧强制把结果窗从「最小化」状态展开（新结果、或用户主动要求查看时置位）
+    pub stats_result_expand_pending: bool,
+    /// 分组字段（视图列索引，1~3 个）
+    pub stats_group_cols: Vec<usize>,
+    /// 聚合规格：视图列索引 + 聚合方式（同一列可添加多个聚合）
+    pub stats_aggs: Vec<(usize, AggKind)>,
+    /// 「添加聚合」时选中的列（视图列索引）
+    pub stats_new_col: usize,
+    /// 「添加聚合」时选中的聚合方式（`AggKind::ALL` 的下标）
+    pub stats_new_kind: usize,
     // 筛选/拆分/文件信息 弹出窗口
     pub filter_window: bool,
     pub split_window: bool,

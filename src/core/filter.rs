@@ -135,14 +135,18 @@ fn eval_one(reader: &RowReader, c: &FilterCondition) -> bool {
     }
 }
 
-/// 数值化尝试：整数（i128，覆盖 19 位卡号）或浮点
+/// 数值化尝试：整数（i128，覆盖 19 位卡号）或浮点。
+///
+/// 与 `stats.rs`（分组汇总的求和/均值/极值）共用同一套解析与比较语义：
+/// 筛选里"金额 > 100 命中"与统计里"金额求和包含该行"必须一致，
+/// 因此这两处刻意复用同一实现，而不是各写一份。
 #[derive(Debug, Clone, Copy)]
-enum Num {
+pub(crate) enum Num {
     Int(i128),
     Float(f64),
 }
 
-fn try_num(s: &str) -> Option<Num> {
+pub(crate) fn try_num(s: &str) -> Option<Num> {
     let t = s.trim();
     if t.is_empty() {
         return None;
@@ -153,7 +157,7 @@ fn try_num(s: &str) -> Option<Num> {
     t.parse::<f64>().ok().map(Num::Float)
 }
 
-fn cmp_num(a: &Num, b: &Num) -> Ordering {
+pub(crate) fn cmp_num(a: &Num, b: &Num) -> Ordering {
     match (a, b) {
         (Num::Int(x), Num::Int(y)) => x.cmp(y),
         (Num::Int(x), Num::Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal),
