@@ -872,8 +872,12 @@ pub struct DuplicateReport {
     pub duplicate_keys: usize,
     /// 重复行数 = 统计范围行数 − 不同键个数
     pub duplicate_rows: usize,
-    /// **重复键涉及的全部行号**（升序，0 起始，含各键首次出现的那行）——「只看重复的行」用。
-    /// 注意与 [`DuplicateReport::duplicate_rows`] 的区别：这里含首次出现行，便于直接对比。
+    /// **重复键涉及的全部行号**（0 起始，含各键首次出现的那行）——「只看重复的行」用。
+    ///
+    /// 顺序是**按重复键分组**：组之间按「重复次数降序、键升序」（与明细表一致），
+    /// 组内按行号升序 —— 这样落回预览区后，同一个键的各行**紧挨着**，
+    /// 一眼就能看出谁和谁重复，便于逐条核对（而不是被其它键的行隔开）。
+    /// 注意与 [`DuplicateReport::duplicate_rows`] 的区别：这里含首次出现行。
     pub dup_rows: Vec<u32>,
     /// 每个键首次出现的行号（升序，0 起始）——「只看唯一行」用（与去重结果一致）
     pub unique_rows: Vec<u32>,
@@ -1025,28 +1029,35 @@ fn duplicate_stats_with_max_keys(
         p(1.0);
     }
 
-    // 汇总：唯一行 = 各键首次出现；重复行 = 首次 + 后续出现
+    // 汇总：唯一行 = 各键首次出现；重复组 = (键, 次数, 首次行号, 该键全部行号)
     let mut unique_rows: Vec<u32> = Vec::with_capacity(map.len());
-    let mut dup_rows: Vec<u32> = Vec::new();
-    // 明细候选：(键, 出现次数, 首次行号)
-    let mut detail: Vec<(String, u64, u32)> = Vec::new();
+    let mut detail: Vec<(String, u64, u32, Vec<u32>)> = Vec::new();
     for (k, st) in map.drain() {
         unique_rows.push(st.first);
         if st.count > 1 {
-            dup_rows.push(st.first);
-            dup_rows.extend_from_slice(&st.rest);
-            detail.push((k, st.count, st.first));
+            // 该键的全部行：首次出现 + 后续出现（`rest` 按扫描顺序天然升序）
+            let mut rows_of_key = Vec::with_capacity(st.rest.len() + 1);
+            rows_of_key.push(st.first);
+            rows_of_key.extend_from_slice(&st.rest);
+            detail.push((k, st.count, st.first, rows_of_key));
         }
     }
     unique_rows.sort_unstable();
-    dup_rows.sort_unstable();
 
-    // 明细：重复次数降序，次数相同按键升序（稳定可复现）
+    // 明细排序：重复次数降序，次数相同按键升序（稳定可复现）
     detail.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let duplicate_keys = detail.len();
+    // 「只看重复的行」的行号序列：**按重复键分组**展开（同组相邻、组内行号升序），
+    // 组顺序与明细表一致 —— 预览区里同一个键的各行因此紧挨着，便于一眼核对
+    let mut dup_rows: Vec<u32> = Vec::with_capacity(
+        detail.iter().map(|(_, _, _, r)| r.len()).sum::<usize>(),
+    );
+    for (_, _, _, rows_of_key) in &detail {
+        dup_rows.extend_from_slice(rows_of_key);
+    }
     let shown = top_n.min(duplicate_keys);
     let pct = |n: u64| fmt_pct(n as f64 * 100.0 / total.max(1) as f64);
-    for (k, count, first) in detail.iter().take(shown) {
+    for (k, count, first, _) in detail.iter().take(shown) {
         let mut row: Vec<String> = Vec::with_capacity(cols.len() + 4);
         for part in k.splitn(cols.len(), '\u{1F}') {
             row.push(part.to_string());
@@ -1062,7 +1073,7 @@ fn duplicate_stats_with_max_keys(
     }
     if duplicate_keys > shown {
         let rest_keys = duplicate_keys - shown;
-        let rest_rows: u64 = detail[shown..].iter().map(|(_, c, _)| *c).sum();
+        let rest_rows: u64 = detail[shown..].iter().map(|(_, c, _, _)| *c).sum();
         let mut row: Vec<String> = Vec::with_capacity(cols.len() + 4);
         row.push(format!("(其余 {} 个重复键)", rest_keys));
         while row.len() < cols.len() {
@@ -1091,7 +1102,9 @@ fn duplicate_stats_with_max_keys(
             .to_string(),
     );
     table.notes.push(
-        "「只看重复的行」会筛出重复键涉及的全部行（含首次出现的那行），便于逐条对比。".to_string(),
+        "「只看重复的行」会筛出重复键涉及的全部行（含首次出现的那行），并**按重复键分组排列**\
+         （同一个键的各行相邻、组内按行号升序，组顺序与本表一致），行号列显示的是原始行号。"
+            .to_string(),
     );
     table.notes.push(
         "判重口径与「提取唯一行（去重）」完全一致（按原值组合，保留首次出现的行）。".to_string(),
@@ -2242,8 +2255,9 @@ mod tests {
         // 明细按次数降序：C(3) 在前，A(2) 在后；首次出现行号从 1 开始
         assert_eq!(r.table.rows[0], vec!["C", "3", "2", "50", "4"]);
         assert_eq!(r.table.rows[1], vec!["A", "2", "1", "33.33", "1"]);
-        // 可筛选的行号：重复涉及行 = A/C 的全部行（0 起始 0,1,3,4,5）；唯一行 = 各键首次出现
-        assert_eq!(r.dup_rows, vec![0, 1, 3, 4, 5]);
+        // 可筛选的行号按**重复键分组**排列：C 组（3 次，行 3/4/5）在前，A 组（2 次，行 0/1）在后
+        // —— 这样落回预览区时同一个键的各行相邻，便于一眼核对
+        assert_eq!(r.dup_rows, vec![3, 4, 5, 0, 1]);
         assert_eq!(r.unique_rows, vec![0, 2, 3]);
         assert!(r.summary().contains("重复行 3 行（占 50%）"), "{}", r.summary());
         // （dup_rows 是「重复键涉及的全部行」：A 的 2 行 + C 的 3 行 = 5 行，含首次出现）
@@ -2279,7 +2293,8 @@ mod tests {
         assert_eq!(r.table.group_columns, 1);
         assert_eq!(r.duplicate_keys, 2);
         assert_eq!(r.duplicate_rows, 2);
-        assert_eq!(r.dup_rows, vec![0, 1, 2, 3]);
+        // 两组次数相同（各 2 次）→ 组间按键升序：上海(U+4E0A) < 北京(U+5317)
+        assert_eq!(r.dup_rows, vec![2, 3, 0, 1]);
         assert_eq!(r.unique_rows, vec![0, 2]);
         // 判重字段同时作为表头第一列（列名 = 字段名）
         assert_eq!(r.table.headers[0], "城市");
@@ -2289,6 +2304,33 @@ mod tests {
         assert_eq!(r2.duplicate_keys, 0);
         assert!(r2.dup_rows.is_empty());
         assert!(r2.table.notes.iter().any(|n| n.contains("没有重复键")));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn duplicate_stats_keeps_same_key_rows_adjacent() {
+        // 「只看重复的行」要求同一键的各行相邻：组间按次数降序、键升序，组内按行号升序
+        // 数据：A 在行 0、4；B 在行 1、5；C(唯一) 行 2；D 在行 3、6、7
+        let p = write_temp(
+            "K\nA\nB\nC\nD\nA\nB\nD\nD\n".as_bytes(),
+            "_dup_adj.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let r = duplicate_stats(&m, None, &[], 100, None).unwrap();
+        // D(3 次) 组在前 → 行 3、6、7；A、B 各 2 次 → 按键升序 A 组（0、4）后 B 组（1、5）
+        assert_eq!(r.dup_rows, vec![3, 6, 7, 0, 4, 1, 5]);
+        // 同一键的行必须相邻：按「组号」序列检查它单调不减（即不会出现 A、B、A 这种交错）
+        let group_of = |row: u32| -> usize {
+            match row {
+                3 | 6 | 7 => 0,
+                0 | 4 => 1,
+                _ => 2,
+            }
+        };
+        let groups: Vec<usize> = r.dup_rows.iter().map(|&x| group_of(x)).collect();
+        assert_eq!(groups, vec![0, 0, 0, 1, 1, 2, 2], "同一键的行必须相邻");
+        // 唯一行仍按行号升序（与去重一致）
+        assert_eq!(r.unique_rows, vec![0, 1, 2, 3]);
         std::fs::remove_file(&p).ok();
     }
 
