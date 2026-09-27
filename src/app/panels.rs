@@ -2,6 +2,7 @@
 
 use eframe::egui;
 
+use csv_editor_rust::core::db::{self, DbKind};
 use csv_editor_rust::core::dedup;
 use csv_editor_rust::core::merge::{self, HeaderCheck, MergeMode};
 use csv_editor_rust::core::stats::{self, AggSpec};
@@ -30,6 +31,71 @@ impl CsvEditorApp {
                     ui.separator();
                     if ui.button("退出").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                ui.menu_button("数据库", |ui| {
+                    // 读取各主要数据库：点击后打开连接窗口并预置该类型的默认参数
+                    for (idx, kind) in DbKind::ALL.iter().enumerate() {
+                        let label = match kind {
+                            DbKind::MySql => "连接 MySQL / MariaDB…",
+                            DbKind::PostgreSql => "连接 PostgreSQL…",
+                            DbKind::SqlServer => "连接 SQL Server…",
+                            DbKind::Oracle => "连接 Oracle…",
+                            DbKind::Generic => "连接其它数据库（ODBC / DSN）…",
+                        };
+                        if ui.button(label).clicked() {
+                            self.open_db_connect(idx);
+                            ui.close_menu();
+                        }
+                    }
+                    ui.separator();
+                    // 已保存的连接（本机配置文件里保存过的一键直连）
+                    self.ensure_db_odbc();
+                    let saved = self.dialogs.db.saved.clone();
+                    if saved.is_empty() {
+                        ui.add_enabled(false, egui::Button::new("（暂无已保存的连接）"))
+                            .on_hover_text(
+                                "在「连接数据库」窗口里填写参数并勾选「保存此连接」，                                 即可保存到 exe 同目录的「数据库连接配置.ini」",
+                            );
+                    } else {
+                        ui.menu_button("已保存的连接", |ui| {
+                            for cfg in &saved {
+                                if ui
+                                    .button(cfg.display_name())
+                                    .on_hover_text(format!(
+                                        "{}：{}",
+                                        cfg.kind.label(),
+                                        cfg.redacted_conn_str(&self.dialogs.db.drivers)
+                                    ))
+                                    .clicked()
+                                {
+                                    self.db_connect(cfg.clone());
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    }
+                    ui.separator();
+                    let connected = self.db_conn.is_some();
+                    if ui
+                        .add_enabled(connected, egui::Button::new("浏览数据库表 / 载入数据…"))
+                        .on_hover_text("选择库/表/字段，把数据读入编辑器（只读，不改动数据库数据）")
+                        .clicked()
+                    {
+                        self.dialogs.db.browse_window = true;
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(connected, egui::Button::new("断开当前连接"))
+                        .on_hover_text(&self.db_conn_desc)
+                        .clicked()
+                    {
+                        self.db_disconnect();
+                        ui.close_menu();
+                    }
+                    if connected {
+                        ui.separator();
+                        ui.weak(format!("当前连接：{}", self.db_conn_desc));
                     }
                 });
                 ui.menu_button("编辑", |ui| {
@@ -244,6 +310,18 @@ impl CsvEditorApp {
                             ui.ctx().memory_mut(|m| m.reset_areas());
                         }
                     });
+                    ui.separator();
+                    if ui
+                        .button("清理数据库临时文件")
+                        .on_hover_text(
+                            "从数据库读取的数据会先落到系统临时目录再交给编辑器（大表可达数 GB 的文件）。\
+                             程序启动、退出与每次取数时都会自动清理；这里可手动立即清理一次。",
+                        )
+                        .clicked()
+                    {
+                        self.cleanup_db_temp_files();
+                        ui.close_menu();
+                    }
                     ui.separator();
                     // 操作日志落盘开关（两态文本等长，保证左对齐且宽度不跳动）
                     let label = if self.log_to_file {
@@ -699,8 +777,18 @@ impl CsvEditorApp {
                     ui.add_space(4.0);
                     ui.label(&busy.detail);
                     ui.add_space(6.0);
-                    ui.add(egui::ProgressBar::new(busy.progress).desired_width(320.0));
-                    ui.weak(format!("{:.0}%", busy.progress * 100.0));
+                    if busy.progress < 0.0 {
+                        // 不确定进度（总行数未知）：用动画进度条 + 已读取行数，而不是假的百分比
+                        ui.add(
+                            egui::ProgressBar::new(0.0)
+                                .desired_width(320.0)
+                                .animate(true),
+                        );
+                        ui.weak("进行中…");
+                    } else {
+                        ui.add(egui::ProgressBar::new(busy.progress).desired_width(320.0));
+                        ui.weak(format!("{:.0}%", busy.progress * 100.0));
+                    }
                 });
             });
     }
@@ -1486,6 +1574,283 @@ impl CsvEditorApp {
         self.set_busy("交叉 / 关联统计", "正在统计对应关系...", 0.0);
     }
 
+    // ===== 数据库（只读）=====
+
+    /// 首次使用时读取本机 ODBC 驱动、DSN 与已保存的连接（只做一次）
+    pub fn ensure_db_odbc(&mut self) {
+        if self.dialogs.db.odbc_loaded {
+            return;
+        }
+        self.dialogs.db.odbc_loaded = true;
+        self.dialogs.db.drivers = db::installed_drivers();
+        self.dialogs.db.dsns = db::installed_dsns();
+        self.dialogs.db.saved = db::load_configs();
+        self.dialogs.db.saved_loaded = true;
+    }
+
+    /// 打开「连接数据库」窗口，并按类型预置端口与驱动
+    pub fn open_db_connect(&mut self, kind_idx: usize) {
+        self.ensure_db_odbc();
+        let d = &mut self.dialogs.db;
+        d.kind_idx = kind_idx.min(DbKind::ALL.len() - 1);
+        let kind = d.kind();
+        let old_default = DbKind::ALL.iter().any(|k| !k.default_port().is_empty() && d.port == k.default_port());
+        if d.port.trim().is_empty() || old_default {
+            d.port = kind.default_port().to_string();
+        }
+        if let Some(drv) = db::pick_driver(kind, &d.drivers) {
+            d.driver = drv;
+        } else if d.driver.trim().is_empty() {
+            d.driver.clear();
+        }
+        d.status.clear();
+        d.connect_window = true;
+    }
+
+    /// 发起数据库连接（后台线程；成功后自动打开库/表浏览窗口）
+    pub fn db_connect(&mut self, cfg: db::DbConfig) {
+        if self.busy.is_some() || self.dialogs.db.connecting {
+            self.log("已有任务在执行，请稍候");
+            return;
+        }
+        let drivers = self.dialogs.db.drivers.clone();
+        let shown = cfg.redacted_conn_str(&drivers);
+        self.log(&format!(
+            "开始连接数据库：{}（{}）",
+            cfg.display_name(),
+            shown
+        ));
+        let tx = self.tx.clone();
+        self.worker = Some(Worker::spawn(tx.clone(), move |worker| {
+            worker.report_progress(0.25, "正在建立只读连接...");
+            match db::DbConn::connect(&cfg, &drivers) {
+                Ok(conn) => {
+                    worker.report_progress(0.7, "正在读取库/表清单...");
+                    let scopes = conn.scopes().unwrap_or_default();
+                    worker.report_progress(1.0, "连接完成");
+                    let desc = format!(
+                        "{} · {}（驱动：{}{}）",
+                        cfg.kind.label(),
+                        conn.server_info(),
+                        conn.driver_name(),
+                        if conn.session_read_only() {
+                            "，数据库侧已设为只读会话"
+                        } else {
+                            ""
+                        }
+                    );
+                    let _ = tx.send(BgMsg::DbConnected(std::sync::Arc::new(conn), desc, scopes));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::Error(format!("连接数据库失败：{}", e)));
+                }
+            }
+        }));
+        self.set_busy("连接数据库", "正在建立只读连接...", 0.0);
+        self.dialogs.db.connecting = true;
+        self.dialogs.db.status = "正在连接...".to_string();
+    }
+
+    /// 读取某个库/模式下的表与视图（后台线程）
+    pub fn db_load_tables(&mut self, scope: String) {
+        let Some(conn) = self.db_conn.clone() else {
+            return;
+        };
+        if self.dialogs.db.connecting {
+            return; // 已有数据库任务在跑，避免并发使用同一连接
+        }
+        self.dialogs.db.connecting = true;
+        let tx = self.tx.clone();
+        self.worker = Some(Worker::spawn(tx.clone(), move |worker| {
+            worker.report_progress(0.3, "正在读取表清单...");
+            let scopes = conn.scopes().unwrap_or_default();
+            match conn.tables(&scope) {
+                Ok(tables) => {
+                    let _ = tx.send(BgMsg::DbTables(scopes, tables));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::Error(format!("读取表清单失败：{}", e)));
+                }
+            }
+        }));
+        self.set_busy("读取表清单", "正在读取表清单...", 0.0);
+    }
+
+    /// 选中某张表：读取字段清单并预览前若干行（后台线程）
+    pub fn db_open_table(&mut self, idx: usize) {
+        let Some(conn) = self.db_conn.clone() else {
+            return;
+        };
+        let Some(t) = self.dialogs.db.tables.get(idx).cloned() else {
+            return;
+        };
+        if self.dialogs.db.connecting {
+            return;
+        }
+        self.dialogs.db.selected_table = Some(idx);
+        self.dialogs.db.columns.clear();
+        self.dialogs.db.col_checked.clear();
+        self.dialogs.db.preview = None;
+        self.dialogs.db.preview_note.clear();
+        self.dialogs.db.connecting = true;
+        let tx = self.tx.clone();
+        self.worker = Some(Worker::spawn(tx.clone(), move |worker| {
+            worker.report_progress(0.25, "正在读取字段清单...");
+            let cols = match conn.columns(&t) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(BgMsg::Error(format!("读取字段失败：{}", e)));
+                    return;
+                }
+            };
+            worker.report_progress(0.6, "正在预览数据...");
+            match conn.fetch_rows(&t, &[], DB_PREVIEW_ROWS) {
+                Ok((header, rows)) => {
+                    let note = if rows.len() >= DB_PREVIEW_ROWS {
+                        format!("表 {} 仅显示前 {} 行", t.name, DB_PREVIEW_ROWS)
+                    } else {
+                        format!("表 {} 共 {} 行", t.name, rows.len())
+                    };
+                    let _ = tx.send(BgMsg::DbPreview(header, rows, note));
+                    let _ = tx.send(BgMsg::DbColumns(cols));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::Error(format!("预览失败：{}", e)));
+                }
+            }
+        }));
+        self.set_busy("读取数据库表", "正在读取字段与预览数据...", 0.0);
+    }
+
+    /// 把当前选中的表（按勾选字段与行数上限）只读读出，载入编辑器
+    pub fn db_load_selected_into_editor(&mut self) {
+        let Some(conn) = self.db_conn.clone() else {
+            self.log("请先连接数据库");
+            return;
+        };
+        if self.busy.is_some() || self.dialogs.db.connecting {
+            self.log("已有任务在执行，请稍候");
+            return;
+        }
+        let Some(idx) = self.dialogs.db.selected_table else {
+            self.log("请先在左侧选择一张表");
+            return;
+        };
+        let Some(t) = self.dialogs.db.tables.get(idx).cloned() else {
+            return;
+        };
+        if !self.dialogs.db.columns.is_empty()
+            && self.dialogs.db.col_checked.iter().all(|c| !*c)
+        {
+            self.log("请至少勾选一个字段");
+            return;
+        }
+        let cols = self.dialogs.db.checked_columns();
+        let limit = self.dialogs.db.max_rows();
+        self.db_source_label = format!("数据库表 {}", t.name);
+        let out = db::temp_csv_path();
+        let out_s = out.to_string_lossy().into_owned();
+        self.log(&format!(
+            "开始读取数据库表 {} 到编辑器（{}，最多 {} 行）...",
+            t.name,
+            if cols.is_empty() {
+                "全部字段".to_string()
+            } else {
+                format!("{} 个字段", cols.len())
+            },
+            if limit == 0 {
+                "不限".to_string()
+            } else {
+                limit.to_string()
+            }
+        ));
+        self.dialogs.db.connecting = true;
+        let tx = self.tx.clone();
+        self.worker = Some(Worker::spawn(tx.clone(), move |worker| {
+            // 先取行数**估算**作为进度分母（读系统统计视图，毫秒级；取不到就退化为不确定进度）
+            let total = conn.estimate_rows(&t);
+            if total.is_none() {
+                self_log_unavailable("无法估算表行数，进度将显示已读取行数");
+            }
+            let progress = |done: u64, hint: Option<u64>| {
+                let total = hint.or(total);
+                match total {
+                    // 已读行数超过估算（统计信息偏小）→ 不再显示虚假百分比
+                    Some(t) if done > t => worker.report_progress(
+                        -1.0,
+                        &format!("正在读取数据… 已读取 {} 行（超出预估 {} 行）", done, t),
+                    ),
+                    Some(t) if t > 0 => {
+                        let frac = (done as f64 / t as f64).min(1.0);
+                        worker.report_progress(
+                            0.02 + (frac as f32) * 0.97,
+                            &format!(
+                                "正在读取数据… {} / {} 行（{:.0}%）",
+                                done,
+                                t,
+                                frac * 100.0
+                            ),
+                        );
+                    }
+                    // 总行数未知：显示不确定进度（进度条动画），只报已读行数
+                    _ => worker.report_progress(
+                        -1.0,
+                        &format!("正在读取数据… 已读取 {} 行", done),
+                    ),
+                }
+            };
+            match conn.export_to_csv(&t, &cols, &out_s, limit, total, Some(&progress)) {
+                Ok((rows, _h)) => {
+                    worker.report_progress(1.0, "读取完成");
+                    let _ = tx.send(BgMsg::DbExported(out_s, rows));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::Error(format!("读取数据库数据失败：{}", e)));
+                }
+            }
+        }));
+        self.set_busy("读取数据库数据", "正在统计表的总行数...", 0.0);
+    }
+
+    /// 手动清理数据库取数的临时文件（保留当前正在使用的那个）
+    pub fn cleanup_db_temp_files(&mut self) {
+        let keep = self.db_temp.clone();
+        let (files, freed) = match keep {
+            Some(p) => db::cleanup_temp_csvs_except(std::path::Path::new(&p)),
+            None => db::cleanup_temp_csvs(),
+        };
+        if files == 0 {
+            self.log("没有可清理的数据库临时文件（正在使用中的文件会在退出时自动清理）");
+        } else {
+            self.log(&format!(
+                "已清理数据库临时文件：{} 个，释放 {:.1} MB",
+                files,
+                freed as f64 / 1024.0 / 1024.0
+            ));
+        }
+    }
+
+    /// 断开当前数据库连接
+    pub fn db_disconnect(&mut self) {
+        if self.db_conn.take().is_none() {
+            self.log("当前没有数据库连接");
+            return;
+        }
+        let desc = std::mem::take(&mut self.db_conn_desc);
+        let d = &mut self.dialogs.db;
+        d.scopes.clear();
+        d.scope.clear();
+        d.tables.clear();
+        d.selected_table = None;
+        d.columns.clear();
+        d.col_checked.clear();
+        d.preview = None;
+        d.preview_note.clear();
+        d.browse_window = false;
+        d.status = format!("已断开：{}", desc);
+        self.log(&format!("已断开数据库连接（{}）", desc));
+    }
+
     /// 刷新预览视图：滚动回首行（表格内容本身每帧重渲染）
     pub fn refresh_view(&mut self) {
         self.preview.scroll_to(0);
@@ -1518,6 +1883,15 @@ impl CsvEditorApp {
             self.log("示例数据写入失败");
         }
     }
+}
+
+/// 数据库表预览行数
+const DB_PREVIEW_ROWS: usize = 100;
+
+/// 后台线程里记录「不影响正确性」的提示：写进 exe 同目录的启动诊断日志
+/// （操作日志面板由 UI 线程维护，后台线程不直接访问）
+fn self_log_unavailable(msg: &str) {
+    log::warn!("数据库取数提示：{}", msg);
 }
 
 /// 进程峰值工作集（Windows）

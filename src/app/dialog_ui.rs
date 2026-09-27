@@ -4,6 +4,7 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
 use csv_editor_rust::core::column_ops::{HashAlgo, InsertPosition};
+use csv_editor_rust::core::db::{self, DbKind};
 use csv_editor_rust::core::export;
 use csv_editor_rust::core::filter::{FilterCondition, FilterOp, Logic};
 use csv_editor_rust::core::merge::{self, HeaderCheck};
@@ -19,6 +20,48 @@ const WECHAT_QR_PNG: &[u8] = include_bytes!("../../assets/wechat_qr.png");
 
 /// 透视表的行字段槽位数（1~2 个；与 `stats::MAX_GROUP_COLUMNS` 独立，界面固定 2 个槽位）
 const MAX_PIVOT_ROW_SLOTS: usize = 2;
+
+/// 数据库表预览最多显示的列数（更宽的表仍可由横向滚动查看，载入编辑器后不受限制）
+const DB_PREVIEW_MAX_COLS: usize = 60;
+
+/// 数据预览的默认列宽：窗口放不下时按这个宽度显示并出现横向滚动条
+const DB_PREVIEW_COL_W: f32 = 78.0;
+
+/// 「数据库表（只读）」窗口的尺寸度量（纯函数，便于测试）
+pub(crate) struct DbBrowseMetrics {
+    /// 窗口内容区可用高度（内容整体放进这个高度的滚动区，窗口因此不会超出屏幕）
+    pub content_h: f32,
+    pub win_w: f32,
+    pub win_h: f32,
+    /// 左侧「表 / 视图」列表宽度
+    pub left_w: f32,
+    /// 上段两个列表（表 / 字段）的高度
+    pub lists_h: f32,
+    /// 下段通栏数据预览的高度
+    pub preview_h: f32,
+}
+
+/// 按屏幕尺寸算「数据库表（只读）」窗口的各区域尺寸。
+///
+/// 布局为「上段两栏列表 + 下段通栏预览」：左侧表列表不再从顶铺到底，
+/// 数据预览横跨窗口左右两侧（因此预览高度给得比列表更大）。
+pub(crate) fn db_browse_metrics(screen: egui::Rect) -> DbBrowseMetrics {
+    let content_h = (screen.height() - 150.0).clamp(220.0, 660.0);
+    let win_w = (screen.width() - 48.0).clamp(460.0, 1080.0);
+    let win_h = content_h + 56.0;
+    let left_w = (win_w * 0.28).clamp(160.0, 280.0);
+    // 两处都是「高度上限」：内容少时按内容高度（布局紧凑），内容多时到此为止并出现滚动条
+    let preview_h = (content_h * 0.38).clamp(110.0, 260.0);
+    let lists_h = (content_h * 0.30).clamp(100.0, 240.0);
+    DbBrowseMetrics {
+        content_h,
+        win_w,
+        win_h,
+        left_w,
+        lists_h,
+        preview_h,
+    }
+}
 
 /// 渲染一行「规模上限」设置（标签 + 输入框 + 悬浮说明），返回是否被修改
 fn limits_row(
@@ -101,26 +144,72 @@ fn filter_op_idx(op: FilterOp) -> usize {
     }
 }
 
-/// 按弹窗位置给 Window 应用默认位置（default_pos：首次定位、可拖动、egui 自动记忆拖动位置）
+/// 按弹窗位置给 Window 应用默认位置（default_pos：首次定位、可拖动、egui 自动记忆拖动位置）。
+///
+/// 同时做两件「防超出屏幕」的事（小屏或界面放大 1.5 倍时尤其重要）：
+/// 1. 限制窗口最大宽高不超过屏幕 —— 窗口比屏幕还宽时，标题栏会被裁到屏幕外，
+///    右侧的「✕ 关闭」与滚动条都会点不到；
+/// 2. 把默认位置限制在「窗口放得下」的范围内 —— 位置贴到屏幕下缘时，
+///    底部按钮会被推到屏幕外（实测 egui 自身的 constrain 不足以处理这种情况）。
+///
+/// `est_size` 为该窗口的估计尺寸（一般用它的 `default_size`）：屏幕装不下时把窗口
+/// 固定成屏幕内可容纳的尺寸，内容超出部分由窗口自身滚动（egui 的 `max_height`
+/// 只能限制用户拖动，压不住内容把窗口撑大）。
 pub(super) fn apply_dialog_pos<'a>(
     w: egui::Window<'a>,
     pos: DialogPosition,
     ctx: &'a egui::Context,
 ) -> egui::Window<'a> {
+    apply_dialog_pos_sized(w, pos, ctx, egui::vec2(520.0, 480.0))
+}
+
+/// 同 [`apply_dialog_pos`]，但显式给出窗口的估计尺寸（较宽/较高的窗口应传入自己的 `default_size`）
+pub(super) fn apply_dialog_pos_sized<'a>(
+    w: egui::Window<'a>,
+    pos: DialogPosition,
+    ctx: &'a egui::Context,
+    est_size: egui::Vec2,
+) -> egui::Window<'a> {
     let screen = ctx.screen_rect();
+    let max_w = (screen.width() - 40.0).max(320.0);
+    let max_h = (screen.height() - 120.0).max(240.0);
+    let est_w = est_size.x.clamp(240.0, max_w);
+    // 估计尺寸超出屏幕可容纳范围时：把窗口固定为屏幕内尺寸，内容由窗口内部滚动，
+    // 避免出现「窗口比屏幕还大 → 标题栏的关闭按钮跑到屏幕外」的情况
+    let w = if est_size.x > max_w || est_size.y > max_h {
+        w.default_size([est_size.x.min(max_w), est_size.y.min(max_h)])
+            .resizable(false)
+            .max_width(max_w)
+            .max_height(max_h)
+    } else {
+        w.max_width(max_w).max_height(max_h)
+    };
+
+    let x_min = screen.left() + 8.0;
+    let x_max = (screen.right() - est_w - 8.0).max(x_min);
+    let y_min = screen.top() + 8.0;
+    // 高度可能随内容增长到 max_h，故按最坏情况限制起始 y，确保底边不越界
+    let y_max = (screen.bottom() - max_h - 8.0).max(y_min);
+    let cx = |x: f32| x.clamp(x_min, x_max);
+    let cy = |y: f32| y.clamp(y_min, y_max);
     match pos {
-        DialogPosition::Center => {
-            w.default_pos(egui::pos2(screen.center().x - 200.0, screen.center().y - 200.0))
-        }
-        DialogPosition::RightTop => {
-            w.default_pos(egui::pos2(screen.right() - 360.0, screen.top() + 80.0))
-        }
-        DialogPosition::LeftTop => {
-            w.default_pos(egui::pos2(screen.left() + 300.0, screen.top() + 80.0))
-        }
-        DialogPosition::CenterTop => {
-            w.default_pos(egui::pos2(screen.center().x - 300.0, screen.top() + 80.0))
-        }
+        DialogPosition::Center => w.default_pos(egui::pos2(
+            cx(screen.center().x - 200.0),
+            cy(screen.center().y - 200.0),
+        )),
+        DialogPosition::RightTop => w.default_pos(egui::pos2(
+            cx(screen.right() - 360.0),
+            cy(screen.top() + 80.0),
+        )),
+        DialogPosition::LeftTop => w.default_pos(egui::pos2(
+            cx(screen.left() + 300.0),
+            cy(screen.top() + 80.0),
+        )),
+        DialogPosition::CenterTop => w.default_pos(egui::pos2(
+            cx(screen.center().x - 300.0),
+            cy(screen.top() + 80.0),
+        )),
+        // 记忆位置：尊重用户拖动的位置，但仍然受上面的最大宽高限制
         DialogPosition::Remember => w,
     }
 }
@@ -206,11 +295,756 @@ impl CsvEditorApp {
         let mut f = std::mem::take(&mut self.dialogs.stats_result_window);
         self.dialog_stats_result(ctx, &mut f);
         self.dialogs.stats_result_window = f;
+        // 数据库：连接窗口 + 库/表浏览窗口
+        let mut f = self.dialogs.db.connect_window;
+        self.dialog_db_connect(ctx, &mut f);
+        self.dialogs.db.connect_window = f;
+        let mut f = self.dialogs.db.browse_window;
+        self.dialog_db_browse(ctx, &mut f);
+        self.dialogs.db.browse_window = f;
         // 数据行详情（双击单元格触发）
         let mut open = self.detail_row.is_some();
         self.dialog_row_detail(ctx, &mut open);
         if !open {
             self.detail_row = None;
+        }
+    }
+
+    /// 「连接数据库」窗口：选择数据库类型、填写连接参数、测试/保存/连接（全部只读）
+    fn dialog_db_connect(&mut self, ctx: &egui::Context, open: &mut bool) {
+        self.ensure_db_odbc();
+        let mut keep = *open;
+        let mut close_now = false;
+        let mut act_connect = false;
+        let mut act_test = false;
+        let mut act_save = false;
+        let mut act_delete: Option<String> = None;
+        let mut act_use_saved: Option<usize> = None;
+        // 尺寸自适应：窗口与内部滚动区都不超出屏幕（小屏 / 界面放大后仍可操作与关闭）
+        let screen = ctx.screen_rect();
+        let win_w = (screen.width() - 80.0).clamp(420.0, 620.0);
+        let scroll_h = (screen.height() - 190.0).clamp(220.0, 560.0);
+        if keep && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            close_now = true;
+        }
+        apply_dialog_pos(
+            egui::Window::new("连接数据库（只读）")
+                .open(&mut keep)
+                .collapsible(false)
+                .resizable(true)
+                .default_width(win_w)
+                .max_width((screen.width() - 24.0).max(420.0))
+                .max_height((screen.height() - 48.0).max(300.0)),
+            self.dialog_position,
+            ctx,
+        )
+        .show(ctx, |ui| {
+            // 内容较多（含已保存连接列表），小屏或界面放大后需要滚动查看
+            egui::ScrollArea::vertical()
+                .max_height(scroll_h)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+            ui.weak(
+                "本软件只读取数据库（SELECT / 元数据），不会修改、删除或新建数据库中的任何数据。",
+            );
+            ui.separator();
+            let d = &mut self.dialogs.db;
+
+            // —— 数据库类型 ——
+            ui.horizontal(|ui| {
+                ui.label("数据库类型:");
+                let mut idx = d.kind_idx;
+                egui::ComboBox::from_id_source("db_kind")
+                    .selected_text(d.kind().label())
+                    .show_ui(ui, |ui| {
+                        for (i, k) in DbKind::ALL.iter().enumerate() {
+                            ui.selectable_value(&mut idx, i, k.label());
+                        }
+                    });
+                if idx != d.kind_idx {
+                    d.kind_idx = idx;
+                    let k = d.kind();
+                    d.port = k.default_port().to_string();
+                    d.driver = db::pick_driver(k, &d.drivers).unwrap_or_default();
+                    if k != DbKind::Generic {
+                        d.use_dsn = false;
+                    }
+                    d.status.clear();
+                }
+            });
+
+            // —— 通用 ODBC：可选 DSN ——
+            if d.kind() == DbKind::Generic {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut d.use_dsn, "使用已配置的数据源（DSN）");
+                    if d.use_dsn {
+                        let sel = if d.dsn.is_empty() {
+                            "（请选择）".to_string()
+                        } else {
+                            d.dsn.clone()
+                        };
+                        egui::ComboBox::from_id_source("db_dsn_pick")
+                            .selected_text(sel)
+                            .show_ui(ui, |ui| {
+                                if d.dsns.is_empty() {
+                                    ui.label("（本机没有已配置的 DSN）");
+                                }
+                                for name in d.dsns.clone() {
+                                    ui.selectable_value(&mut d.dsn, name.clone(), name);
+                                }
+                            });
+                    }
+                });
+            }
+
+            // —— ODBC 驱动 ——
+            ui.horizontal(|ui| {
+                ui.label("ODBC 驱动:");
+                let shown = if d.driver.is_empty() {
+                    "（自动选择）".to_string()
+                } else {
+                    d.driver.clone()
+                };
+                egui::ComboBox::from_id_source("db_driver_pick")
+                    .selected_text(shown)
+                    .width(320.0)
+                    .show_ui(ui, |ui| {
+                        if d.drivers.is_empty() {
+                            ui.label("（本机未检测到 ODBC 驱动，请先安装对应数据库的 ODBC 驱动）");
+                        }
+                        let auto = db::pick_driver(d.kind(), &d.drivers);
+                        let label = match &auto {
+                            Some(a) => format!("（自动：{}）", a),
+                            None => "（不指定，按连接串里的 DRIVER 项）".to_string(),
+                        };
+                        ui.selectable_value(&mut d.driver, String::new(), label);
+                        for name in d.drivers.clone() {
+                            ui.selectable_value(&mut d.driver, name.clone(), name);
+                        }
+                    });
+            });
+            // 驱动缺失时给醒目提示：这是「连接失败」最常见的原因
+            let missing_driver = d.kind() != DbKind::Generic
+                && d.driver.trim().is_empty()
+                && db::pick_driver(d.kind(), &d.drivers).is_none();
+            if missing_driver {
+                ui.colored_label(
+                    egui::Color32::from_rgb(190, 60, 60),
+                    format!(
+                        "⚠ 本机未安装 {} 的 ODBC 驱动，直接连接会失败（ODBC 报 IM002「未发现数据源名称」）。",
+                        d.kind().label()
+                    ),
+                );
+                ui.colored_label(egui::Color32::from_rgb(190, 60, 60), db::driver_hint(d.kind()));
+                if !d.drivers.is_empty() {
+                    ui.weak(format!(
+                        "本机现有驱动：{}",
+                        d.drivers.join("、")
+                    ));
+                }
+            } else if !d.drivers.is_empty() {
+                ui.weak(format!(
+                    "本机已安装 {} 个 ODBC 驱动；未列出目标数据库时，请先安装对应驱动或直接手写连接串。",
+                    d.drivers.len()
+                ));
+            }
+
+            // —— 连接参数 ——
+            ui.separator();
+            let generic = d.kind() == DbKind::Generic;
+            if !generic {
+                egui::Grid::new("db_params")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("主机 / 服务器:");
+                        ui.text_edit_singleline(&mut d.host);
+                        ui.end_row();
+                        ui.label("端口:");
+                        ui.add(egui::TextEdit::singleline(&mut d.port).desired_width(80.0));
+                        ui.end_row();
+                        ui.label(if d.kind() == DbKind::Oracle {
+                            "服务名 / SID:"
+                        } else {
+                            "数据库名:"
+                        });
+                        ui.text_edit_singleline(&mut d.database);
+                        ui.end_row();
+                        ui.label("用户名:");
+                        ui.text_edit_singleline(&mut d.user);
+                        ui.end_row();
+                        ui.label("密码:");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut d.password)
+                                    .password(!d.show_password)
+                                    .desired_width(200.0),
+                            );
+                            ui.checkbox(&mut d.show_password, "显示");
+                        });
+                        ui.end_row();
+                    });
+            } else {
+                ui.label("通用 ODBC 模式：直接填写参数或手写连接串（DSN / 其它数据库用）。");
+                egui::Grid::new("db_params_generic")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("主机 / 服务器:");
+                        ui.text_edit_singleline(&mut d.host);
+                        ui.end_row();
+                        ui.label("用户名:");
+                        ui.text_edit_singleline(&mut d.user);
+                        ui.end_row();
+                        ui.label("密码:");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut d.password)
+                                    .password(!d.show_password)
+                                    .desired_width(200.0),
+                            );
+                            ui.checkbox(&mut d.show_password, "显示");
+                        });
+                        ui.end_row();
+                    });
+            }
+
+            // —— 连接串 ——
+            ui.separator();
+            ui.checkbox(&mut d.manual_conn_str, "手动编辑连接串（勾选后按下面填写的内容连接）");
+            if d.manual_conn_str {
+                ui.add(
+                    egui::TextEdit::multiline(&mut d.conn_str)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("例：DRIVER={ODBC Driver 17 for SQL Server};SERVER=...;DATABASE=...;UID=...;PWD=..."),
+                );
+                ui.weak("提示：连接串里的密码不会被保存，除非另外勾选「同时保存密码」。");
+            } else {
+                let preview = d.config().redacted_conn_str(&d.drivers);
+                ui.add(egui::Label::new(egui::RichText::new(preview).monospace()).wrap(true));
+                ui.weak("以上为将使用的连接串（密码显示为 ***）。需要覆盖时勾选上面的「手动编辑连接串」。");
+            }
+
+            // —— 保存 ——
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("连接名称:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut d.conn_name)
+                        .desired_width(200.0)
+                        .hint_text("留空则按「类型 主机/库」自动命名"),
+                );
+                ui.checkbox(&mut d.save_password, "同时保存密码");
+            });
+            ui.weak("保存的配置写入 exe 同目录的「数据库连接配置.ini」；勾选保存密码时密码为明文保存。");
+
+            // —— 状态与按钮 ——
+            ui.separator();
+            if !d.status.is_empty() {
+                ui.label(&d.status);
+            }
+            ui.horizontal(|ui| {
+                let busy = d.connecting;
+                if ui
+                    .add_enabled(!busy, egui::Button::new("连接并浏览"))
+                    .on_hover_text("建立只读连接，成功后打开「数据库表」窗口")
+                    .clicked()
+                {
+                    act_connect = true;
+                }
+                if ui
+                    .add_enabled(!busy, egui::Button::new("测试连接"))
+                    .on_hover_text("只验证能否连通，不保留连接")
+                    .clicked()
+                {
+                    act_test = true;
+                }
+                if ui
+                    .add_enabled(!busy, egui::Button::new("保存此连接"))
+                    .on_hover_text("保存到本机配置文件，之后可从「数据库 → 已保存的连接」一键连接")
+                    .clicked()
+                {
+                    act_save = true;
+                }
+                if busy {
+                    ui.spinner();
+                    ui.weak("正在连接...");
+                }
+            });
+
+            // —— 已保存的连接 ——
+            if !self.dialogs.db.saved.is_empty() {
+                ui.separator();
+                ui.label("已保存的连接：");
+                egui::ScrollArea::vertical()
+                    .max_height(140.0)
+                    .show(ui, |ui| {
+                        let saved = self.dialogs.db.saved.clone();
+                        for (i, c) in saved.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                if ui.button("连接").clicked() {
+                                    act_use_saved = Some(i);
+                                }
+                                if ui.button("删除").clicked() {
+                                    act_delete = Some(c.name.clone());
+                                }
+                                ui.label(format!("{}（{}）", c.display_name(), c.kind.label()));
+                            });
+                        }
+                    });
+            }
+                });
+        });
+        *open = keep && !close_now;
+        if close_now {
+            return;
+        }
+
+        // 闭包外执行动作（避免与界面借用冲突）
+        if act_save {
+            let mut cfg = self.dialogs.db.config();
+            if cfg.name.trim().is_empty() {
+                cfg.name = cfg.display_name();
+            }
+            let mut list = self.dialogs.db.saved.clone();
+            db::upsert_config(&mut list, cfg.clone());
+            match db::save_configs(&list) {
+                Ok(()) => {
+                    self.dialogs.db.saved = list;
+                    self.dialogs.db.status = format!("已保存连接：{}", cfg.name);
+                    self.log(&format!("已保存数据库连接配置：{}", cfg.name));
+                }
+                Err(e) => {
+                    self.dialogs.db.status = format!("保存失败：{}", e);
+                    self.log(&format!("保存数据库连接配置失败：{}", e));
+                }
+            }
+        }
+        if let Some(name) = act_delete {
+            let mut list = self.dialogs.db.saved.clone();
+            if db::remove_config(&mut list, &name) {
+                match db::save_configs(&list) {
+                    Ok(()) => {
+                        self.dialogs.db.saved = list;
+                        self.dialogs.db.status = format!("已删除连接：{}", name);
+                        self.log(&format!("已删除数据库连接配置：{}", name));
+                    }
+                    Err(e) => self.log(&format!("删除后保存失败：{}", e)),
+                }
+            }
+        }
+        if let Some(i) = act_use_saved {
+            if let Some(cfg) = self.dialogs.db.saved.get(i).cloned() {
+                self.dialogs.db.apply_config(&cfg);
+                act_connect = true;
+            }
+        }
+        if act_test {
+            self.dialogs.db.test_only = true;
+            let cfg = self.dialogs.db.config();
+            self.db_connect(cfg);
+        } else if act_connect {
+            self.dialogs.db.test_only = false;
+            let cfg = self.dialogs.db.config();
+            self.db_connect(cfg);
+        }
+    }
+
+    /// 「数据库表」窗口：选择库/表/字段 → 预览 → 只读载入编辑器。
+    ///
+    /// 尺寸与位置都按当前屏幕自适应：本窗口内容较多（库/表 + 字段 + 预览），
+    /// 若沿用「右上角」这类为小窗口设计的默认位置，窗口会跑出屏幕，导致标题栏、
+    /// 滚动条与按钮点不到、关不掉。这里按其实际宽高居中偏上，并限制最大尺寸
+    /// （超出部分在窗口内部滚动），另设「关闭」按钮与 Esc 作为兜底。
+    fn dialog_db_browse(&mut self, ctx: &egui::Context, open: &mut bool) {
+        let mut keep = *open;
+        let mut close_now = false;
+        let mut pick_table: Option<usize> = None;
+        let mut act_load = false;
+        let mut act_preview = false;
+        let mut change_scope: Option<String> = None;
+        let mut select_all: Option<bool> = None;
+
+        // —— 尺寸自适应 ——
+        // 注意：egui 的 Window 会被内容撑大（max_height 压不住），所以窗口内容整体
+        // 放进一个高度受限的滚动区（content_h），窗口高度 = content_h + 标题栏/边距，
+        // 这样在任何屏幕上窗口都不会超出屏幕（否则标题栏与滚动条可能点不到、关不掉）。
+        let screen = ctx.screen_rect();
+        let m = db_browse_metrics(screen);
+        let (content_h, win_w, win_h) = (m.content_h, m.win_w, m.win_h);
+        let (left_w, lists_h, preview_h) = (m.left_w, m.lists_h, m.preview_h);
+
+        // Esc 关闭（窗口较大时标题栏可能不便点，键盘兜底）
+        if keep && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            close_now = true;
+        }
+
+        // 收窄窗口内边距：让下段的通栏数据预览左右两侧紧贴窗口边缘
+        let frame = egui::Frame::window(&ctx.style())
+            .inner_margin(egui::Margin::symmetric(4.0, 6.0));
+        let mut win = egui::Window::new("数据库表（只读）")
+            .frame(frame)
+            .open(&mut keep)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([win_w, win_h])
+            .min_width(460.0)
+            .min_height(320.0)
+            .max_width((screen.width() - 24.0).max(460.0))
+            .max_height((screen.height() - 48.0).max(320.0));
+        if self.dialog_position != DialogPosition::Remember {
+            // 居中偏上：本窗口较大，小窗口用的「右上角」定位会让它超出屏幕
+            let x = (screen.center().x - win_w * 0.5).clamp(
+                screen.left() + 8.0,
+                (screen.right() - win_w - 8.0).max(screen.left() + 8.0),
+            );
+            let y = (screen.center().y - win_h * 0.5).clamp(
+                screen.top() + 28.0,
+                (screen.bottom() - win_h - 8.0).max(screen.top() + 8.0),
+            );
+            win = win.default_pos(egui::pos2(x, y));
+        }
+        win.show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(content_h)
+                // y 收缩：内容少时窗口跟着变矮（紧凑），内容多时才出现滚动条
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    self.db_browse_body(
+                        ui,
+                        left_w,
+                        lists_h,
+                        preview_h,
+                        &mut pick_table,
+                        &mut act_load,
+                        &mut act_preview,
+                        &mut change_scope,
+                        &mut select_all,
+                    );
+                });
+        });
+        *open = keep && !close_now;
+        if close_now {
+            return; // 用户关窗：本帧不再执行任何动作
+        }
+        if let Some(true) = select_all {
+            for f in self.dialogs.db.col_checked.iter_mut() {
+                *f = true;
+            }
+        }
+        if let Some(false) = select_all {
+            for f in self.dialogs.db.col_checked.iter_mut() {
+                *f = false;
+            }
+        }
+        if let Some(scope) = change_scope {
+            self.dialogs.db.scope = scope.clone();
+            self.dialogs.db.selected_table = None;
+            self.dialogs.db.columns.clear();
+            self.dialogs.db.col_checked.clear();
+            self.dialogs.db.preview = None;
+            self.db_load_tables(scope);
+        }
+        match pick_table {
+            Some(usize::MAX) => {
+                let scope = self.dialogs.db.scope.clone();
+                self.db_load_tables(scope);
+            }
+            Some(i) => self.db_open_table(i),
+            None => {}
+        }
+        if act_preview {
+            if let Some(i) = self.dialogs.db.selected_table {
+                self.db_open_table(i);
+            }
+        }
+        if act_load {
+            self.db_load_selected_into_editor();
+        }
+    }
+
+    /// 「数据库表」窗口的正文（放在高度受限的滚动区里渲染，见 `dialog_db_browse`）
+    #[allow(clippy::too_many_arguments)]
+    fn db_browse_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        left_w: f32,
+        lists_h: f32,
+        preview_h: f32,
+        pick_table: &mut Option<usize>,
+        act_load: &mut bool,
+        act_preview: &mut bool,
+        change_scope: &mut Option<String>,
+        select_all: &mut Option<bool>,
+    ) {
+        let pick_table = &mut *pick_table;
+        let act_load = &mut *act_load;
+        let act_preview = &mut *act_preview;
+        let change_scope = &mut *change_scope;
+        let select_all = &mut *select_all;
+
+        // —— 顶部：连接信息 + 显式「关闭」——
+        ui.horizontal(|ui| {
+            let desc = if self.db_conn_desc.is_empty() {
+                "（未连接）".to_string()
+            } else {
+                self.db_conn_desc.clone()
+            };
+            ui.strong(truncate_cell(&desc, 56)).on_hover_text(format!(
+                "{}\n只读：本软件只执行查询（SELECT 与库表元数据），不会改动数据库数据",
+                desc
+            ));
+        });
+
+        // —— 库 / 模式选择 ——
+        {
+            let d = &mut self.dialogs.db;
+            if !d.scopes.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{}:", d.kind().scope_label()));
+                    let cur = if d.scope.is_empty() {
+                        "（全部）".to_string()
+                    } else {
+                        d.scope.clone()
+                    };
+                    let mut sel = d.scope.clone();
+                    egui::ComboBox::from_id_source("db_scope_pick")
+                        .selected_text(cur)
+                        .width(260.0)
+                        .show_ui(ui, |ui| {
+                            for sc in d.scopes.clone() {
+                                ui.selectable_value(&mut sel, sc.clone(), sc);
+                            }
+                        });
+                    if sel != d.scope {
+                        *change_scope = Some(sel);
+                    }
+                });
+            }
+        }
+        ui.separator();
+
+        // —— 上段：左＝表 / 视图列表，右＝字段列表（两个列表等高，底部不铺满窗口）——
+        // —— 上段：左＝表 / 视图列表，右＝字段列表 ——
+        // 用「限定高度的容器」承载两栏：水平布局里的 ui.separator()（竖分隔线）会按
+        // 「可用高度」绘制并计入布局，若不限定高度，它会把上段撑到接近整窗高，
+        // 两栏下方就留下一大块消不掉的空白（窗口显得松散、不紧凑）。
+        let row_h = lists_h + 66.0; // 标签 + 筛选/操作行 + 列表 + 计数行
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), row_h),
+            egui::Layout::left_to_right(egui::Align::Min),
+            |ui| {
+                // 左：表 / 视图
+                let d = &mut self.dialogs.db;
+                ui.vertical(|ui| {
+                    ui.set_min_width(left_w);
+                    ui.set_max_width(left_w);
+                    ui.label("表 / 视图（点击选择）:");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.table_filter)
+                                .desired_width((left_w - 118.0).max(60.0))
+                                .hint_text("按名称过滤"),
+                        );
+                        if ui
+                            .button("刷新")
+                            .on_hover_text("重新读取当前库/模式的表清单")
+                            .clicked()
+                        {
+                            *pick_table = Some(usize::MAX);
+                        }
+                    });
+                    let filter = d.table_filter.trim().to_lowercase();
+                    let rows: Vec<(usize, String)> = d
+                        .tables
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, t)| filter.is_empty() || t.name.to_lowercase().contains(&filter))
+                        .map(|(i, t)| (i, t.display()))
+                        .collect();
+                    let selected = d.selected_table;
+                    egui::ScrollArea::vertical()
+                        .id_source("db_tables")
+                        .max_height(lists_h)
+                        // y 方向收缩到内容高度：auto_shrink 的 y=false 会让滚动区占满可用高度，
+                        // 结果两栏下方留出一大块空白（窗口显得松散）
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            if rows.is_empty() {
+                                ui.weak("（没有符合条件的表；可点「刷新」重新读取）");
+                            }
+                            for (i, label) in &rows {
+                                if ui
+                                    .selectable_label(selected == Some(*i), truncate_cell(label, 28))
+                                    .on_hover_text(label.as_str())
+                                    .clicked()
+                                {
+                                    *pick_table = Some(*i);
+                                }
+                            }
+                        });
+                    ui.weak(format!("共 {} 个表/视图", d.tables.len()));
+                });
+                ui.separator();
+
+                // 右：字段
+                let d = &mut self.dialogs.db;
+                ui.vertical(|ui| {
+                    ui.label("字段（勾选要读取的列）:");
+                    ui.horizontal(|ui| {
+                        if ui.button("全选").clicked() {
+                            *select_all = Some(true);
+                        }
+                        if ui.button("全不选").clicked() {
+                            *select_all = Some(false);
+                        }
+                        ui.label("读取行数上限:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.max_rows_text)
+                                .desired_width(90.0)
+                                .hint_text("0=全部"),
+                        )
+                        .on_hover_text("从数据库读取多少行：填 0 表示读取全部行");
+                    });
+                    egui::ScrollArea::vertical()
+                        .id_source("db_columns")
+                        .max_height(lists_h)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            if d.columns.is_empty() {
+                                ui.weak("（先选择一张表）");
+                            }
+                            for (i, name) in d.columns.iter().enumerate() {
+                                if let Some(flag) = d.col_checked.get_mut(i) {
+                                    ui.checkbox(flag, truncate_cell(name, 34))
+                                        .on_hover_text(name.as_str());
+                                }
+                            }
+                        });
+                });
+        },
+        );
+
+        // —— 操作行 ——
+        ui.separator();
+        let d = &mut self.dialogs.db;
+        ui.horizontal(|ui| {
+            let can_act = d.selected_table.is_some() && !d.connecting;
+            if ui
+                .add_enabled(can_act, egui::Button::new("⬇ 载入到编辑器"))
+                .on_hover_text("把选中的字段与数据读入编辑器，随后可用筛选/统计/拆分/导出等全部功能")
+                .clicked()
+            {
+                *act_load = true;
+            }
+            if ui
+                .add_enabled(can_act, egui::Button::new("🔄 刷新预览"))
+                .clicked()
+            {
+                *act_preview = true;
+            }
+            if d.connecting {
+                ui.spinner();
+                ui.weak("正在读取...");
+            }
+        });
+
+        // —— 下段：数据预览（通栏；列多时可横向滚动）——
+        ui.separator();
+        ui.label(if d.preview_note.is_empty() {
+            "数据预览:".to_string()
+        } else {
+            format!("数据预览（{}）:", d.preview_note)
+        });
+        if let Some((header, rows)) = &d.preview {
+            let header = header.clone();
+            let rows = rows.clone();
+            let n = header.len().min(DB_PREVIEW_MAX_COLS).max(1);
+            // 列宽：窗口放得下就铺满整宽（左右贴住窗口），放不下就按默认列宽显示，
+            // 由横向滚动条查看其它列 —— 表格宽度不再影响窗口尺寸。
+            let gap = 8.0;
+            let avail_w = (ui.available_width() - 18.0).max(160.0); // 18 = 预留垂直滚动条
+            let per_col = (avail_w - gap * n as f32) / n as f32;
+            let col_w = if per_col >= DB_PREVIEW_COL_W {
+                per_col
+            } else {
+                DB_PREVIEW_COL_W
+            };
+            if header.len() > n {
+                ui.weak(format!(
+                    "（该表共 {} 列，这里显示前 {} 列；可拖动横向滚动条查看，载入编辑器后可查看全部列）",
+                    header.len(),
+                    n
+                ));
+            }
+            egui::ScrollArea::horizontal()
+                .id_source("db_preview_hscroll")
+                .max_height(preview_h + 22.0) // 预留横向滚动条
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .auto_shrink([true, true])
+                        .columns(Column::exact(col_w).clip(true), n)
+                        .max_scroll_height(preview_h)
+                        .header(20.0, |mut h| {
+                            for name in header.iter().take(n) {
+                                h.col(|ui| {
+                                    ui.strong(truncate_cell(name, 40));
+                                });
+                            }
+                        })
+                        .body(|mut body| {
+                            for row in &rows {
+                                body.row(18.0, |mut r| {
+                                    for c in row.iter().take(n) {
+                                        r.col(|ui| {
+                                            ui.label(truncate_cell(c, 40));
+                                        });
+                                    }
+                                });
+                            }
+                        });
+                });
+        } else {
+            ui.weak("（选择表后自动预览前 100 行）");
+        }
+
+        // —— 动作处理（与界面渲染分开，避免借用冲突）——
+        if let Some(true) = *select_all {
+            for f in self.dialogs.db.col_checked.iter_mut() {
+                *f = true;
+            }
+        }
+        if let Some(false) = *select_all {
+            for f in self.dialogs.db.col_checked.iter_mut() {
+                *f = false;
+            }
+        }
+        if let Some(scope) = change_scope.clone() {
+            self.dialogs.db.scope = scope.clone();
+            self.dialogs.db.selected_table = None;
+            self.dialogs.db.columns.clear();
+            self.dialogs.db.col_checked.clear();
+            self.dialogs.db.preview = None;
+            self.db_load_tables(scope);
+        }
+        match *pick_table {
+            Some(usize::MAX) => {
+                let scope = self.dialogs.db.scope.clone();
+                self.db_load_tables(scope);
+            }
+            Some(i) => self.db_open_table(i),
+            None => {}
+        }
+        if *act_preview {
+            if let Some(i) = self.dialogs.db.selected_table {
+                self.db_open_table(i);
+            }
+        }
+        if *act_load {
+            self.db_load_selected_into_editor();
         }
     }
 
@@ -715,7 +1549,7 @@ impl CsvEditorApp {
     /// 数据筛选弹出窗口（原左侧筛选面板逻辑，功能不变）
     fn dialog_filter(&mut self, ctx: &egui::Context, open: &mut bool) {
         let mut keep = *open;
-        apply_dialog_pos(
+        apply_dialog_pos_sized(
             egui::Window::new("数据筛选")
                 .open(&mut keep)
                 .collapsible(false)
@@ -723,6 +1557,7 @@ impl CsvEditorApp {
                 .default_size([640.0, 460.0]),
             self.dialog_position,
             ctx,
+            egui::vec2(640.0, 460.0),
         )
         .show(ctx, |ui| {
                 let header: Vec<String> = self
@@ -1037,7 +1872,7 @@ impl CsvEditorApp {
             return;
         };
         let mut keep = *open;
-        apply_dialog_pos(
+        apply_dialog_pos_sized(
             egui::Window::new("数据行详情")
                 .open(&mut keep)
                 .collapsible(false)
@@ -1045,6 +1880,7 @@ impl CsvEditorApp {
                 .default_size([460.0, 480.0]),
             self.dialog_position,
             ctx,
+            egui::vec2(460.0, 480.0),
         )
         .show(ctx, |ui| {
             let (Some(model), Some(ops)) = (self.model.clone(), self.ops.clone()) else {
@@ -1077,7 +1913,7 @@ impl CsvEditorApp {
     fn dialog_merge_files(&mut self, ctx: &egui::Context, open: &mut bool) {
         let mut keep = *open;
         let mut closed = false;
-        apply_dialog_pos(
+        apply_dialog_pos_sized(
             egui::Window::new("合并多个CSV文件")
                 .open(&mut keep)
                 .collapsible(false)
@@ -1085,6 +1921,7 @@ impl CsvEditorApp {
                 .default_size([760.0, 470.0]),
             self.dialog_position,
             ctx,
+            egui::vec2(760.0, 470.0),
         )
         .show(ctx, |ui| {
             ui.label("选择多个表头相同的 CSV 文件（可反复追加），校验表头后合并为一个数据集。");
@@ -1117,7 +1954,8 @@ impl CsvEditorApp {
             let headers = self.dialogs.merge_headers.clone();
             let mut remove_idx: Option<usize> = None;
             ui.group(|ui| {
-                ui.set_min_width(700.0);
+                // 固定最小宽度在窄屏上会把窗口撑出屏幕 → 不超过屏幕可用宽度
+                ui.set_min_width(700.0_f32.min(ui.ctx().screen_rect().width() - 80.0));
                 egui::ScrollArea::vertical()
                     .max_height(170.0)
                     .auto_shrink([false, false])
@@ -1235,7 +2073,10 @@ impl CsvEditorApp {
     fn dialog_help_guide(&mut self, ctx: &egui::Context, open: &mut bool) {
         let mut keep = *open;
         let mut closed = false;
-        apply_dialog_pos(
+        // 正文滚动区高度按屏幕计算：窗口高度随内容增长，若不限制，
+        // 小屏（或界面放大 1.5 倍）时窗口会顶到屏幕外，底部按钮点不到。
+        let help_scroll_h = (ctx.screen_rect().height() - 300.0).clamp(160.0, 520.0);
+        apply_dialog_pos_sized(
             egui::Window::new("使用说明")
                 .open(&mut keep)
                 .collapsible(false)
@@ -1243,12 +2084,14 @@ impl CsvEditorApp {
                 .default_size([800.0, 580.0]),
             self.dialog_position,
             ctx,
+            egui::vec2(800.0, 580.0),
         )
         .show(ctx, |ui| {
             ui.label(egui::RichText::new("宿经03超大CSV文件实用编辑器 · 使用说明").heading());
             ui.weak("专为超大 CSV 设计（实测 6.5GB / 901 万行流畅操作）。下面按使用顺序讲解，跟着做一遍就能上手。");
             ui.separator();
             egui::ScrollArea::vertical()
+                .max_height(help_scroll_h)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.collapsing("一、三步上手", |ui| {
@@ -1316,14 +2159,29 @@ impl CsvEditorApp {
                         ui.label("    结果窗可「最小化」成一条标题栏（结果不丢），稍后点标题栏左侧三角展开即可继续查看或导出；");
                         ui.weak("除「重复情况统计」的一键筛选外，统计本身不改变当前数据视图；只能选原始列统计（拆分/合并/复制/哈希产生的新列不参与）；分组数或不同取值超过上限时会提示改用取值较少的字段或先筛选缩小范围。");
                     });
-                    ui.collapsing("十、常见问题", |ui| {
+                    ui.collapsing("十、连接数据库（只读）", |ui| {
+                        ui.label("• 菜单「数据库」下可连接各主要数据库：MySQL / MariaDB、PostgreSQL、SQL Server、Oracle，以及「连接其它数据库（ODBC / DSN）」通用入口；");
+                        ui.label("• 在「连接数据库（只读）」窗口选择数据库类型（自动填入默认端口与已安装驱动），填写主机 / 端口 / 数据库名 / 用户名 / 密码；驱动名特殊的库（Oracle、达梦等）可勾选「手动编辑连接串」直接写 ODBC 连接串；");
+                        ui.label("• 「测试连接」只验证能否连通；「连接并浏览」成功后打开「数据库表（只读）」窗口：选库/模式 → 选表/视图 → 勾选字段 → 设置读取行数上限（默认 10 万，填 0 = 全部）→「载入到编辑器」；");
+                        ui.label("• 载入后的数据就是当前数据，可继续使用筛选、拆分、列操作、各类统计与导出等全部功能；");
+                        ui.label("• 「数据库表」窗口分两段：上段左侧是表/视图列表、右侧是字段列表（都按内容自适应高度，不会铺到底部），下段是通栏的数据预览（横跨窗口左右两侧，列多时可拖动横向滚动条查看；载入编辑器后不受限制）；");
+                        ui.label("• 取数是批量进行的（一次读取多行），百万行级表约 10 秒、千万行级约 1~2 分钟；读取行数上限越小越快，可用「上限」先试读；");
+                        ui.label("• 进度窗口会显示「已读取 N / 约 M 行（百分比）」（M 由数据库统计信息快速估算）；取不到估算时显示「已读取 N 行」+ 动画进度条；");
+                        ui.label("• 读出的数据先放在系统临时目录，软件在启动/退出/每次读取前会自动清理这些临时文件，也可用「设置 → 清理数据库临时文件」手动清理；");
+                        ui.label("• 窗口会按屏幕自适应、不会超出屏幕；关闭可点标题栏 ✕ 或按 Esc 键；");
+                        ui.label("• 「保存此连接」把配置存到 exe 同目录的「数据库连接配置.ini」，之后可从「数据库 → 已保存的连接」一键连接（只有勾选「同时保存密码」才会保存密码，且为明文）；");
+                        ui.weak("只读保证（两道保险）：连接以只读模式建立、软件只执行查询（SELECT 与库表元数据读取），且不提供 SQL 编辑框；MySQL / PostgreSQL 还会把会话设为只读，由数据库自己拒绝写操作。导出/拆分只写本机文件。");
+                        ui.weak("前置条件：需在本机安装目标数据库的 64 位 ODBC 驱动（MySQL Connector/ODBC、PostgreSQL psqlODBC、ODBC Driver 17/18 for SQL Server、Oracle ODBC Driver 等）；SQL Server / Access / Excel 驱动为 Windows 自带。");
+                    });
+                    ui.collapsing("十一、常见问题", |ui| {
+                        ui.label("• 连接数据库要装什么？ 需要目标数据库的 64 位 ODBC 驱动；连接窗口会列出本机已安装的驱动名。");
                         ui.label("• 打开很慢或卡住？ 读文件在后台进行，请看进度窗口与右下「操作日志」面板；");
                         ui.label("• 中文显示乱码？ 编码由软件自动识别；若结果异常，请在日志中确认识别到的编码；");
                         ui.label("• 中文输入只出现第一个字？ 该问题已在当前版本修复（若仍出现请反馈输入法名称）；");
                         ui.label("• 拆分产生文件太多？ 改用「按行数拆分」，或先筛选缩小数据范围；");
                         ui.label("• 程序启动无反应？ 请查看 exe 同目录的 csv_editor_rust.log（记录启动诊断信息）。");
                     });
-                    ui.collapsing("十一、支持开发者", |ui| {
+                    ui.collapsing("十二、支持开发者", |ui| {
                         ui.label("工具栏「❤ 自愿捐助」按钮中有微信收款码，感谢您的支持。");
                     });
                 });
@@ -1544,7 +2402,7 @@ impl CsvEditorApp {
         ensure_stats_limits(self, ctx);
         let mut keep = *open;
         let mut done = false;
-        apply_dialog_pos(
+        apply_dialog_pos_sized(
             egui::Window::new("字段分组汇总")
                 .open(&mut keep)
                 .collapsible(false)
@@ -1552,6 +2410,7 @@ impl CsvEditorApp {
                 .default_size([680.0, 540.0]),
             self.dialog_position,
             ctx,
+            egui::vec2(680.0, 540.0),
         )
         .show(ctx, |ui| {
             let header = self.header_names();
@@ -1737,7 +2596,7 @@ impl CsvEditorApp {
         ensure_stats_limits(self, ctx);
         let mut keep = *open;
         let mut done = false;
-        apply_dialog_pos(
+        apply_dialog_pos_sized(
             egui::Window::new("数值列统计")
                 .open(&mut keep)
                 .collapsible(false)
@@ -1745,6 +2604,7 @@ impl CsvEditorApp {
                 .default_size([600.0, 520.0]),
             self.dialog_position,
             ctx,
+            egui::vec2(600.0, 520.0),
         )
         .show(ctx, |ui| {
             let header = self.header_names();
@@ -1845,7 +2705,7 @@ impl CsvEditorApp {
     fn dialog_pivot_table(&mut self, ctx: &egui::Context, open: &mut bool) {
         let mut keep = *open;
         let mut done = false;
-        apply_dialog_pos(
+        apply_dialog_pos_sized(
             egui::Window::new("透视表")
                 .open(&mut keep)
                 .collapsible(false)
@@ -1853,6 +2713,7 @@ impl CsvEditorApp {
                 .default_size([680.0, 660.0]),
             self.dialog_position,
             ctx,
+            egui::vec2(680.0, 660.0),
         )
         .show(ctx, |ui| {
             let header = self.header_names();
@@ -2140,7 +3001,7 @@ impl CsvEditorApp {
         ensure_stats_limits(self, ctx);
         let mut keep = *open;
         let mut done = false;
-        apply_dialog_pos(
+        apply_dialog_pos_sized(
             egui::Window::new("交叉 / 关联统计")
                 .open(&mut keep)
                 .collapsible(false)
@@ -2148,6 +3009,7 @@ impl CsvEditorApp {
                 .default_size([600.0, 460.0]),
             self.dialog_position,
             ctx,
+            egui::vec2(600.0, 460.0),
         )
         .show(ctx, |ui| {
             let header = self.header_names();
@@ -2287,7 +3149,7 @@ impl CsvEditorApp {
         ensure_stats_limits(self, ctx);
         let mut keep = *open;
         let mut done = false;
-        apply_dialog_pos(
+        apply_dialog_pos_sized(
             egui::Window::new("重复情况统计")
                 .open(&mut keep)
                 .collapsible(false)
@@ -2295,6 +3157,7 @@ impl CsvEditorApp {
                 .default_size([600.0, 540.0]),
             self.dialog_position,
             ctx,
+            egui::vec2(600.0, 540.0),
         )
         .show(ctx, |ui| {
             let header = self.header_names();
@@ -2410,7 +3273,7 @@ impl CsvEditorApp {
     fn dialog_quality_stats(&mut self, ctx: &egui::Context, open: &mut bool) {
         let mut keep = *open;
         let mut done = false;
-        apply_dialog_pos(
+        apply_dialog_pos_sized(
             egui::Window::new("空值与数据质量统计")
                 .open(&mut keep)
                 .collapsible(false)
@@ -2418,6 +3281,7 @@ impl CsvEditorApp {
                 .default_size([600.0, 540.0]),
             self.dialog_position,
             ctx,
+            egui::vec2(600.0, 540.0),
         )
         .show(ctx, |ui| {
             let header = self.header_names();
@@ -2500,7 +3364,7 @@ impl CsvEditorApp {
         ensure_stats_limits(self, ctx);
         let mut keep = *open;
         let mut done = false;
-        apply_dialog_pos(
+        apply_dialog_pos_sized(
             egui::Window::new("取值频次分布 / Top-N")
                 .open(&mut keep)
                 .collapsible(false)
@@ -2508,6 +3372,7 @@ impl CsvEditorApp {
                 .default_size([600.0, 540.0]),
             self.dialog_position,
             ctx,
+            egui::vec2(600.0, 540.0),
         )
         .show(ctx, |ui| {
             let header = self.header_names();
@@ -2640,7 +3505,7 @@ impl CsvEditorApp {
         }
         // Arc：结果窗每帧渲染都共享同一份结果表，不复制数据
         let table = self.last_stats.clone();
-        apply_dialog_pos(
+        apply_dialog_pos_sized(
             egui::Window::new(title)
                 .open(&mut keep)
                 .collapsible(true)
@@ -2649,6 +3514,7 @@ impl CsvEditorApp {
                 .default_size([780.0, 540.0]),
             self.dialog_position,
             ctx,
+            egui::vec2(780.0, 540.0),
         )
         .show(ctx, |ui| {
             let Some(table) = table.as_ref() else {
@@ -2884,7 +3750,7 @@ impl CsvEditorApp {
             ctx,
         )
         .show(ctx, |ui| {
-            ui.set_min_width(360.0);
+            ui.set_min_width(360.0_f32.min(ui.ctx().screen_rect().width() - 80.0));
             ui.label("如果您愿意捐助钱款帮助开发者改进产品请微信扫码，万分感谢！");
             ui.add_space(6.0);
             ui.vertical_centered(|ui| {

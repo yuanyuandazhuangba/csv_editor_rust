@@ -3,6 +3,7 @@
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 
+use csv_editor_rust::core::db::{DbConn, TableInfo};
 use csv_editor_rust::core::dedup::DedupReport;
 use csv_editor_rust::core::merge::{FileHeader, HeaderCheck, MergeReport};
 use csv_editor_rust::core::model::DataModel;
@@ -31,6 +32,16 @@ pub enum BgMsg {
     StatsDone(std::sync::Arc<StatsTable>),
     /// 重复情况统计完成（含明细表与可直接落回视图的行号）
     DuplicateDone(std::sync::Arc<DuplicateReport>),
+    /// 数据库连接成功（连接对象, 连接描述, 库/模式列表）
+    DbConnected(std::sync::Arc<DbConn>, String, Vec<String>),
+    /// 数据库表列表读取完成（库/模式列表, 表清单）
+    DbTables(Vec<String>, Vec<TableInfo>),
+    /// 数据库表字段清单读取完成
+    DbColumns(Vec<String>),
+    /// 数据库表预览完成（表头, 数据行, 说明）
+    DbPreview(Vec<String>, Vec<Vec<String>>, String),
+    /// 数据库数据已导出为临时 CSV（路径, 行数）；随后按普通文件载入编辑器
+    DbExported(String, usize),
     /// 错误
     Error(String),
 }
