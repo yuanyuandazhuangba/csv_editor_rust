@@ -70,6 +70,24 @@ pub struct DialogStates {
     pub dup_cols: Vec<usize>,
     /// 明细列出前 N 个重复键（0 = 尚未初始化，界面按 100 处理）
     pub dup_top_n: usize,
+    // 数据分析：透视表
+    pub pivot_window: bool,
+    /// 行字段（视图列索引，1~2 个）
+    pub pivot_row_cols: Vec<usize>,
+    /// 列字段（视图列索引）
+    pub pivot_col: usize,
+    /// 值列（视图列索引）
+    pub pivot_value_col: usize,
+    /// 聚合方式（`stats::PIVOT_KINDS` 的下标）
+    pub pivot_kind: usize,
+    // 数据分析：交叉/关联统计
+    pub cross_window: bool,
+    /// A 字段（视图列索引）
+    pub cross_a: usize,
+    /// B 字段（视图列索引）
+    pub cross_b: usize,
+    /// 明细前 N 项（0 = 尚未初始化，界面按 100 处理）
+    pub cross_top_n: usize,
     // 数据分析：空值与数据质量统计
     pub quality_window: bool,
     /// 要检查的列（视图列索引）

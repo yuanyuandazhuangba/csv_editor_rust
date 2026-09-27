@@ -466,6 +466,144 @@ fn main() {
         }
     }
 
+    // 11. 透视表：行 × 列 × 值聚合（用求和核对「合计 == 各行/各列之和」）
+    if let (Some(c_row), Some(c_col), Some(c_val)) = (
+        col_of("数据来源_银行名称").or(group_col),
+        col_of("交易是否成功").or(col_of("收付标志")),
+        value_col,
+    ) {
+        let t = Instant::now();
+        match stats::pivot_table(
+            &m,
+            filtered.as_deref(),
+            &[c_row],
+            c_col,
+            c_val,
+            AggKind::Sum,
+            None,
+        ) {
+            Ok(tb) => {
+                // 核对：末行（合计行）各列 == 上面各行的对应列之和；末列 == 各行末列之和
+                let last = tb.rows.len().saturating_sub(1);
+                let col_ok = if tb.rows.len() > 1 {
+                    (1..tb.headers.len()).all(|ci| {
+                        let sum: f64 = tb.rows[..last]
+                            .iter()
+                            .map(|r| r.get(ci).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0))
+                            .sum();
+                        let total: f64 = tb.rows[last]
+                            .get(ci)
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        (sum - total).abs() < 0.01
+                    })
+                } else {
+                    true
+                };
+                println!(
+                    "OK  透视表 {}: {} 行 × {} 列（行字段「{}」× 列字段「{}」× 金额求和），核对 {} ({:.2}s)",
+                    if filtered.is_some() { "(当前筛选结果)" } else { "(全量)" },
+                    tb.rows.len(),
+                    tb.group_columns,
+                    header.get(c_row).cloned().unwrap_or_default(),
+                    header.get(c_col).cloned().unwrap_or_default(),
+                    if col_ok { "通过" } else { "未通过" },
+                    t.elapsed().as_secs_f64()
+                );
+                if !col_ok {
+                    fails += 1;
+                }
+                let sc = format!("{}\\e2e_pivot.csv", out_dir);
+                match export::export_rows_csv(&sc, &tb.headers, tb.rows.iter().cloned()) {
+                    Ok(n) => println!("OK  导出透视表 CSV: {} 行 -> {}", n, sc),
+                    Err(e) => {
+                        println!("FAIL 导出透视表 CSV: {}", e);
+                        fails += 1;
+                    }
+                }
+                let sx = format!("{}\\e2e_pivot.xlsx", out_dir);
+                match export::export_rows_xlsx(&sx, &tb.headers, tb.rows.iter().cloned()) {
+                    Ok(n) => println!("OK  导出透视表 XLSX: {} 行 -> {}", n, sx),
+                    Err(e) => {
+                        println!("FAIL 导出透视表 XLSX: {}", e);
+                        fails += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                println!("FAIL 透视表: {}", e);
+                fails += 1;
+            }
+        }
+    } else {
+        println!("WARN 无可用于透视表的列，跳过透视表");
+    }
+
+    // 12. 交叉 / 关联统计：两个字段的对应关系
+    if let (Some(c_a), Some(c_b)) = (col_of("交易时间").or(value_col), group_col) {
+        let t = Instant::now();
+        match stats::cross_stats(&m, filtered.as_deref(), c_a, c_b, 1000, None) {
+            Ok(rep) => {
+                // 核对：明细各行「对应 B 的不同值数」之和 == 组合数；各行「行数」之和 == 统计范围行数
+                let sum_pairs: u64 = rep
+                    .table
+                    .rows
+                    .iter()
+                    .filter(|r| !r[0].starts_with("(其余"))
+                    .filter_map(|r| r[2].parse::<u64>().ok())
+                    .sum();
+                let sum_rows: u64 = rep
+                    .table
+                    .rows
+                    .iter()
+                    .filter(|r| !r[0].starts_with("(其余"))
+                    .filter_map(|r| r[1].parse::<u64>().ok())
+                    .sum();
+                let ok = sum_pairs as usize == rep.pairs
+                    && sum_rows as usize == rep.input_rows
+                    && rep.max_b_per_a <= rep.b_values
+                    && rep.max_a_per_b <= rep.a_values;
+                println!(
+                    "OK  交叉统计 {}: {}，核对 {} ({:.2}s)",
+                    if filtered.is_some() { "(当前筛选结果)" } else { "(全量)" },
+                    rep.summary(),
+                    if ok { "通过" } else { "未通过" },
+                    t.elapsed().as_secs_f64()
+                );
+                if let Some(top) = rep.table.rows.first() {
+                    println!("      明细首行：{:?}", top);
+                }
+                if !ok {
+                    fails += 1;
+                }
+                let mut tb = rep.table.clone();
+                tb.notes.insert(0, rep.summary());
+                let sc = format!("{}\\e2e_cross.csv", out_dir);
+                match export::export_rows_csv(&sc, &tb.headers, tb.rows.iter().cloned()) {
+                    Ok(n) => println!("OK  导出交叉统计 CSV: {} 项 -> {}", n, sc),
+                    Err(e) => {
+                        println!("FAIL 导出交叉统计 CSV: {}", e);
+                        fails += 1;
+                    }
+                }
+                let sx = format!("{}\\e2e_cross.xlsx", out_dir);
+                match export::export_rows_xlsx(&sx, &tb.headers, tb.rows.iter().cloned()) {
+                    Ok(n) => println!("OK  导出交叉统计 XLSX: {} 项 -> {}", n, sx),
+                    Err(e) => {
+                        println!("FAIL 导出交叉统计 XLSX: {}", e);
+                        fails += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                println!("FAIL 交叉/关联统计: {}", e);
+                fails += 1;
+            }
+        }
+    } else {
+        println!("WARN 无可用于交叉统计的列，跳过交叉统计");
+    }
+
     if fails == 0 {
         println!("=== 端到端回归: 全部通过 ===");    } else {
         println!("=== 端到端回归: {} 项失败 ===", fails);

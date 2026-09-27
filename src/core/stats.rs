@@ -137,6 +137,10 @@ pub enum StatsKind {
     DuplicateCheck,
     /// 空值与数据质量统计
     DataQuality,
+    /// 透视表（行字段 × 列字段 × 值聚合）
+    Pivot,
+    /// 交叉/关联统计（A 与 B 的对应关系）
+    CrossTab,
 }
 
 impl StatsKind {
@@ -148,6 +152,8 @@ impl StatsKind {
             StatsKind::ValueFrequency => "频次分布",
             StatsKind::DuplicateCheck => "重复情况",
             StatsKind::DataQuality => "数据质量",
+            StatsKind::Pivot => "透视表",
+            StatsKind::CrossTab => "交叉统计",
         }
     }
 
@@ -159,6 +165,8 @@ impl StatsKind {
             StatsKind::ValueFrequency => "频次分布结果",
             StatsKind::DuplicateCheck => "重复情况结果",
             StatsKind::DataQuality => "数据质量结果",
+            StatsKind::Pivot => "透视表结果",
+            StatsKind::CrossTab => "交叉统计结果",
         }
     }
 
@@ -170,6 +178,8 @@ impl StatsKind {
             StatsKind::ValueFrequency => "频次分布",
             StatsKind::DuplicateCheck => "重复情况",
             StatsKind::DataQuality => "数据质量",
+            StatsKind::Pivot => "透视表",
+            StatsKind::CrossTab => "交叉统计",
         }
     }
 }
@@ -207,6 +217,8 @@ impl StatsTable {
             StatsKind::ValueFrequency => "项",
             StatsKind::DuplicateCheck => "项",
             StatsKind::DataQuality => "列",
+            StatsKind::Pivot => "行",
+            StatsKind::CrossTab => "项",
         }
     }
 
@@ -237,6 +249,18 @@ impl StatsTable {
             StatsKind::DataQuality => {
                 format!("统计范围 {} 行 → {} 列", self.input_rows, self.rows.len())
             }
+            StatsKind::Pivot => format!(
+                "统计范围 {} 行 → {} 行 × {} 列（含合计行列）",
+                self.input_rows,
+                self.rows.len().saturating_sub(1),
+                self.group_columns
+            ),
+            StatsKind::CrossTab => format!(
+                "统计范围 {} 行 → {} 个 {}（含汇总说明）",
+                self.input_rows,
+                self.rows.len(),
+                self.row_unit()
+            ),
         }
     }
 }
@@ -1123,6 +1147,531 @@ fn duplicate_stats_with_max_keys(
         dup_rows,
         unique_rows,
     })
+}
+
+/// 交叉统计可容纳的不同 (A,B) 组合数上限（超出报错，提示先筛选缩小范围）
+const MAX_CROSS_PAIRS: usize = 1_000_000;
+/// 交叉统计明细里每个 A 最多列出几个 B 取值作为示例
+const CROSS_SAMPLE_MAX: usize = 5;
+/// 交叉统计明细允许的最大 Top-N
+pub const MAX_CROSS_TOP_N: usize = 1000;
+
+/// 「交叉/关联统计」的结果：关系判定 + 明细表
+#[derive(Debug, Clone)]
+pub struct CrossReport {
+    /// 明细表（每个 A 一行：行数 / 对应 B 的不同值数 / B 取值示例）
+    pub table: StatsTable,
+    /// A 字段名
+    pub a_name: String,
+    /// B 字段名
+    pub b_name: String,
+    /// 统计范围行数
+    pub input_rows: usize,
+    /// A 的不同取值个数
+    pub a_values: usize,
+    /// B 的不同取值个数
+    pub b_values: usize,
+    /// 不同 (A,B) 组合数
+    pub pairs: usize,
+    /// 单个 A 最多对应多少个不同 B
+    pub max_b_per_a: usize,
+    /// 单个 B 最多对应多少个不同 A
+    pub max_a_per_b: usize,
+    /// 关系判定（一对一 / 一对多 / 多对一 / 多对多）
+    pub relation: &'static str,
+}
+
+impl CrossReport {
+    /// 一句话摘要（结果窗与日志用）
+    pub fn summary(&self) -> String {
+        format!(
+            "统计范围 {} 行 → 「{}」{} 个取值、「{}」{} 个取值、组合 {} 对；关系：{}",
+            self.input_rows,
+            self.a_name,
+            self.a_values,
+            self.b_name,
+            self.b_values,
+            self.pairs,
+            self.relation
+        )
+    }
+}
+
+/// 交叉/关联统计：看两个字段之间的对应关系（例：「同一卡号对应多少个账号」）。
+///
+/// 输出：
+/// - 关系判定：一对一 / 一对多（一个 A 对应多个 B）/ 多对一 / 多对多，
+///   同时给出两个方向的「最大对应数」（单个 A 最多对应几个 B、单个 B 最多对应几个 A）；
+/// - 明细：每个 A 一行 —— 行数、对应 B 的不同值数、B 取值示例（最多
+///   [`CROSS_SAMPLE_MAX`] 个），按「对应 B 的不同值数」降序（最"发散"的排前面）。
+///
+/// 口径说明：按**原值**比较（与去重一致），空值作为一种正常取值参与（示例里显示为 `(空)`）。
+/// 内存护栏：不同 (A,B) 组合数 ≤ [`MAX_CROSS_PAIRS`]，A 的不同取值 ≤ [`MAX_GROUPS`]。
+/// 单线程（需要同时维护双向映射，与去重/重复统计同理）。
+pub fn cross_stats(
+    model: &DataModel,
+    rows: Option<&[u32]>,
+    a_col: usize,
+    b_col: usize,
+    top_n: usize,
+    progress: Option<&(dyn Fn(f64) + Sync)>,
+) -> Result<CrossReport, String> {
+    let column_count = model.column_count();
+    if a_col >= column_count || b_col >= column_count {
+        return Err("字段无效（列可能已删除或隐藏）".to_string());
+    }
+    if a_col == b_col {
+        return Err("两个字段不能相同（同一个字段的交叉没有意义）".to_string());
+    }
+    let top_n = top_n.clamp(1, MAX_CROSS_TOP_N);
+    let a_name = column_name(model, a_col);
+    let b_name = column_name(model, b_col);
+    let total = rows.map(|v| v.len()).unwrap_or_else(|| model.row_count());
+
+    // A 侧：保序（首次出现）+ 行数 + 该 A 的 B 取值集合；B 侧：B → A 取值集合
+    let mut a_index: HashMap<String, usize> = HashMap::new();
+    let mut a_keys: Vec<String> = Vec::new();
+    let mut a_rows: Vec<u64> = Vec::new();
+    let mut a_bsets: Vec<HashSet<String>> = Vec::new();
+    let mut b_map: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut pairs: usize = 0;
+
+    let mut reader = RowReader::new(vec![a_col, b_col]);
+    for i in 0..total {
+        let row = match rows {
+            Some(list) => list[i] as usize,
+            None => i,
+        };
+        reader.load(model.file(), row);
+        let av = reader.value(a_col);
+        let bv = reader.value(b_col);
+        let aidx = match a_index.get(av) {
+            Some(&i) => i,
+            None => {
+                if a_keys.len() >= MAX_GROUPS {
+                    return Err(format!(
+                        "「{}」的不同取值超过上限 {}：请先用筛选缩小范围",
+                        a_name, MAX_GROUPS
+                    ));
+                }
+                let i = a_keys.len();
+                a_index.insert(av.to_string(), i);
+                a_keys.push(av.to_string());
+                a_rows.push(0);
+                a_bsets.push(HashSet::new());
+                i
+            }
+        };
+        a_rows[aidx] += 1;
+        if !a_bsets[aidx].contains(bv) {
+            a_bsets[aidx].insert(bv.to_string());
+            pairs += 1;
+            if pairs > MAX_CROSS_PAIRS {
+                return Err(format!(
+                    "「{}×{}」的不同组合数超过上限 {}：请先用筛选缩小范围",
+                    a_name, b_name, MAX_CROSS_PAIRS
+                ));
+            }
+        }
+        match b_map.get_mut(bv) {
+            Some(set) => {
+                if !set.contains(av) {
+                    set.insert(av.to_string());
+                }
+            }
+            None => {
+                let mut set = HashSet::new();
+                set.insert(av.to_string());
+                b_map.insert(bv.to_string(), set);
+            }
+        }
+        if let Some(p) = progress {
+            if i % 50_000 == 0 {
+                p(i as f64 / total.max(1) as f64);
+            }
+        }
+    }
+    if let Some(p) = progress {
+        p(1.0);
+    }
+
+    // 关系判定：两个方向是否存在"一对多"
+    let a_values = a_keys.len();
+    let b_values = b_map.len();
+    let max_b_per_a = a_bsets.iter().map(|s| s.len()).max().unwrap_or(0);
+    let max_a_per_b = b_map.values().map(|s| s.len()).max().unwrap_or(0);
+    let relation = match (max_b_per_a > 1, max_a_per_b > 1) {
+        (false, false) => "一对一（每个取值互相唯一对应）",
+        (true, false) => "一对多（一个取值对应多个对方取值）",
+        (false, true) => "多对一（多个取值对应同一个对方取值）",
+        (true, true) => "多对多（两侧都存在一对多）",
+    };
+
+    // 明细：按「对应 B 的不同值数」降序 → 行数降序 → A 值升序
+    let mut order: Vec<usize> = (0..a_values).collect();
+    order.sort_by(|&x, &y| {
+        a_bsets[y]
+            .len()
+            .cmp(&a_bsets[x].len())
+            .then_with(|| a_rows[y].cmp(&a_rows[x]))
+            .then_with(|| a_keys[x].cmp(&a_keys[y]))
+    });
+
+    let headers: Vec<String> = vec![
+        a_name.clone(),
+        "行数".to_string(),
+        format!("对应「{}」的不同值数", b_name),
+        format!("「{}」取值示例", b_name),
+    ];
+    let mut out_rows: Vec<Vec<String>> = Vec::with_capacity(order.len() + 1);
+    let shown = top_n.min(order.len());
+    for &aidx in order.iter().take(shown) {
+        let mut sample: Vec<&String> = a_bsets[aidx].iter().collect();
+        sample.sort();
+        let sample_text = if sample.len() <= CROSS_SAMPLE_MAX {
+            sample
+                .iter()
+                .map(|s| display_value(s))
+                .collect::<Vec<_>>()
+                .join("、")
+        } else {
+            format!(
+                "{}…（共 {} 个）",
+                sample[..CROSS_SAMPLE_MAX]
+                    .iter()
+                    .map(|s| display_value(s))
+                    .collect::<Vec<_>>()
+                    .join("、"),
+                sample.len()
+            )
+        };
+        out_rows.push(vec![
+            display_value(&a_keys[aidx]),
+            a_rows[aidx].to_string(),
+            a_bsets[aidx].len().to_string(),
+            sample_text,
+        ]);
+    }
+    if order.len() > shown {
+        let rest: usize = order.len() - shown;
+        out_rows.push(vec![
+            format!("(其余 {} 个取值)", rest),
+            String::new(),
+            String::new(),
+            String::new(),
+        ]);
+    }
+
+    let mut table = StatsTable {
+        kind: StatsKind::CrossTab,
+        headers,
+        rows: out_rows,
+        input_rows: total,
+        group_columns: 0,
+        aggs: a_values,
+        notes: Vec::new(),
+    };
+    table.notes.push(format!(
+        "「{}」{} 个取值、「{}」{} 个取值、不同组合 {} 对；关系判定：{}",
+        a_name, a_values, b_name, b_values, pairs, relation
+    ));
+    table.notes.push(format!(
+        "单个「{}」最多对应 {} 个「{}」；单个「{}」最多对应 {} 个「{}」",
+        a_name, max_b_per_a, b_name, b_name, max_a_per_b, a_name
+    ));
+    table.notes.push(
+        "按原值比较（与去重一致），空值作为正常取值参与（示例里显示为「(空)」）；\
+         「取值示例」最多列 5 个，超出只显示前几个与总数"
+            .to_string(),
+    );
+
+    Ok(CrossReport {
+        table,
+        a_name,
+        b_name,
+        input_rows: total,
+        a_values,
+        b_values,
+        pairs,
+        max_b_per_a,
+        max_a_per_b,
+        relation,
+    })
+}
+
+/// 展示用的取值文本（空值显示为 `(空)`，与频次分布的约定一致）
+fn display_value(s: &str) -> String {
+    if s.trim().is_empty() {
+        "(空)".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// 透视表界面可选的聚合方式（「去重计数」不在其中：[`pivot_table`] 会拒绝）
+pub const PIVOT_KINDS: [AggKind; 5] = [
+    AggKind::Sum,
+    AggKind::Avg,
+    AggKind::Max,
+    AggKind::Min,
+    AggKind::Count,
+];
+
+/// 透视表的列字段取值个数上限（超出报错：列太多既看不清也意义有限）
+const MAX_PIVOT_COLUMNS: usize = 200;
+/// 透视表的单元格总数上限（行组合 × 出现过的列取值；每个单元格一个聚合器，约 60MB）
+const MAX_PIVOT_CELLS: usize = 500_000;
+
+/// 透视表（行字段 × 列字段 × 值聚合）。
+///
+/// 语义：
+/// - 行 = `row_cols`（1~2 个字段）的取值组合，列 = `col_col` 的各个取值，
+///   单元格 = `value_col` 在 `kind`（求和/均值/最小/最大/计数）下的聚合值；
+/// - 末行「(合计)」是各列的**整体聚合**（不是把各行相加）——所以均值、计数这类
+///   非可加聚合在合计行依然正确；每行末尾也是该行的整体聚合；
+/// - 列顺序按**列字段取值升序**（稳定、可预测；日期字符串升序即时间顺序）；
+///   空值的列名显示为 `(空)`；行顺序为行键首次出现顺序（与分组汇总一致）；
+/// - 没有数据的单元格留空（与"聚合结果为 0"区分开）。
+///
+/// 护栏：行组合数 ≤ [`MAX_GROUPS`]、列字段取值 ≤ [`MAX_PIVOT_COLUMNS`]、
+/// 单元格总数 ≤ [`MAX_PIVOT_CELLS`]（超出均报错并提示改用分组汇总或先筛选）；
+/// 不支持「去重计数」（每个单元格一个集合，内存不可控，可用分组汇总替代）。
+pub fn pivot_table(
+    model: &DataModel,
+    rows: Option<&[u32]>,
+    row_cols: &[usize],
+    col_col: usize,
+    value_col: usize,
+    kind: AggKind,
+    progress: Option<&(dyn Fn(f64) + Sync)>,
+) -> Result<StatsTable, String> {
+    let column_count = model.column_count();
+    // 行字段：丢弃越界列，保持用户顺序
+    let mut rcols: Vec<usize> = Vec::new();
+    for &c in row_cols {
+        if c < column_count && !rcols.contains(&c) {
+            rcols.push(c);
+        }
+    }
+    if rcols.is_empty() {
+        return Err("请至少选择一个有效的行字段（列可能已删除或隐藏）".to_string());
+    }
+    if rcols.len() > MAX_GROUP_COLUMNS {
+        return Err(format!("行字段最多 {} 个", MAX_GROUP_COLUMNS));
+    }
+    if col_col >= column_count {
+        return Err("列字段无效（列可能已删除或隐藏）".to_string());
+    }
+    if value_col >= column_count {
+        return Err("值列无效（列可能已删除或隐藏）".to_string());
+    }
+    if rcols.contains(&col_col) {
+        return Err("列字段不能与行字段相同".to_string());
+    }
+    if kind == AggKind::DistinctCount {
+        return Err(
+            "透视表不支持「去重计数」（每个单元格都要维护一个值集合，内存不可控）；\
+             如需此口径请用「字段分组汇总」按两个字段分组"
+                .to_string(),
+        );
+    }
+
+    let total = rows.map(|v| v.len()).unwrap_or_else(|| model.row_count());
+    let mut row_index: HashMap<String, usize> = HashMap::new();
+    let mut row_keys: Vec<String> = Vec::new();
+    let mut row_aggs: Vec<RowPivot> = Vec::new();
+    let mut col_index: HashMap<String, usize> = HashMap::new();
+    let mut col_values: Vec<String> = Vec::new();
+    let mut cells_total: usize = 0;
+    let mut grand = Acc::new(kind);
+
+    // 只读这三类列（RowReader 整行只解析一次）
+    let mut need: Vec<usize> = rcols.clone();
+    need.push(col_col);
+    need.push(value_col);
+    let mut reader = RowReader::new(need);
+    let mut key = String::with_capacity(128);
+    for i in 0..total {
+        let row = match rows {
+            Some(list) => list[i] as usize,
+            None => i,
+        };
+        reader.load(model.file(), row);
+        key.clear();
+        for (k, &c) in rcols.iter().enumerate() {
+            if k > 0 {
+                key.push('\u{1F}');
+            }
+            key.push_str(reader.value(c));
+        }
+        let ridx = match row_index.get(key.as_str()) {
+            Some(&i) => i,
+            None => {
+                if row_aggs.len() >= MAX_GROUPS {
+                    return Err(format!(
+                        "透视表的行组合数超过上限 {}：请减少行字段、或先用筛选缩小范围",
+                        MAX_GROUPS
+                    ));
+                }
+                let i = row_aggs.len();
+                row_index.insert(key.clone(), i);
+                row_keys.push(key.clone());
+                row_aggs.push(RowPivot::new(kind));
+                i
+            }
+        };
+        let cv = reader.value(col_col);
+        if !col_index.contains_key(cv) {
+            if col_values.len() >= MAX_PIVOT_COLUMNS {
+                return Err(format!(
+                    "列字段的不同取值超过上限 {}：请改用取值较少的列字段，\
+                     或先筛选缩小范围（也可用「字段分组汇总」按两个字段分组）",
+                    MAX_PIVOT_COLUMNS
+                ));
+            }
+            col_index.insert(cv.to_string(), col_values.len());
+            col_values.push(cv.to_string());
+        }
+        let value = reader.value(value_col);
+        // 单元格（借用分开：先更新 cells，再更新行合计，避免同时可变借用同一结构）
+        let cell_missing = {
+            let ra = &mut row_aggs[ridx];
+            ra.rows += 1;
+            match ra.cells.get_mut(cv) {
+                Some(acc) => {
+                    acc.push(kind, value);
+                    false
+                }
+                None => true,
+            }
+        };
+        if cell_missing {
+            if cells_total >= MAX_PIVOT_CELLS {
+                return Err(format!(
+                    "透视表的单元格数超过上限 {}：请减少行字段、换一个列字段，或先筛选缩小范围",
+                    MAX_PIVOT_CELLS
+                ));
+            }
+            cells_total += 1;
+            let mut acc = Acc::new(kind);
+            acc.push(kind, value);
+            row_aggs[ridx].cells.insert(cv.to_string(), acc);
+        }
+        row_aggs[ridx].total.push(kind, value);
+        grand.push(kind, value);
+        if let Some(p) = progress {
+            if i % 50_000 == 0 {
+                p(i as f64 / total.max(1) as f64);
+            }
+        }
+    }
+    if let Some(p) = progress {
+        p(1.0);
+    }
+
+    // 列顺序：取值升序（空值排在最前，作为「(空)」列）
+    let mut col_sorted = col_values.clone();
+    col_sorted.sort_unstable();
+
+    // 表头：行字段名… + 各列取值 + 合计
+    let mut headers: Vec<String> = rcols.iter().map(|&c| column_name(model, c)).collect();
+    for cv in &col_sorted {
+        headers.push(if cv.is_empty() {
+            "(空)".to_string()
+        } else {
+            cv.clone()
+        });
+    }
+    headers.push("(合计)".to_string());
+
+    let mut out_rows: Vec<Vec<String>> = Vec::with_capacity(row_aggs.len() + 1);
+    for (key, ra) in row_keys.iter().zip(row_aggs.iter()) {
+        let mut row: Vec<String> = Vec::with_capacity(headers.len());
+        for part in key.splitn(rcols.len(), '\u{1F}') {
+            row.push(part.to_string());
+        }
+        while row.len() < rcols.len() {
+            row.push(String::new());
+        }
+        for cv in &col_sorted {
+            row.push(match ra.cells.get(cv) {
+                Some(acc) => acc.finish(kind),
+                None => String::new(), // 没有数据的单元格留空
+            });
+        }
+        row.push(ra.total.finish(kind));
+        out_rows.push(row);
+    }
+    // 末行合计：逐列的整体聚合（各自的累加器，不是把行相加）
+    if total > 0 {
+        let mut row: Vec<String> = vec!["(合计)".to_string()];
+        while row.len() < rcols.len() {
+            row.push(String::new());
+        }
+        for cv in &col_sorted {
+            let mut acc = Acc::new(kind);
+            for ra in row_aggs.iter() {
+                if let Some(cell) = ra.cells.get(cv) {
+                    acc.merge(cell);
+                }
+            }
+            row.push(acc.finish(kind));
+        }
+        row.push(grand.finish(kind));
+        out_rows.push(row);
+    }
+
+    let row_name = rcols
+        .iter()
+        .map(|&c| column_name(model, c))
+        .collect::<Vec<_>>()
+        .join("、");
+    let mut table = StatsTable {
+        kind: StatsKind::Pivot,
+        headers,
+        rows: out_rows,
+        input_rows: total,
+        group_columns: col_sorted.len(),
+        aggs: 0,
+        notes: Vec::new(),
+    };
+    table.notes.push(format!(
+        "行字段：{}；列字段：{}；值：{}({})",
+        row_name,
+        column_name(model, col_col),
+        column_name(model, value_col),
+        kind.label()
+    ));
+    table.notes.push(format!(
+        "列字段共 {} 个取值（按取值升序排列，空值为「(空)」列）；没有数据的单元格留空",
+        col_sorted.len()
+    ));
+    table.notes.push(
+        "每行末尾的「(合计)」是该行的整体聚合，末行是各列的整体聚合 —— 均值/计数等\
+         非可加指标因此在合计处依然正确（不是把各行数值相加）"
+            .to_string(),
+    );
+    Ok(table)
+}
+
+/// 透视表的一行：单元格 + 行合计
+struct RowPivot {
+    /// 列值 → 单元格聚合器（借用查询时避免重复分配）
+    cells: HashMap<String, Acc>,
+    /// 该行的整体聚合（行末「(合计)」列）
+    total: Acc,
+    /// 该行参与统计的行数
+    rows: u64,
+}
+
+impl RowPivot {
+    fn new(kind: AggKind) -> Self {
+        Self {
+            cells: HashMap::new(),
+            total: Acc::new(kind),
+            rows: 0,
+        }
+    }
 }
 
 /// 「空值与数据质量统计」的指标表头（每列一行）
@@ -2520,6 +3069,199 @@ mod tests {
         assert_eq!(r[5], "3000", "含控制字符数");
         assert_eq!(r[6], "2", "最短长度（北京）");
         assert_eq!(r[7], "4", "最长长度（abc\\t）");
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ===== 透视表（pivot_table）=====
+
+    #[test]
+    fn pivot_table_sums_by_row_and_column() {
+        // 行=城市、列=月份、值=金额求和
+        let p = write_temp(
+            "城市,月份,金额\n北京,1,10\n北京,2,20\n上海,1,5\n北京,1,30\n上海,3,7\n".as_bytes(),
+            "_pv1.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = pivot_table(&m, None, &[0], 1, 2, AggKind::Sum, None).unwrap();
+        assert_eq!(t.kind, StatsKind::Pivot);
+        assert_eq!(t.headers, vec!["城市", "1", "2", "3", "(合计)"]);
+        // 行序 = 行键首次出现顺序：北京、上海
+        // 列序 = 取值升序：1、2、3；无数据的单元格留空
+        assert_eq!(t.rows[0], vec!["北京", "40", "20", "", "60"]);
+        assert_eq!(t.rows[1], vec!["上海", "5", "", "7", "12"]);
+        // 末行 = 各列的整体聚合
+        assert_eq!(t.rows[2], vec!["(合计)", "45", "20", "7", "72"]);
+        assert_eq!(t.group_columns, 3, "列字段取值个数");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn pivot_table_average_total_is_overall_not_sum_of_rows() {
+        // 均值：合计行必须是整体均值（不是把各行均值相加）
+        let p = write_temp(
+            "组,列,值\nA,x,10\nA,x,30\nB,x,0\n".as_bytes(),
+            "_pv2.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = pivot_table(&m, None, &[0], 1, 2, AggKind::Avg, None).unwrap();
+        // A 的均值 = 20、B 的均值 = 0；x 列整体均值 = (10+30+0)/3 = 13.333333
+        assert_eq!(t.rows[0], vec!["A", "20", "20"]);
+        assert_eq!(t.rows[1], vec!["B", "0", "0"]);
+        assert_eq!(t.rows[2], vec!["(合计)", "13.333333", "13.333333"]);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn pivot_table_multi_row_fields_and_empty_column() {
+        // 两个行字段（组合键）+ 列字段里的空值显示为「(空)」列
+        let p = write_temp(
+            "省,市,渠道,金额\n江苏,南京,线上,10\n江苏,南京,,20\n江苏,苏州,线上,5\n".as_bytes(),
+            "_pv3.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = pivot_table(&m, None, &[0, 1], 2, 3, AggKind::Sum, None).unwrap();
+        assert_eq!(t.headers, vec!["省", "市", "(空)", "线上", "(合计)"]);
+        assert_eq!(t.rows[0], vec!["江苏", "南京", "20", "10", "30"]);
+        assert_eq!(t.rows[1], vec!["江苏", "苏州", "", "5", "5"]);
+        assert_eq!(t.rows[2], vec!["(合计)", "", "20", "15", "35"]);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn pivot_table_counts_and_row_subset() {
+        // 计数（非空）+ 统计范围取行子集
+        let p = write_temp(
+            "组,列,值\nA,x,1\nA,x,\nA,y,2\nB,y,3\n".as_bytes(),
+            "_pv4.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = pivot_table(&m, None, &[0], 1, 2, AggKind::Count, None).unwrap();
+        // A×x 的非空计数 = 1（另一行为空）、A×y = 1、B×y = 1
+        assert_eq!(t.rows[0], vec!["A", "1", "1", "2"]);
+        assert_eq!(t.rows[1], vec!["B", "", "1", "1"]);
+        assert_eq!(t.rows[2], vec!["(合计)", "1", "2", "3"]);
+        // 行子集：只看第 0、1 行（都属 A×x）
+        let t2 = pivot_table(&m, Some(&[0, 1]), &[0], 1, 2, AggKind::Count, None).unwrap();
+        assert_eq!(t2.input_rows, 2);
+        assert_eq!(t2.rows[0], vec!["A", "1", "1"]);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn pivot_table_rejects_invalid_inputs() {
+        let p = write_temp("A,B,C\nx,y,1\n".as_bytes(), "_pv5.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        assert!(pivot_table(&m, None, &[], 1, 2, AggKind::Sum, None).is_err(), "无行字段");
+        assert!(pivot_table(&m, None, &[9], 1, 2, AggKind::Sum, None).is_err(), "行字段越界");
+        assert!(pivot_table(&m, None, &[0], 9, 2, AggKind::Sum, None).is_err(), "列字段越界");
+        assert!(pivot_table(&m, None, &[0], 1, 9, AggKind::Sum, None).is_err(), "值列越界");
+        assert!(
+            pivot_table(&m, None, &[0], 0, 2, AggKind::Sum, None).is_err(),
+            "列字段与行字段相同"
+        );
+        let err = pivot_table(&m, None, &[0], 1, 2, AggKind::DistinctCount, None).unwrap_err();
+        assert!(err.contains("去重计数"), "{err}");
+        // 空范围：只有表头（无行、无合计行）
+        let t = pivot_table(&m, Some(&[]), &[0], 1, 2, AggKind::Sum, None).unwrap();
+        assert!(t.rows.is_empty());
+        assert_eq!(t.kind.file_stem(), "透视表");
+        assert_eq!(t.kind.title(), "透视表结果");
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ===== 交叉/关联统计（cross_stats）=====
+
+    #[test]
+    fn cross_stats_one_to_many_relation() {
+        // 卡号 → 账号：一个卡号对应多个账号（一对多）
+        let p = write_temp(
+            "卡号,账号\nK1,A1\nK1,A2\nK2,A1\nK2,A3\n".as_bytes(),
+            "_cx1.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let r = cross_stats(&m, None, 0, 1, 100, None).unwrap();
+        assert_eq!(r.a_values, 2);
+        assert_eq!(r.b_values, 3);
+        assert_eq!(r.pairs, 4);
+        assert_eq!(r.max_b_per_a, 2);
+        assert_eq!(r.max_a_per_b, 2);
+        assert!(r.relation.starts_with("多对多"), "{}", r.relation);
+        assert_eq!(r.table.kind, StatsKind::CrossTab);
+        assert_eq!(
+            r.table.headers,
+            vec!["卡号", "行数", "对应「账号」的不同值数", "「账号」取值示例"]
+        );
+        // 明细按「对应 B 的不同值数」降序，再按行数、取值升序 → K1 与 K2 都是 2 个 B、2 行 → 按取值升序 K1 在前
+        assert_eq!(r.table.rows[0], vec!["K1", "2", "2", "A1、A2"]);
+        assert_eq!(r.table.rows[1], vec!["K2", "2", "2", "A1、A3"]);
+        assert!(r.summary().contains("组合 4 对"), "{}", r.summary());
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn cross_stats_one_to_one_and_many_to_one() {
+        // 一对一：ID ↔ 卡号 一一对应
+        let p = write_temp("ID,卡号\n1,K1\n2,K2\n3,K3\n".as_bytes(), "_cx2.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let r = cross_stats(&m, None, 0, 1, 100, None).unwrap();
+        assert!(r.relation.starts_with("一对一"), "{}", r.relation);
+        assert_eq!(r.pairs, 3);
+        assert_eq!(r.max_b_per_a, 1);
+        assert_eq!(r.max_a_per_b, 1);
+
+        // 多对一：多个账号指向同一个卡号（B→A 一侧一对多）
+        let p2 = write_temp("账号,卡号\nA1,K1\nA2,K1\n".as_bytes(), "_cx3.csv");
+        let m2 = DataModel::open(&p2, 100).unwrap();
+        let r2 = cross_stats(&m2, None, 0, 1, 100, None).unwrap();
+        assert!(r2.relation.starts_with("多对一"), "{}", r2.relation);
+        assert_eq!(r2.max_b_per_a, 1);
+        assert_eq!(r2.max_a_per_b, 2);
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(&p2).ok();
+    }
+
+    #[test]
+    fn cross_stats_samples_top_n_and_notes() {
+        // 取值示例超过 5 个时只列前 5 个并给出总数；明细 Top-N 截断
+        let mut data = String::from("A,B\n");
+        for j in 0..8 {
+            data.push_str(&format!("a1,b{}\n", j));
+        }
+        data.push_str("a2,b0\n");
+        let p = write_temp(data.as_bytes(), "_cx4.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let r = cross_stats(&m, None, 0, 1, 100, None).unwrap();
+        let sample = &r.table.rows[0][3];
+        assert!(sample.starts_with("b0、b1、b2、b3、b4"), "{sample}");
+        assert!(sample.contains("共 8 个"), "{sample}");
+        assert!(r.table.notes.iter().any(|n| n.contains("最多对应 8 个")));
+
+        // Top-1：只列第一个（a1），其余汇总为一行
+        let r2 = cross_stats(&m, None, 0, 1, 1, None).unwrap();
+        assert_eq!(r2.table.rows.len(), 2);
+        assert_eq!(r2.table.rows[0][0], "a1");
+        assert_eq!(r2.table.rows[1][0], "(其余 1 个取值)");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn cross_stats_handles_empty_and_invalid() {
+        let p = write_temp("A,B\nx,\nx,y\n".as_bytes(), "_cx5.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let r = cross_stats(&m, None, 0, 1, 100, None).unwrap();
+        // 空值作为一种取值参与，示例里显示为「(空)」
+        assert_eq!(r.table.rows[0][0], "x");
+        assert_eq!(r.table.rows[0][2], "2");
+        assert!(r.table.rows[0][3].contains("(空)"), "{:?}", r.table.rows[0]);
+        // 非法输入
+        assert!(cross_stats(&m, None, 0, 0, 100, None).is_err(), "同字段");
+        assert!(cross_stats(&m, None, 9, 1, 100, None).is_err(), "越界");
+        // 空范围：无明细，关系为"一对一"（两侧最大对应数都是 0）
+        let r2 = cross_stats(&m, Some(&[]), 0, 1, 100, None).unwrap();
+        assert_eq!(r2.input_rows, 0);
+        assert!(r2.table.rows.is_empty());
+        assert_eq!(r2.relation, "一对一（每个取值互相唯一对应）");
+        assert_eq!(r2.table.kind.file_stem(), "交叉统计");
         std::fs::remove_file(&p).ok();
     }
 

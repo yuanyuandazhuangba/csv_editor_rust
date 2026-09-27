@@ -199,6 +199,14 @@ impl CsvEditorApp {
                         self.dialogs.quality_window = true;
                         ui.close_menu();
                     }
+                    if ui.button("透视表…").clicked() {
+                        self.dialogs.pivot_window = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("交叉 / 关联统计…").clicked() {
+                        self.dialogs.cross_window = true;
+                        ui.close_menu();
+                    }
                     // 结果窗被关掉后仍可回看上次的统计结果（无需重跑）
                     let has_stats = self.last_stats.is_some();
                     if ui
@@ -344,6 +352,24 @@ impl CsvEditorApp {
                             .clicked()
                         {
                             self.dialogs.quality_window = true;
+                        }
+                        if ui
+                            .button("🧮 透视表…")
+                            .on_hover_text(
+                                "行字段 × 列字段 × 值聚合的交叉表（含行/列合计），适合「按银行×月份看金额合计」这类分析",
+                            )
+                            .clicked()
+                        {
+                            self.dialogs.pivot_window = true;
+                        }
+                        if ui
+                            .button("🔗 交叉/关联…")
+                            .on_hover_text(
+                                "看两个字段的对应关系（如「同一卡号对应多少个账号」），并判定一对一 / 一对多 / 多对多",
+                            )
+                            .clicked()
+                        {
+                            self.dialogs.cross_window = true;
                         }
                     });
                 });
@@ -1189,6 +1215,140 @@ impl CsvEditorApp {
             }
         }));
         self.set_busy("空值与数据质量统计", "正在检查各列...", 0.0);
+    }
+
+    /// 执行「透视表」（后台线程）：行字段 × 列字段 × 值聚合。
+    pub fn run_pivot_table(&mut self) {
+        if self.busy.is_some() {
+            self.log("已有任务在执行，请稍候");
+            return;
+        }
+        let Some(model) = self.model.clone() else {
+            self.log("请先加载数据");
+            return;
+        };
+        // 视图列 → 原始列（派生列不参与）
+        let rcols: Vec<usize> = self
+            .dialogs
+            .pivot_row_cols
+            .iter()
+            .filter_map(|&c| self.ops.as_ref().and_then(|o| o.view_to_base(c)))
+            .collect();
+        if rcols.is_empty() {
+            self.log("请至少选择一个行字段（派生列不能作为统计字段）");
+            return;
+        }
+        let to_base = |c: usize| self.ops.as_ref().and_then(|o| o.view_to_base(c));
+        let Some(col_col) = to_base(self.dialogs.pivot_col) else {
+            self.log("列字段无效（派生列或列已删除），请重新选择");
+            return;
+        };
+        let Some(value_col) = to_base(self.dialogs.pivot_value_col) else {
+            self.log("值列无效（派生列或列已删除），请重新选择");
+            return;
+        };
+        let kind = stats::PIVOT_KINDS[self.dialogs.pivot_kind.min(stats::PIVOT_KINDS.len() - 1)];
+        let names = |cols: &[usize]| -> String {
+            cols.iter()
+                .filter_map(|&c| model.header().get(c).cloned())
+                .collect::<Vec<_>>()
+                .join("、")
+        };
+        let scope = match self.visible_rows() {
+            Some(v) => format!("当前筛选结果 {} 行", v.len()),
+            None => format!("全部数据 {} 行", model.row_count()),
+        };
+        self.log(&format!(
+            "开始透视表：行 [{}]；列 [{}]；值 [{}({})]；范围 {}",
+            names(&rcols),
+            model.header().get(col_col).cloned().unwrap_or_default(),
+            model.header().get(value_col).cloned().unwrap_or_default(),
+            kind.label(),
+            scope
+        ));
+        let rows = self.visible_rows().map(|v| v.to_vec());
+        let tx = self.tx.clone();
+        self.worker = Some(Worker::spawn(tx.clone(), move |ctl| {
+            let result = stats::pivot_table(
+                &model,
+                rows.as_deref(),
+                &rcols,
+                col_col,
+                value_col,
+                kind,
+                Some(&|p| ctl.report_progress(p as f32, "正在生成透视表...")),
+            );
+            match result {
+                Ok(table) => {
+                    let _ = tx.send(BgMsg::StatsDone(std::sync::Arc::new(table)));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::Error(format!("透视表生成失败：{}", e)));
+                }
+            }
+        }));
+        self.set_busy("透视表", "正在生成透视表...", 0.0);
+    }
+
+    /// 执行「交叉 / 关联统计」（后台线程）：看两个字段的对应关系。
+    pub fn run_cross_stats(&mut self) {
+        if self.busy.is_some() {
+            self.log("已有任务在执行，请稍候");
+            return;
+        }
+        let Some(model) = self.model.clone() else {
+            self.log("请先加载数据");
+            return;
+        };
+        let to_base = |c: usize| self.ops.as_ref().and_then(|o| o.view_to_base(c));
+        let (Some(a_col), Some(b_col)) = (
+            to_base(self.dialogs.cross_a),
+            to_base(self.dialogs.cross_b),
+        ) else {
+            self.log("A / B 字段无效（派生列或列已删除），请重新选择");
+            return;
+        };
+        if a_col == b_col {
+            self.log("两个字段不能相同（同一个字段的交叉没有意义）");
+            return;
+        }
+        let top_n = if self.dialogs.cross_top_n == 0 {
+            100
+        } else {
+            self.dialogs.cross_top_n.clamp(1, stats::MAX_CROSS_TOP_N)
+        };
+        self.dialogs.cross_top_n = top_n;
+        let scope = match self.visible_rows() {
+            Some(v) => format!("当前筛选结果 {} 行", v.len()),
+            None => format!("全部数据 {} 行", model.row_count()),
+        };
+        self.log(&format!(
+            "开始交叉/关联统计：[{}] × [{}]；明细前 {} 项；范围 {}",
+            model.header().get(a_col).cloned().unwrap_or_default(),
+            model.header().get(b_col).cloned().unwrap_or_default(),
+            top_n,
+            scope
+        ));
+        let rows = self.visible_rows().map(|v| v.to_vec());
+        let tx = self.tx.clone();
+        self.worker = Some(Worker::spawn(tx.clone(), move |ctl| {
+            let result = stats::cross_stats(&model, rows.as_deref(), a_col, b_col, top_n, Some(&|p| {
+                ctl.report_progress(p as f32, "正在统计对应关系...")
+            }));
+            match result {
+                Ok(report) => {
+                    // 交叉统计也走统一的结果窗：把关系判定摘要放在 notes 首条，窗口顶部一眼可见
+                    let summary = report.summary();
+                    let mut table = report.table;
+                    table.notes.insert(0, summary);
+                    let _ = tx.send(BgMsg::StatsDone(std::sync::Arc::new(table)));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::Error(format!("交叉/关联统计失败：{}", e)));
+                }
+            }
+        }));
+        self.set_busy("交叉 / 关联统计", "正在统计对应关系...", 0.0);
     }
 
     /// 刷新预览视图：滚动回首行（表格内容本身每帧重渲染）

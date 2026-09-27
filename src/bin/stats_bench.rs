@@ -270,6 +270,60 @@ fn main() {
         quality(&(0..15).collect::<Vec<_>>())
     }));
 
+    // 透视表（行 × 列 × 值聚合；单线程：需要行/列/单元格三级映射）
+    let pivot = |rcols: &[usize], ccol: usize, vcol: usize| -> String {
+        match csv_editor_rust::core::stats::pivot_table(
+            &m,
+            None,
+            rcols,
+            ccol,
+            vcol,
+            AggKind::Sum,
+            None,
+        ) {
+            Ok(t) => format!(
+                "{} 行 × {} 列",
+                t.rows.len().saturating_sub(1),
+                t.group_columns
+            ),
+            Err(e) => format!("失败：{}", e.chars().take(20).collect::<String>()),
+        }
+    };
+    results.push(bench("透视表：银行 × 城市（20 × 100）", repeat, || {
+        pivot(&[1], 6, 3)
+    }));
+    results.push(bench(
+        "透视表：城市 × 网点（列字段 500 取值，预期拒绝）",
+        repeat,
+        || pivot(&[6], 7, 3),
+    ));
+    results.push(bench(
+        "透视表：银行 × 账号（列字段超上限，预期拒绝）",
+        repeat,
+        || pivot(&[1], 2, 3),
+    ));
+
+    // 交叉/关联统计（单线程：需要双向映射）
+    let cross = |a: usize, b: usize| -> String {
+        match csv_editor_rust::core::stats::cross_stats(&m, None, a, b, 100, None) {
+            Ok(r) => format!(
+                "A {} / B {} / 组合 {} / {}",
+                r.a_values,
+                r.b_values,
+                r.pairs,
+                r.relation.chars().take(6).collect::<String>()
+            ),
+            Err(e) => format!("失败：{}", e.chars().take(20).collect::<String>()),
+        }
+    };
+    results.push(bench("交叉统计：银行 × 城市", repeat, || cross(1, 6)));
+    results.push(bench("交叉统计：城市 × 备注1", repeat, || cross(6, 11)));
+    results.push(bench(
+        "交叉统计：账号 × 银行（高基数列，预期拒绝）",
+        repeat,
+        || cross(2, 1),
+    ));
+
     println!(
         "\n{:<44} {:>9} {:>9} {:>8}  {}",
         "场景", "耗时(s)", "CPU(s)", "并行度", "产出"

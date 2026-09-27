@@ -17,6 +17,9 @@ use super::{CsvEditorApp, DialogPosition};
 /// 内嵌的微信收款码（自愿捐助窗口用；单文件发布无法依赖外部图片）
 const WECHAT_QR_PNG: &[u8] = include_bytes!("../../assets/wechat_qr.png");
 
+/// 透视表的行字段槽位数（1~2 个；与 `stats::MAX_GROUP_COLUMNS` 独立，界面固定 2 个槽位）
+const MAX_PIVOT_ROW_SLOTS: usize = 2;
+
 /// 程序化设置某个 egui 窗口的「折叠（最小化）」状态。
 ///
 /// egui 0.27 的 `Window` 只有 `collapsible`，没有公开的 `minimized()`；
@@ -144,6 +147,12 @@ impl CsvEditorApp {
         let mut f = std::mem::take(&mut self.dialogs.quality_window);
         self.dialog_quality_stats(ctx, &mut f);
         self.dialogs.quality_window = f;
+        let mut f = std::mem::take(&mut self.dialogs.pivot_window);
+        self.dialog_pivot_table(ctx, &mut f);
+        self.dialogs.pivot_window = f;
+        let mut f = std::mem::take(&mut self.dialogs.cross_window);
+        self.dialog_cross_stats(ctx, &mut f);
+        self.dialogs.cross_window = f;
         let mut f = std::mem::take(&mut self.dialogs.stats_result_window);
         self.dialog_stats_result(ctx, &mut f);
         self.dialogs.stats_result_window = f;
@@ -1242,14 +1251,16 @@ impl CsvEditorApp {
                         ui.label("• 输入或拖动数值即可把菜单、菜单命令、工具栏按钮、表格文字整体等比放大，方便视力不佳的用户；");
                         ui.weak("设置会被记住，下次启动仍然生效。");
                     });
-                    ui.collapsing("九、数据分析（去重 / 分组汇总 / 列统计 / 频次分布 / 重复情况 / 数据质量）", |ui| {
-                        ui.label("六条命令都在「数据分析」工具栏与菜单「数据分析」下；作用范围都是当前筛选结果（未筛选则为全部数据）。");
+                    ui.collapsing("九、数据分析（去重 / 分组汇总 / 列统计 / 频次分布 / 重复情况 / 数据质量 / 透视表 / 交叉统计）", |ui| {
+                        ui.label("八条命令都在「数据分析」工具栏与菜单「数据分析」下；作用范围都是当前筛选结果（未筛选则为全部数据）。");
                         ui.label("• 提取唯一行（去重）：勾选判重字段（一个都不勾 = 按整行判重），执行后保留唯一行并作为当前视图，可继续导出、拆分、统计；完成后可导出「重复行对应表」。");
                         ui.label("• 字段分组汇总：选 1~3 个分组字段，再为若干列添加汇总方式（求和/均值/最大/最小/计数/去重计数/空值数），点「开始汇总」；结果是每组一行的汇总表（含「行数」）。");
                         ui.label("• 数值列统计：勾选要统计的列（可多选），点「开始统计」；给出每列的行数、计数、空值数、非数值数、求和、均值、中位数、最小、最大、标准差（总体）。");
                         ui.label("• 频次分布 / Top-N：勾选列并设置「每列显示前 N 项」，点「开始统计」；列出各取值的出现次数与占比（按次数从多到少），空值作为「(空)」一类参与排名，超出前 N 项的汇总为一行「(其余 M 个取值)」，末行「(合计)」用于核对总量（占比 100%）。常用法：找出卡号/账号出现次数最多的前 20 条。");
                         ui.label("• 重复情况统计：选判重字段（不勾 = 按整行判重），点「开始统计」；给出不同键/重复键个数与重复行占比，明细按重复次数降序列出前 N 个重复键。结果窗里可一键「只看重复的行」或「只看唯一行」，把结果直接落到当前数据视图（用工具栏「清除筛选」可恢复全部）。");
                         ui.label("• 空值与数据质量统计：勾选列（想知道整份数据质量就点「全选」），点「开始检查」；逐列给出空值数、纯空白数、空值率、含控制字符数、最短/最长/平均长度、超长值数（>255 字符）。");
+                        ui.label("• 透视表：选 1~2 个行字段 + 1 个列字段 + 1 个值列与聚合方式（求和/均值/最大/最小/计数），点「生成透视表」；得到交叉表，行末与末行给出「(合计)」（整体聚合，均值/计数在合计处也正确）。列字段的不同取值最多 200 个。");
+                        ui.label("• 交叉/关联统计：选 A、B 两个字段，点「开始统计」；给出关系判定（一对一 / 一对多 / 多对一 / 多对多）、两侧最大对应数，以及每个 A 值对应的 B 值个数与示例（如「同一卡号对应多少个账号」）。");
                         ui.label("    金额等按数值精确计算（定点十进制累加，两位小数的合计不会出现 3613134567.580001 这类多余尾数）；某列若混有文字会被跳过，并在结果窗提示「N 个非数值未参与计算」；");
                         ui.label("    中位数需要保留该列的原始数值：数据量特别大时（超过用内存上限）该列中位数显示「—」，并提示先用筛选缩小范围；");
                         ui.label("    结果窗可「最小化」成一条标题栏（结果不丢），稍后点标题栏左侧三角展开即可继续查看或导出；");
@@ -1737,6 +1748,298 @@ impl CsvEditorApp {
                     done = true;
                 }
                 ui.weak(format!("已选 {} 列", sel.len()));
+            });
+        });
+        if done {
+            keep = false;
+        }
+        *open = keep;
+    }
+
+    /// 「透视表」参数对话框：行字段（1~2）+ 列字段 + 值列 + 聚合方式。
+    fn dialog_pivot_table(&mut self, ctx: &egui::Context, open: &mut bool) {
+        let mut keep = *open;
+        let mut done = false;
+        apply_dialog_pos(
+            egui::Window::new("透视表")
+                .open(&mut keep)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([620.0, 560.0]),
+            self.dialog_position,
+            ctx,
+        )
+        .show(ctx, |ui| {
+            let header = self.header_names();
+            if header.is_empty() {
+                ui.label("请先加载数据");
+                return;
+            }
+            // 可作为统计字段的视图列（派生列 = false）
+            let base_ok: Vec<bool> = (0..header.len())
+                .map(|i| self.ops.as_ref().and_then(|o| o.view_to_base(i)).is_some())
+                .collect();
+            let raw: Vec<usize> = (0..header.len()).filter(|&i| base_ok[i]).collect();
+            if raw.is_empty() {
+                ui.label("没有可用于统计的原始列");
+                return;
+            }
+            let scope = match self.visible_rows() {
+                Some(v) => format!("当前筛选结果（{} 行）", v.len()),
+                None => format!(
+                    "全部数据（{} 行）",
+                    self.model.as_ref().map(|m| m.row_count()).unwrap_or(0)
+                ),
+            };
+            ui.label(format!("统计范围：{scope}"));
+            ui.weak(
+                "行字段 × 列字段 × 值聚合的交叉表：行是行字段的取值组合，列是列字段的各个取值，\
+                 单元格是值列在该组合下的聚合结果；每行末尾与末行给出「(合计)」（整体聚合，\
+                 均值/计数在合计处也正确）。列字段的不同取值最多 200 个（太多请改用分组汇总）。\
+                 派生列不参与统计。",
+            );
+            ui.separator();
+
+            // —— 行字段（2 个槽位）——
+            ui.label("行字段（1~2 个）:");
+            self.dialogs
+                .pivot_row_cols
+                .retain(|&i| i < header.len() && base_ok[i]);
+            let cur = self.dialogs.pivot_row_cols.clone();
+            let mut slots: Vec<Option<usize>> = (0..MAX_PIVOT_ROW_SLOTS)
+                .map(|i| cur.get(i).copied().filter(|&c| c < header.len()))
+                .collect();
+            for (slot_i, slot) in slots.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("行 {}", slot_i + 1));
+                    let text = match *slot {
+                        Some(c) => header[c].clone(),
+                        None => "（不使用）".to_string(),
+                    };
+                    egui::ComboBox::from_id_source(("pivot_row", slot_i))
+                        .selected_text(text)
+                        .width(220.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(slot, None, "（不使用）");
+                            for &i in &raw {
+                                ui.selectable_value(slot, Some(i), &header[i]);
+                            }
+                        });
+                });
+            }
+            let mut picked: Vec<usize> = Vec::new();
+            for s in slots.iter().flatten() {
+                if !picked.contains(s) {
+                    picked.push(*s);
+                }
+            }
+            self.dialogs.pivot_row_cols = picked;
+
+            // —— 列字段 ——
+            ui.horizontal(|ui| {
+                ui.label("列字段");
+                let mut col = self.dialogs.pivot_col.min(header.len().saturating_sub(1));
+                if !base_ok.get(col).copied().unwrap_or(false) {
+                    col = raw[0];
+                }
+                egui::ComboBox::from_id_source("pivot_col")
+                    .selected_text(header[col].clone())
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        for &i in &raw {
+                            ui.selectable_value(&mut col, i, &header[i]);
+                        }
+                    });
+                self.dialogs.pivot_col = col;
+            });
+
+            // —— 值列 ——
+            ui.horizontal(|ui| {
+                ui.label("值列　");
+                let mut col = self
+                    .dialogs
+                    .pivot_value_col
+                    .min(header.len().saturating_sub(1));
+                if !base_ok.get(col).copied().unwrap_or(false) {
+                    col = raw[0];
+                }
+                egui::ComboBox::from_id_source("pivot_value_col")
+                    .selected_text(header[col].clone())
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        for &i in &raw {
+                            ui.selectable_value(&mut col, i, &header[i]);
+                        }
+                    });
+                self.dialogs.pivot_value_col = col;
+                // —— 聚合方式（透视表只支持这 5 种）——
+                let mut k = self
+                    .dialogs
+                    .pivot_kind
+                    .min(stats::PIVOT_KINDS.len().saturating_sub(1));
+                egui::ComboBox::from_id_source("pivot_kind")
+                    .selected_text(stats::PIVOT_KINDS[k].label())
+                    .width(96.0)
+                    .show_ui(ui, |ui| {
+                        for (i, kind) in stats::PIVOT_KINDS.iter().enumerate() {
+                            ui.selectable_value(&mut k, i, kind.label());
+                        }
+                    });
+                self.dialogs.pivot_kind = k;
+            });
+            ui.weak("聚合方式：求和 / 均值 / 最大 / 最小 / 计数（非空）");
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let clash = self.dialogs.pivot_row_cols.contains(&self.dialogs.pivot_col);
+                if ui
+                    .add_enabled(!clash, egui::Button::new("生成透视表"))
+                    .clicked()
+                {
+                    self.run_pivot_table();
+                    done = true;
+                }
+                if ui.button("取消").clicked() {
+                    done = true;
+                }
+                if clash {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 120, 0),
+                        "⚠ 列字段不能与行字段相同",
+                    );
+                } else {
+                    ui.weak(format!(
+                        "行 {} 个字段 / 列 {} / 值 {}",
+                        self.dialogs.pivot_row_cols.len(),
+                        header.get(self.dialogs.pivot_col).cloned().unwrap_or_default(),
+                        header
+                            .get(self.dialogs.pivot_value_col)
+                            .cloned()
+                            .unwrap_or_default()
+                    ));
+                }
+            });
+        });
+        if done {
+            keep = false;
+        }
+        *open = keep;
+    }
+
+    /// 「交叉 / 关联统计」参数对话框：A 字段 × B 字段 + 明细前 N 项。
+    fn dialog_cross_stats(&mut self, ctx: &egui::Context, open: &mut bool) {
+        let mut keep = *open;
+        let mut done = false;
+        apply_dialog_pos(
+            egui::Window::new("交叉 / 关联统计")
+                .open(&mut keep)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([600.0, 460.0]),
+            self.dialog_position,
+            ctx,
+        )
+        .show(ctx, |ui| {
+            let header = self.header_names();
+            if header.is_empty() {
+                ui.label("请先加载数据");
+                return;
+            }
+            let base_ok: Vec<bool> = (0..header.len())
+                .map(|i| self.ops.as_ref().and_then(|o| o.view_to_base(i)).is_some())
+                .collect();
+            let raw: Vec<usize> = (0..header.len()).filter(|&i| base_ok[i]).collect();
+            if raw.is_empty() {
+                ui.label("没有可用于统计的原始列");
+                return;
+            }
+            let scope = match self.visible_rows() {
+                Some(v) => format!("当前筛选结果（{} 行）", v.len()),
+                None => format!(
+                    "全部数据（{} 行）",
+                    self.model.as_ref().map(|m| m.row_count()).unwrap_or(0)
+                ),
+            };
+            ui.label(format!("统计范围：{scope}"));
+            ui.weak(
+                "看两个字段的对应关系，例如「同一卡号对应多少个账号」：结果会给出关系判定\
+                 （一对一 / 一对多 / 多对一 / 多对多）、两侧的最大对应数，以及每个 A 值对应的\
+                 B 值个数与示例。按原值比较（与去重一致），空值也是一种取值。",
+            );
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                ui.label("A 字段");
+                let mut a = self.dialogs.cross_a.min(header.len().saturating_sub(1));
+                if !base_ok.get(a).copied().unwrap_or(false) {
+                    a = raw[0];
+                }
+                egui::ComboBox::from_id_source("cross_a")
+                    .selected_text(header[a].clone())
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        for &i in &raw {
+                            ui.selectable_value(&mut a, i, &header[i]);
+                        }
+                    });
+                self.dialogs.cross_a = a;
+            });
+            ui.horizontal(|ui| {
+                ui.label("B 字段");
+                let mut b = self.dialogs.cross_b.min(header.len().saturating_sub(1));
+                if !base_ok.get(b).copied().unwrap_or(false) {
+                    b = raw.get(1).copied().unwrap_or(raw[0]);
+                }
+                egui::ComboBox::from_id_source("cross_b")
+                    .selected_text(header[b].clone())
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        for &i in &raw {
+                            ui.selectable_value(&mut b, i, &header[i]);
+                        }
+                    });
+                self.dialogs.cross_b = b;
+            });
+
+            ui.separator();
+            if self.dialogs.cross_top_n == 0 {
+                self.dialogs.cross_top_n = 100; // 懒初始化默认值
+            }
+            ui.horizontal(|ui| {
+                ui.label("明细列出前");
+                ui.add(
+                    egui::DragValue::new(&mut self.dialogs.cross_top_n)
+                        .clamp_range(1..=stats::MAX_CROSS_TOP_N)
+                        .speed(1.0),
+                );
+                ui.label("个 A 取值（按「对应的 B 个数」从多到少）");
+            });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let same = self.dialogs.cross_a == self.dialogs.cross_b;
+                if ui
+                    .add_enabled(!same, egui::Button::new("开始统计"))
+                    .clicked()
+                {
+                    self.run_cross_stats();
+                    done = true;
+                }
+                if ui.button("取消").clicked() {
+                    done = true;
+                }
+                if same {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 120, 0),
+                        "⚠ 两个字段不能相同",
+                    );
+                } else {
+                    ui.weak(format!(
+                        "{} × {}",
+                        header.get(self.dialogs.cross_a).cloned().unwrap_or_default(),
+                        header.get(self.dialogs.cross_b).cloned().unwrap_or_default()
+                    ));
+                }
             });
         });
         if done {
