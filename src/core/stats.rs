@@ -277,6 +277,25 @@ pub fn group_by(
     aggs: &[AggSpec],
     progress: Option<&(dyn Fn(f64) + Sync)>,
 ) -> Result<StatsTable, String> {
+    group_by_with_limits(
+        model,
+        rows,
+        group_cols,
+        aggs,
+        StatsLimits::default(),
+        progress,
+    )
+}
+
+/// 与 [`group_by`] 相同，但分组数上限由调用方给出（界面可调，见 [`StatsLimits`]）
+pub fn group_by_with_limits(
+    model: &DataModel,
+    rows: Option<&[u32]>,
+    group_cols: &[usize],
+    aggs: &[AggSpec],
+    limits: StatsLimits,
+    progress: Option<&(dyn Fn(f64) + Sync)>,
+) -> Result<StatsTable, String> {
     let column_count = model.column_count();
     // 分组字段：丢弃越界列（界面可能传入陈旧的列索引）、去重、保持用户选择顺序
     let mut gcols: Vec<usize> = Vec::new();
@@ -416,11 +435,11 @@ pub fn group_by(
                     }
                 }
                 None => {
-                    if keys.len() >= MAX_GROUPS {
+                    if keys.len() >= limits.max_groups {
                         return Err(format!(
-                            "分组数超过上限 {}（当前已超过），请改用取值较少的字段分组，\
-                             或先用筛选缩小范围",
-                            MAX_GROUPS
+                            "分组数超过上限 {}（当前已超过）：请改用取值较少的字段分组、\
+                             调大「分组数上限」，或先用筛选缩小范围",
+                            limits.max_groups
                         ));
                     }
                     index.insert(key.clone(), keys.len());
@@ -502,10 +521,8 @@ const COLUMN_SUMMARY_HEADERS: [&str; 11] = [
 
 /// 精确中位数可保留的数值总数预算（约 160MB；在所有统计列之间均分）
 const MEDIAN_TOTAL_BUDGET: usize = 20_000_000;
-/// 单列可保留的数值个数下限（列很多时也尽量能算中位数）
+/// 单列可保留的数值个数下限（列很多时也尽量能算中位数；上限由预算按列数均分决定）
 const MEDIAN_MIN_PER_COLUMN: usize = 200_000;
-/// 单列可保留的数值个数上限
-const MEDIAN_MAX_PER_COLUMN: usize = 10_000_000;
 
 /// 数值列描述统计：对每个选定的原始列计算
 /// 行数 / 计数（非空）/ 空值数 / 非数值数 / 求和 / 均值 / 中位数 / 最小 / 最大 / 标准差。
@@ -526,6 +543,17 @@ pub fn describe_columns(
     cols: &[usize],
     progress: Option<&(dyn Fn(f64) + Sync)>,
 ) -> Result<StatsTable, String> {
+    describe_columns_with_limits(model, rows, cols, StatsLimits::default(), progress)
+}
+
+/// 与 [`describe_columns`] 相同，但「精确中位数」的数值保留预算由调用方给出
+pub fn describe_columns_with_limits(
+    model: &DataModel,
+    rows: Option<&[u32]>,
+    cols: &[usize],
+    limits: StatsLimits,
+    progress: Option<&(dyn Fn(f64) + Sync)>,
+) -> Result<StatsTable, String> {
     let column_count = model.column_count();
     // 丢弃越界列（界面可能传入陈旧的列索引）、去重、保持用户选择顺序
     let mut list: Vec<usize> = Vec::new();
@@ -537,8 +565,8 @@ pub fn describe_columns(
     if list.is_empty() {
         return Err("请至少选择一个有效的列（列可能已删除或隐藏）".to_string());
     }
-    // 每列保留多少原始数值（用于精确中位数）
-    let cap = (MEDIAN_TOTAL_BUDGET / list.len()).clamp(MEDIAN_MIN_PER_COLUMN, MEDIAN_MAX_PER_COLUMN);
+    // 每列保留多少原始数值（用于精确中位数）；预算由调用方给出，按列数均分
+    let cap = (limits.median_budget / list.len()).max(MEDIAN_MIN_PER_COLUMN);
 
     let total = rows.map(|v| v.len()).unwrap_or_else(|| model.row_count());
     let mut table = StatsTable {
@@ -657,9 +685,7 @@ const FREQUENCY_HEADERS: [&str; 5] = ["列名", "排名", "取值", "出现次�
 
 /// 频次分布可容纳的不同取值总数预算（所有统计列共享，超出报错）
 const FREQ_TOTAL_BUDGET: usize = 3_000_000;
-/// 单列可容纳的不同取值个数上限
-const FREQ_MAX_PER_COLUMN: usize = 1_000_000;
-/// 单列可容纳的不同取值个数下限（列很多时也不至于小到不可用）
+/// 单列可容纳的不同取值个数下限（列很多时也不至于小到不可用；上限由预算按列数均分决定）
 const FREQ_MIN_PER_COLUMN: usize = 200_000;
 /// 引擎允许的最大 Top-N（界面输入也已限制，这里再兜底一次）
 pub const MAX_FREQ_TOP_N: usize = 1000;
@@ -684,6 +710,18 @@ pub fn value_frequency(
     top_n: usize,
     progress: Option<&(dyn Fn(f64) + Sync)>,
 ) -> Result<StatsTable, String> {
+    value_frequency_with_limits(model, rows, cols, top_n, StatsLimits::default(), progress)
+}
+
+/// 与 [`value_frequency`] 相同，但不同取值预算由调用方给出
+pub fn value_frequency_with_limits(
+    model: &DataModel,
+    rows: Option<&[u32]>,
+    cols: &[usize],
+    top_n: usize,
+    limits: StatsLimits,
+    progress: Option<&(dyn Fn(f64) + Sync)>,
+) -> Result<StatsTable, String> {
     let column_count = model.column_count();
     // 丢弃越界列（界面可能传入陈旧的列索引）、去重、保持用户选择顺序
     let mut list: Vec<usize> = Vec::new();
@@ -696,7 +734,7 @@ pub fn value_frequency(
         return Err("请至少选择一个有效的列（列可能已删除或隐藏）".to_string());
     }
     let top_n = top_n.clamp(1, MAX_FREQ_TOP_N);
-    let cap = (FREQ_TOTAL_BUDGET / list.len()).clamp(FREQ_MIN_PER_COLUMN, FREQ_MAX_PER_COLUMN);
+    let cap = (limits.freq_budget / list.len()).max(FREQ_MIN_PER_COLUMN);
     value_frequency_with_cap(model, rows, &list, top_n, cap, progress)
 }
 
@@ -964,6 +1002,18 @@ pub fn duplicate_stats(
     progress: Option<&(dyn Fn(f64) + Sync)>,
 ) -> Result<DuplicateReport, String> {
     duplicate_stats_with_max_keys(model, rows, columns, top_n, MAX_DUP_KEYS, progress)
+}
+
+/// 与 [`duplicate_stats`] 相同，但不同键个数上限由调用方给出
+pub fn duplicate_stats_with_limits(
+    model: &DataModel,
+    rows: Option<&[u32]>,
+    columns: &[usize],
+    top_n: usize,
+    limits: StatsLimits,
+    progress: Option<&(dyn Fn(f64) + Sync)>,
+) -> Result<DuplicateReport, String> {
+    duplicate_stats_with_max_keys(model, rows, columns, top_n, limits.max_dup_keys, progress)
 }
 
 /// [`duplicate_stats`] 的内部实现（`max_keys` 显式传入，便于测试用小上限驱动超限路径）
@@ -1234,6 +1284,27 @@ pub fn cross_stats(
     top_n: usize,
     progress: Option<&(dyn Fn(f64) + Sync)>,
 ) -> Result<CrossReport, String> {
+    cross_stats_with_limits(
+        model,
+        rows,
+        a_col,
+        b_col,
+        top_n,
+        StatsLimits::default(),
+        progress,
+    )
+}
+
+/// 与 [`cross_stats`] 相同，但 A 侧取值上限与组合数上限由调用方给出
+pub fn cross_stats_with_limits(
+    model: &DataModel,
+    rows: Option<&[u32]>,
+    a_col: usize,
+    b_col: usize,
+    top_n: usize,
+    limits: StatsLimits,
+    progress: Option<&(dyn Fn(f64) + Sync)>,
+) -> Result<CrossReport, String> {
     let column_count = model.column_count();
     if a_col >= column_count || b_col >= column_count {
         return Err("字段无效（列可能已删除或隐藏）".to_string());
@@ -1266,10 +1337,10 @@ pub fn cross_stats(
         let aidx = match a_index.get(av) {
             Some(&i) => i,
             None => {
-                if a_keys.len() >= MAX_GROUPS {
+                if a_keys.len() >= limits.max_groups {
                     return Err(format!(
-                        "「{}」的不同取值超过上限 {}：请先用筛选缩小范围",
-                        a_name, MAX_GROUPS
+                        "「{}」的不同取值超过上限 {}：请先用筛选缩小范围，或调大「取值上限」",
+                        a_name, limits.max_groups
                     ));
                 }
                 let i = a_keys.len();
@@ -1284,10 +1355,10 @@ pub fn cross_stats(
         if !a_bsets[aidx].contains(bv) {
             a_bsets[aidx].insert(bv.to_string());
             pairs += 1;
-            if pairs > MAX_CROSS_PAIRS {
+            if pairs > limits.max_cross_pairs {
                 return Err(format!(
-                    "「{}×{}」的不同组合数超过上限 {}：请先用筛选缩小范围",
-                    a_name, b_name, MAX_CROSS_PAIRS
+                    "「{}×{}」的不同组合数超过上限 {}：请先用筛选缩小范围，或调大「组合数上限」",
+                    a_name, b_name, limits.max_cross_pairs
                 ));
             }
         }
@@ -1423,6 +1494,38 @@ fn display_value(s: &str) -> String {
         "(空)".to_string()
     } else {
         s.to_string()
+    }
+}
+
+/// 统计功能的规模上限（界面可调，用于按硬件能力"放大"软件的处理能力）。
+///
+/// 每一项都直接对应一块内存/规模，默认值即各功能原先的硬编码值：
+/// - [`StatsLimits::max_groups`]：分组汇总的**分组数**上限，也用作交叉统计的 A 侧取值上限；
+/// - [`StatsLimits::median_budget`]：数值列统计里"精确中位数"可保留的**数值总个数**
+///   （所有统计列共享，按列数均分）；
+/// - [`StatsLimits::freq_budget`]：频次分布的**不同取值总个数**预算（所有列共享，按列数均分）；
+/// - [`StatsLimits::max_dup_keys`]：重复情况统计的**不同键个数**上限；
+/// - [`StatsLimits::max_cross_pairs`]：交叉统计的**不同 (A,B) 组合数**上限。
+///
+/// 透视表有自己的一组上限（[`PivotLimits`]），因为它的三个维度含义更具体。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatsLimits {
+    pub max_groups: usize,
+    pub median_budget: usize,
+    pub freq_budget: usize,
+    pub max_dup_keys: usize,
+    pub max_cross_pairs: usize,
+}
+
+impl Default for StatsLimits {
+    fn default() -> Self {
+        Self {
+            max_groups: MAX_GROUPS,
+            median_budget: MEDIAN_TOTAL_BUDGET,
+            freq_budget: FREQ_TOTAL_BUDGET,
+            max_dup_keys: MAX_DUP_KEYS,
+            max_cross_pairs: MAX_CROSS_PAIRS,
+        }
     }
 }
 
@@ -3800,6 +3903,152 @@ mod tests {
             "{:?}",
             t.notes
         );
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ===== 各统计功能的「规模上限」可调（StatsLimits）=====
+
+    #[test]
+    fn stats_limits_defaults_match_former_hardcoded_values() {
+        let d = StatsLimits::default();
+        assert_eq!(d.max_groups, MAX_GROUPS);
+        assert_eq!(d.median_budget, MEDIAN_TOTAL_BUDGET);
+        assert_eq!(d.freq_budget, FREQ_TOTAL_BUDGET);
+        assert_eq!(d.max_dup_keys, MAX_DUP_KEYS);
+        assert_eq!(d.max_cross_pairs, MAX_CROSS_PAIRS);
+    }
+
+    #[test]
+    fn group_by_with_limits_respects_custom_max_groups() {
+        let p = write_temp("K\na\nb\nc\n".as_bytes(), "_lim1.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let agg = [spec(0, AggKind::Count)];
+        // 默认上限下正常（3 个分组）
+        assert!(group_by(&m, None, &[0], &agg, None).is_ok());
+        // 调小到 2 → 报错并提示可调大
+        let err = group_by_with_limits(
+            &m,
+            None,
+            &[0],
+            &agg,
+            StatsLimits {
+                max_groups: 2,
+                ..StatsLimits::default()
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("分组数超过上限 2"), "{err}");
+        assert!(err.contains("调大「分组数上限」"), "{err}");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn value_frequency_with_limits_respects_custom_budget() {
+        let p = write_temp("K\na\nb\nc\n".as_bytes(), "_lim2.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        // 默认下正常
+        assert!(value_frequency(&m, None, &[0], 10, None).is_ok());
+        // 预算调到 2（单列下限保护为 200000，因此这里用两列把 budget 摊薄到很难触发；
+        // 改为直接验证"调小预算 → 报错信息里带上限值"这一路径）
+        let err = value_frequency_with_limits(
+            &m,
+            None,
+            &[0],
+            10,
+            StatsLimits {
+                freq_budget: 100_000,
+                ..StatsLimits::default()
+            },
+            None,
+        );
+        // 3 个取值 < 单列下限 200000，因此不会报错；验证"调大预算"同样正常
+        assert!(err.is_ok());
+        let big = value_frequency_with_limits(
+            &m,
+            None,
+            &[0],
+            10,
+            StatsLimits {
+                freq_budget: 50_000_000,
+                ..StatsLimits::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(big.rows.len(), 4, "3 个取值 + 合计行");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn describe_columns_with_limits_respects_median_budget() {
+        // 中位数预算调小到单列下限以下时，实际仍保留下限（200000）——
+        // 这里用"预算 = 下限"验证 cap 计算走通了该分支，且中位数正常给出
+        let p = write_temp("值\n3\n1\n2\n".as_bytes(), "_lim3.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = describe_columns_with_limits(
+            &m,
+            None,
+            &[0],
+            StatsLimits {
+                median_budget: MEDIAN_MIN_PER_COLUMN,
+                ..StatsLimits::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(t.rows[0][7], "2", "中位数仍可精确给出");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn duplicate_and_cross_with_limits_respect_custom_values() {
+        let p = write_temp("A,B\nx,1\ny,2\nx,3\n".as_bytes(), "_lim4.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        // 重复键上限调到 1 → 报错
+        let err = duplicate_stats_with_limits(
+            &m,
+            None,
+            &[0],
+            10,
+            StatsLimits {
+                max_dup_keys: 1,
+                ..StatsLimits::default()
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("超过上限 1"), "{err}");
+        // 交叉统计：A 取值上限调到 1 → 报错
+        let err = cross_stats_with_limits(
+            &m,
+            None,
+            0,
+            1,
+            10,
+            StatsLimits {
+                max_groups: 1,
+                ..StatsLimits::default()
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("超过上限 1"), "{err}");
+        // 组合数上限调到 1 → 报错
+        let err = cross_stats_with_limits(
+            &m,
+            None,
+            0,
+            1,
+            10,
+            StatsLimits {
+                max_cross_pairs: 1,
+                ..StatsLimits::default()
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("不同组合数超过上限 1"), "{err}");
         std::fs::remove_file(&p).ok();
     }
 

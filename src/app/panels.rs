@@ -917,6 +917,17 @@ impl CsvEditorApp {
         self.set_busy("提取唯一行（去重）", "正在判重...", 0.0);
     }
 
+    /// 若「规模上限」被用户改过（≠默认），在日志里记一笔，便于事后审计
+    fn log_custom_limits(&mut self) {
+        let l = self.dialogs.stats_limits;
+        if l != stats::StatsLimits::default() {
+            self.log(&format!(
+                "当前规模上限（已自定义）：分组数 {}、中位数数值预算 {}、不同取值预算 {}、重复键 {}、组合数 {}",
+                l.max_groups, l.median_budget, l.freq_budget, l.max_dup_keys, l.max_cross_pairs
+            ));
+        }
+    }
+
     /// 执行「字段分组汇总」（后台线程）。
     /// 作用范围是当前筛选结果（未筛选则为全部数据）；结果为一张汇总表，
     /// 在结果窗中查看并可导出 CSV / XLSX（**不**改变当前数据视图）。
@@ -982,12 +993,15 @@ impl CsvEditorApp {
             agg_desc,
             scope
         ));
+        self.log_custom_limits();
         let rows = self.visible_rows().map(|v| v.to_vec());
+        let limits = self.dialogs.stats_limits;
         let tx = self.tx.clone();
         self.worker = Some(Worker::spawn(tx.clone(), move |ctl| {
-            let result = stats::group_by(&model, rows.as_deref(), &gcols, &aggs, Some(&|p| {
-                ctl.report_progress(p as f32, "正在分组汇总...")
-            }));
+            let result =
+                stats::group_by_with_limits(&model, rows.as_deref(), &gcols, &aggs, limits, Some(
+                    &|p| ctl.report_progress(p as f32, "正在分组汇总..."),
+                ));
             match result {
                 Ok(table) => {
                     let _ = tx.send(BgMsg::StatsDone(std::sync::Arc::new(table)));
@@ -1036,12 +1050,18 @@ impl CsvEditorApp {
             names.join("、"),
             scope
         ));
+        self.log_custom_limits();
         let rows = self.visible_rows().map(|v| v.to_vec());
+        let limits = self.dialogs.stats_limits;
         let tx = self.tx.clone();
         self.worker = Some(Worker::spawn(tx.clone(), move |ctl| {
-            let result = stats::describe_columns(&model, rows.as_deref(), &cols, Some(&|p| {
-                ctl.report_progress(p as f32, "正在统计各列...")
-            }));
+            let result = stats::describe_columns_with_limits(
+                &model,
+                rows.as_deref(),
+                &cols,
+                limits,
+                Some(&|p| ctl.report_progress(p as f32, "正在统计各列...")),
+            );
             match result {
                 Ok(table) => {
                     let _ = tx.send(BgMsg::StatsDone(std::sync::Arc::new(table)));
@@ -1097,13 +1117,19 @@ impl CsvEditorApp {
             top_n,
             scope
         ));
+        self.log_custom_limits();
         let rows = self.visible_rows().map(|v| v.to_vec());
+        let limits = self.dialogs.stats_limits;
         let tx = self.tx.clone();
         self.worker = Some(Worker::spawn(tx.clone(), move |ctl| {
-            let result =
-                stats::value_frequency(&model, rows.as_deref(), &cols, top_n, Some(&|p| {
-                    ctl.report_progress(p as f32, "正在统计出现次数...")
-                }));
+            let result = stats::value_frequency_with_limits(
+                &model,
+                rows.as_deref(),
+                &cols,
+                top_n,
+                limits,
+                Some(&|p| ctl.report_progress(p as f32, "正在统计出现次数...")),
+            );
             match result {
                 Ok(table) => {
                     let _ = tx.send(BgMsg::StatsDone(std::sync::Arc::new(table)));
@@ -1156,12 +1182,19 @@ impl CsvEditorApp {
             "开始重复情况统计：按 [{}] 判重；明细前 {} 项；范围 {}",
             field_desc, top_n, scope
         ));
+        self.log_custom_limits();
         let rows = self.visible_rows().map(|v| v.to_vec());
+        let limits = self.dialogs.stats_limits;
         let tx = self.tx.clone();
         self.worker = Some(Worker::spawn(tx.clone(), move |ctl| {
-            let result = stats::duplicate_stats(&model, rows.as_deref(), &cols, top_n, Some(&|p| {
-                ctl.report_progress(p as f32, "正在判重...")
-            }));
+            let result = stats::duplicate_stats_with_limits(
+                &model,
+                rows.as_deref(),
+                &cols,
+                top_n,
+                limits,
+                Some(&|p| ctl.report_progress(p as f32, "正在判重...")),
+            );
             match result {
                 Ok(report) => {
                     let _ = tx.send(BgMsg::DuplicateDone(std::sync::Arc::new(report)));
@@ -1371,12 +1404,20 @@ impl CsvEditorApp {
             top_n,
             scope
         ));
+        self.log_custom_limits();
         let rows = self.visible_rows().map(|v| v.to_vec());
+        let limits = self.dialogs.stats_limits;
         let tx = self.tx.clone();
         self.worker = Some(Worker::spawn(tx.clone(), move |ctl| {
-            let result = stats::cross_stats(&model, rows.as_deref(), a_col, b_col, top_n, Some(&|p| {
-                ctl.report_progress(p as f32, "正在统计对应关系...")
-            }));
+            let result = stats::cross_stats_with_limits(
+                &model,
+                rows.as_deref(),
+                a_col,
+                b_col,
+                top_n,
+                limits,
+                Some(&|p| ctl.report_progress(p as f32, "正在统计对应关系...")),
+            );
             match result {
                 Ok(report) => {
                     // 交叉统计也走统一的结果窗：把关系判定摘要放在 notes 首条，窗口顶部一眼可见

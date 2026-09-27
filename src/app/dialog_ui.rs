@@ -20,6 +20,56 @@ const WECHAT_QR_PNG: &[u8] = include_bytes!("../../assets/wechat_qr.png");
 /// 透视表的行字段槽位数（1~2 个；与 `stats::MAX_GROUP_COLUMNS` 独立，界面固定 2 个槽位）
 const MAX_PIVOT_ROW_SLOTS: usize = 2;
 
+/// 渲染一行「规模上限」设置（标签 + 输入框 + 悬浮说明），返回是否被修改
+fn limits_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut usize,
+    range: std::ops::RangeInclusive<usize>,
+    speed: f64,
+    tip: &str,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        changed = ui
+            .add(
+                egui::DragValue::new(value)
+                    .clamp_range(range)
+                    .speed(speed),
+            )
+            .on_hover_text(tip)
+            .changed();
+    });
+    changed
+}
+
+/// 每个参数窗打开时恢复一次「规模上限」（首次从 egui memory 读，之后沿用内存中的值）
+fn ensure_stats_limits(app: &mut CsvEditorApp, ctx: &egui::Context) {
+    if app.dialogs.stats_limits_loaded {
+        return;
+    }
+    app.dialogs.stats_limits_loaded = true;
+    if let Some(v) = ctx.memory(|m| {
+        m.data
+            .get_temp::<csv_editor_rust::core::stats::StatsLimits>(egui::Id::new("stats_limits"))
+    }) {
+        app.dialogs.stats_limits = v;
+    }
+}
+
+/// 把「规模上限」写回 egui memory（重启后沿用）
+fn save_stats_limits(ctx: &egui::Context, limits: csv_editor_rust::core::stats::StatsLimits) {
+    ctx.memory_mut(|m| m.data.insert_temp(egui::Id::new("stats_limits"), limits));
+}
+
+/// 「规模上限」区的通用标题与说明
+fn limits_header(ui: &mut egui::Ui, hint: &str) {
+    ui.separator();
+    ui.label("规模上限（按电脑内存调整；数值越大能处理的情况越多、占用内存越大）:");
+    ui.weak(hint);
+}
+
 /// 程序化设置某个 egui 窗口的「折叠（最小化）」状态。
 ///
 /// egui 0.27 的 `Window` 只有 `collapsible`，没有公开的 `minimized()`；
@@ -1491,6 +1541,7 @@ impl CsvEditorApp {
     /// 派生列（拆分/合并/复制/哈希等新列）不作为统计字段：其值不是文件里的原始数据，
     /// 且统计走的是 `RowReader` 的零拷贝原列读取。
     fn dialog_stats(&mut self, ctx: &egui::Context, open: &mut bool) {
+        ensure_stats_limits(self, ctx);
         let mut keep = *open;
         let mut done = false;
         apply_dialog_pos(
@@ -1642,6 +1693,22 @@ impl CsvEditorApp {
                 }
             });
 
+            limits_header(
+                ui,
+                "分组数超过上限时会报错；内存富余就把它调大，或先筛选缩小范围",
+            );
+            let mut limits_changed = false;
+            limits_changed |= limits_row(
+                ui,
+                "分组数上限",
+                &mut self.dialogs.stats_limits.max_groups,
+                100..=5_000_000,
+                500.0,
+                "分组汇总最多允许多少个分组（默认 20000）；也用作交叉统计的取值上限",
+            );
+            if limits_changed {
+                save_stats_limits(ctx, self.dialogs.stats_limits);
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if ui.button("开始汇总").clicked() {
@@ -1667,6 +1734,7 @@ impl CsvEditorApp {
     /// 「数值列统计」参数对话框：勾选要统计的原始列。
     /// 与分组汇总参数窗一致，只列出原始列（派生列的值不是文件原始数据）。
     fn dialog_column_stats(&mut self, ctx: &egui::Context, open: &mut bool) {
+        ensure_stats_limits(self, ctx);
         let mut keep = *open;
         let mut done = false;
         apply_dialog_pos(
@@ -1738,6 +1806,22 @@ impl CsvEditorApp {
                 });
             self.dialogs.col_stats_cols = sel.clone();
 
+            limits_header(
+                ui,
+                "中位数需要保留该列的原始数值：预算越大，能精确算中位数的数据量越大（约 8 字节/个）",
+            );
+            let mut limits_changed = false;
+            limits_changed |= limits_row(
+                ui,
+                "中位数数值保留总量",
+                &mut self.dialogs.stats_limits.median_budget,
+                1_000_000..=200_000_000,
+                1_000_000.0,
+                "所有统计列共享、按列数均分（默认 2000 万 ≈ 160MB）；超出时该列中位数显示「—」",
+            );
+            if limits_changed {
+                save_stats_limits(ctx, self.dialogs.stats_limits);
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if ui.button("开始统计").clicked() {
@@ -2053,6 +2137,7 @@ impl CsvEditorApp {
 
     /// 「交叉 / 关联统计」参数对话框：A 字段 × B 字段 + 明细前 N 项。
     fn dialog_cross_stats(&mut self, ctx: &egui::Context, open: &mut bool) {
+        ensure_stats_limits(self, ctx);
         let mut keep = *open;
         let mut done = false;
         apply_dialog_pos(
@@ -2140,6 +2225,30 @@ impl CsvEditorApp {
                 ui.label("个 A 取值（按「对应的 B 个数」从多到少）");
             });
 
+            limits_header(
+                ui,
+                "取值数或组合数超出上限时会报错；内存富余可调大，或先筛选缩小范围",
+            );
+            let mut limits_changed = false;
+            limits_changed |= limits_row(
+                ui,
+                "A 取值上限",
+                &mut self.dialogs.stats_limits.max_groups,
+                100..=5_000_000,
+                500.0,
+                "A 字段最多允许多少个不同取值（默认 20000，与分组汇总之分组数上限共用）",
+            );
+            limits_changed |= limits_row(
+                ui,
+                "组合数上限",
+                &mut self.dialogs.stats_limits.max_cross_pairs,
+                100_000..=50_000_000,
+                500_000.0,
+                "不同 (A,B) 组合数上限（默认 100 万；每条约 60~100 字节）",
+            );
+            if limits_changed {
+                save_stats_limits(ctx, self.dialogs.stats_limits);
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let same = self.dialogs.cross_a == self.dialogs.cross_b;
@@ -2175,6 +2284,7 @@ impl CsvEditorApp {
 
     /// 「重复情况统计」参数对话框：选判重字段（不勾 = 全部字段）+ 明细前 N 项。
     fn dialog_duplicate_stats(&mut self, ctx: &egui::Context, open: &mut bool) {
+        ensure_stats_limits(self, ctx);
         let mut keep = *open;
         let mut done = false;
         apply_dialog_pos(
@@ -2258,6 +2368,22 @@ impl CsvEditorApp {
                 ui.label("个重复键（按重复次数降序；其余汇总为一行）");
             });
 
+            limits_header(
+                ui,
+                "判重键的不同取值超出上限时会报错；内存富余可调大，或减少判重字段 / 先筛选",
+            );
+            let mut limits_changed = false;
+            limits_changed |= limits_row(
+                ui,
+                "不同键个数上限",
+                &mut self.dialogs.stats_limits.max_dup_keys,
+                100_000..=50_000_000,
+                500_000.0,
+                "重复情况统计最多容纳多少个不同的键（默认 200 万；每条约 60~100 字节）",
+            );
+            if limits_changed {
+                save_stats_limits(ctx, self.dialogs.stats_limits);
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if ui.button("开始统计").clicked() {
@@ -2371,6 +2497,7 @@ impl CsvEditorApp {
 
     /// 「取值频次分布 / Top-N」参数对话框：勾选要统计的列 + 每列显示前 N 项。
     fn dialog_value_frequency(&mut self, ctx: &egui::Context, open: &mut bool) {
+        ensure_stats_limits(self, ctx);
         let mut keep = *open;
         let mut done = false;
         apply_dialog_pos(
@@ -2456,6 +2583,22 @@ impl CsvEditorApp {
                 ui.weak("N 越大结果表越长；常见的「找出最多的前 20 条」填 20 即可");
             });
 
+            limits_header(
+                ui,
+                "不同取值超出上限时会拒绝统计（Top-N 依赖完整计数）；内存富余可调大，或先筛选缩小范围",
+            );
+            let mut limits_changed = false;
+            limits_changed |= limits_row(
+                ui,
+                "不同取值总量上限",
+                &mut self.dialogs.stats_limits.freq_budget,
+                100_000..=50_000_000,
+                500_000.0,
+                "所有统计列共享、按列数均分（默认 300 万；每个不同取值约 60~100 字节）",
+            );
+            if limits_changed {
+                save_stats_limits(ctx, self.dialogs.stats_limits);
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if ui.button("开始统计").clicked() {

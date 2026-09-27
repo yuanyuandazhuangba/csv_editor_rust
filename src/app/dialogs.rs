@@ -70,6 +70,10 @@ pub struct DialogStates {
     pub dup_cols: Vec<usize>,
     /// 明细列出前 N 个重复键（0 = 尚未初始化，界面按 100 处理）
     pub dup_top_n: usize,
+    // 数据分析：各统计功能的规模上限（可在参数窗里按硬件调整，并写入 egui memory 记忆）
+    pub stats_limits: csv_editor_rust::core::stats::StatsLimits,
+    /// 是否已从 egui memory 恢复过上限设置（首次打开参数窗时恢复一次）
+    pub stats_limits_loaded: bool,
     // 数据分析：透视表
     pub pivot_window: bool,
     /// 行字段（视图列索引，1~2 个）
