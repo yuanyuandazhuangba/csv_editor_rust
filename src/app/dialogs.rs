@@ -58,6 +58,12 @@ pub struct DialogStates {
     pub col_stats_window: bool,
     /// 要统计的列（视图列索引）
     pub col_stats_cols: Vec<usize>,
+    // 数据分析：取值频次分布 / Top-N
+    pub freq_window: bool,
+    /// 要统计的列（视图列索引）
+    pub freq_cols: Vec<usize>,
+    /// 每列显示前 N 项（0 = 尚未初始化，界面按 20 处理）
+    pub freq_top_n: usize,
     // 筛选/拆分/文件信息 弹出窗口
     pub filter_window: bool,
     pub split_window: bool,

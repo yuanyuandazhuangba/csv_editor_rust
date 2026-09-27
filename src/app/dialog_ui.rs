@@ -135,6 +135,9 @@ impl CsvEditorApp {
         let mut f = std::mem::take(&mut self.dialogs.col_stats_window);
         self.dialog_column_stats(ctx, &mut f);
         self.dialogs.col_stats_window = f;
+        let mut f = std::mem::take(&mut self.dialogs.freq_window);
+        self.dialog_value_frequency(ctx, &mut f);
+        self.dialogs.freq_window = f;
         let mut f = std::mem::take(&mut self.dialogs.stats_result_window);
         self.dialog_stats_result(ctx, &mut f);
         self.dialogs.stats_result_window = f;
@@ -1233,11 +1236,12 @@ impl CsvEditorApp {
                         ui.label("• 输入或拖动数值即可把菜单、菜单命令、工具栏按钮、表格文字整体等比放大，方便视力不佳的用户；");
                         ui.weak("设置会被记住，下次启动仍然生效。");
                     });
-                    ui.collapsing("九、数据分析（消除重复行 / 分组汇总 / 列统计）", |ui| {
-                        ui.label("三条命令都在「数据分析」工具栏与菜单「数据分析」下；作用范围都是当前筛选结果（未筛选则为全部数据）。");
+                    ui.collapsing("九、数据分析（去重 / 分组汇总 / 列统计 / 频次分布）", |ui| {
+                        ui.label("四条命令都在「数据分析」工具栏与菜单「数据分析」下；作用范围都是当前筛选结果（未筛选则为全部数据）。");
                         ui.label("• 提取唯一行（去重）：勾选判重字段（一个都不勾 = 按整行判重），执行后保留唯一行并作为当前视图，可继续导出、拆分、统计；完成后可导出「重复行对应表」。");
                         ui.label("• 字段分组汇总：选 1~3 个分组字段，再为若干列添加汇总方式（求和/均值/最大/最小/计数/去重计数/空值数），点「开始汇总」；结果是每组一行的汇总表（含「行数」）。");
                         ui.label("• 数值列统计：勾选要统计的列（可多选），点「开始统计」；给出每列的行数、计数、空值数、非数值数、求和、均值、中位数、最小、最大、标准差（总体）。");
+                        ui.label("• 频次分布 / Top-N：勾选列并设置「每列显示前 N 项」，点「开始统计」；列出各取值的出现次数与占比（按次数从多到少），空值作为「(空)」一类参与排名，超出前 N 项的汇总为一行「(其余 M 个取值)」，因此各行占比之和是 100%。常用法：找出卡号/账号出现次数最多的前 20 条。注意：若某列不同取值过多（超过内存上限）会提示先用筛选缩小范围，不会给出不完整的频次结果。");
                         ui.label("    金额等按数值精确计算（定点十进制累加，两位小数的合计不会出现 3613134567.580001 这类多余尾数）；某列若混有文字会被跳过，并在结果窗提示「N 个非数值未参与计算」；");
                         ui.label("    中位数需要保留该列的原始数值：数据量特别大时（超过用内存上限）该列中位数显示「—」，并提示先用筛选缩小范围；");
                         ui.label("    结果窗可「最小化」成一条标题栏（结果不丢），稍后点标题栏左侧三角展开即可继续查看或导出；");
@@ -1733,9 +1737,114 @@ impl CsvEditorApp {
         *open = keep;
     }
 
-    /// 统计结果窗（分组汇总 / 数值列统计共用）：虚拟化表格展示 + 导出 CSV / XLSX
-    /// （可最小化为标题栏稍后再导出）。两个统计各自有不同的窗口标题，因此位置、
-    /// 最小化状态互不干扰。
+    /// 「取值频次分布 / Top-N」参数对话框：勾选要统计的列 + 每列显示前 N 项。
+    fn dialog_value_frequency(&mut self, ctx: &egui::Context, open: &mut bool) {
+        let mut keep = *open;
+        let mut done = false;
+        apply_dialog_pos(
+            egui::Window::new("取值频次分布 / Top-N")
+                .open(&mut keep)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([600.0, 540.0]),
+            self.dialog_position,
+            ctx,
+        )
+        .show(ctx, |ui| {
+            let header = self.header_names();
+            if header.is_empty() {
+                ui.label("请先加载数据");
+                return;
+            }
+            let base_ok: Vec<bool> = (0..header.len())
+                .map(|i| self.ops.as_ref().and_then(|o| o.view_to_base(i)).is_some())
+                .collect();
+            let scope = match self.visible_rows() {
+                Some(v) => format!("当前筛选结果（{} 行）", v.len()),
+                None => format!(
+                    "全部数据（{} 行）",
+                    self.model.as_ref().map(|m| m.row_count()).unwrap_or(0)
+                ),
+            };
+            ui.label(format!("统计范围：{scope}"));
+            ui.weak(
+                "统计勾选列各取值的出现次数与占比，按次数从多到少排出前 N 项（例：找出卡号出现次数最多的前 20 条）。\
+                 按原值统计（区分大小写与首尾空格，与去重一致）；空值归为一类「(空)」参与排名；\
+                 超出前 N 项的取值汇总为一行「(其余 M 个取值)」，所以各行的占比之和始终是 100%。\
+                 派生列不参与统计。",
+            );
+            ui.separator();
+
+            ui.label("选择要统计的列:");
+            self.dialogs
+                .freq_cols
+                .retain(|&i| i < header.len() && base_ok[i]);
+            let mut sel = self.dialogs.freq_cols.clone();
+            let selectable = base_ok.iter().filter(|b| **b).count();
+            ui.horizontal(|ui| {
+                if ui.small_button("全选").clicked() {
+                    sel = (0..header.len()).filter(|&i| base_ok[i]).collect();
+                }
+                if ui.small_button("全不选").clicked() {
+                    sel.clear();
+                }
+                ui.weak(format!("已选 {} / {} 列（可统计列）", sel.len(), selectable));
+            });
+            egui::ScrollArea::vertical()
+                .max_height(220.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (i, h) in header.iter().enumerate() {
+                        if !base_ok[i] {
+                            continue; // 派生列不列出
+                        }
+                        let mut on = sel.contains(&i);
+                        ui.checkbox(&mut on, h);
+                        if on && !sel.contains(&i) {
+                            sel.push(i);
+                        } else if !on {
+                            sel.retain(|&x| x != i);
+                        }
+                    }
+                });
+            self.dialogs.freq_cols = sel.clone();
+
+            ui.separator();
+            if self.dialogs.freq_top_n == 0 {
+                self.dialogs.freq_top_n = 20; // 懒初始化默认值
+            }
+            ui.horizontal(|ui| {
+                ui.label("每列显示前");
+                ui.add(
+                    egui::DragValue::new(&mut self.dialogs.freq_top_n)
+                        .clamp_range(1..=stats::MAX_FREQ_TOP_N)
+                        .speed(1.0),
+                );
+                ui.label("项（Top-N）");
+                ui.weak("N 越大结果表越长；常见的「找出最多的前 20 条」填 20 即可");
+            });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("开始统计").clicked() {
+                    self.run_value_frequency();
+                    done = true;
+                }
+                if ui.button("取消").clicked() {
+                    done = true;
+                }
+                ui.weak(format!("已选 {} 列", sel.len()));
+            });
+        });
+        if done {
+            keep = false;
+        }
+        *open = keep;
+    }
+
+    /// 统计结果窗（分组汇总 / 数值列统计 / 频次分布共用）：虚拟化表格展示 +
+    /// 导出 CSV / XLSX（可最小化为标题栏稍后再导出）。三种统计各有不同的窗口标题，
+    /// 因此位置、最小化状态互不干扰。
     fn dialog_stats_result(&mut self, ctx: &egui::Context, open: &mut bool) {
         let mut keep = *open;
         let mut done = false;

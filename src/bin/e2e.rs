@@ -263,6 +263,80 @@ fn main() {
         println!("WARN 无可用于数值列统计的列，跳过统计");
     }
 
+    // 8. 频次分布 / Top-N：找出取值出现次数最多的前 N 项
+    let mut freq_cols: Vec<usize> = Vec::new();
+    if let Some(c) = group_col {
+        freq_cols.push(c);
+    }
+    if let Some(c) = col_of("交易是否成功") {
+        freq_cols.push(c);
+    }
+    if !freq_cols.is_empty() {
+        let cols = freq_cols.clone();
+        let t = Instant::now();
+        match stats::value_frequency(&m, filtered.as_deref(), &cols, 20, None) {
+            Ok(tb) => {
+                // 内置一致性核对：每列各行的「出现次数」之和 == 统计范围行数
+                // （同一列的项在结果表中连续排列，因此按列名变化分段累加即可）
+                let mut sums: Vec<u64> = Vec::new();
+                let mut cur: Option<String> = None;
+                for r in &tb.rows {
+                    if cur.as_deref() != Some(r[0].as_str()) {
+                        cur = Some(r[0].clone());
+                        sums.push(0);
+                    }
+                    if let Ok(n) = r[3].parse::<u64>() {
+                        *sums.last_mut().unwrap() += n;
+                    }
+                }
+                let rows_ok = sums.iter().all(|s| *s as usize == tb.input_rows);
+                println!(
+                    "OK  频次分布 {}: 统计范围 {} 行 × {} 列，共 {} 项，计数核对 {} ({:.2}s)",
+                    if filtered.is_some() { "(当前筛选结果)" } else { "(全量)" },
+                    tb.input_rows,
+                    cols.len(),
+                    tb.rows.len(),
+                    if rows_ok { "通过" } else { "未通过" },
+                    t.elapsed().as_secs_f64()
+                );
+                if let Some(first) = tb.rows.first() {
+                    println!(
+                        "      首项：{} 的「{}」出现 {} 次（占比 {}%）",
+                        first[0], first[2], first[3], first[4]
+                    );
+                }
+                for note in &tb.notes {
+                    println!("      {}", note);
+                }
+                if !rows_ok {
+                    fails += 1;
+                }
+                let sc = format!("{}\\e2e_freq.csv", out_dir);
+                match export::export_rows_csv(&sc, &tb.headers, tb.rows.iter().cloned()) {
+                    Ok(n) => println!("OK  导出频次分布 CSV: {} 项 -> {}", n, sc),
+                    Err(e) => {
+                        println!("FAIL 导出频次分布 CSV: {}", e);
+                        fails += 1;
+                    }
+                }
+                let sx = format!("{}\\e2e_freq.xlsx", out_dir);
+                match export::export_rows_xlsx(&sx, &tb.headers, tb.rows.iter().cloned()) {
+                    Ok(n) => println!("OK  导出频次分布 XLSX: {} 项 -> {}", n, sx),
+                    Err(e) => {
+                        println!("FAIL 导出频次分布 XLSX: {}", e);
+                        fails += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                println!("FAIL 频次分布: {}", e);
+                fails += 1;
+            }
+        }
+    } else {
+        println!("WARN 无可用于频次分布的列，跳过统计");
+    }
+
     if fails == 0 {
         println!("=== 端到端回归: 全部通过 ===");    } else {
         println!("=== 端到端回归: {} 项失败 ===", fails);

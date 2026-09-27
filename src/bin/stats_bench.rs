@@ -202,6 +202,37 @@ fn main() {
         describe(&[0, 1, 2, 3, 4, 6, 7, 10, 11, 14])
     }));
 
+    // 频次分布 / Top-N（每列需维护取值→次数表）
+    let freq = |cols: &[usize], top_n: usize| -> String {
+        match csv_editor_rust::core::stats::value_frequency(&m, None, cols, top_n, None) {
+            Ok(t) => format!("{} 项", t.rows.len()),
+            Err(e) => format!("失败：{}", e),
+        }
+    };
+    results.push(bench("频次分布：1 列（银行，20 个取值）Top-20", repeat, || {
+        freq(&[1], 20)
+    }));
+    results.push(bench("频次分布：3 列（银行/城市/网点）Top-20", repeat, || {
+        freq(&[1, 6, 7], 20)
+    }));
+    results.push(bench("频次分布：5 列 Top-20", repeat, || {
+        freq(&[1, 6, 7, 10, 11], 20)
+    }));
+    results.push(bench("频次分布：5 列 Top-1000", repeat, || {
+        freq(&[1, 6, 7, 10, 11], 1000)
+    }));
+    // 护栏演示：账号是 19 位高基数列（200 万行几乎全是唯一值），超过每列不同取值上限
+    // 时会拒绝统计（Top-N 依赖完整计数，宁可拒绝也不给不完整的结果）
+    results.push(bench(
+        "频次分布：1 列（账号，200 万唯一值）→ 预期拒绝",
+        repeat,
+        || {
+            let s = freq(&[2], 20);
+            let short: String = s.chars().take(24).collect();
+            format!("{}…", short)
+        },
+    ));
+
     println!(
         "\n{:<44} {:>9} {:>9} {:>8}  {}",
         "场景", "耗时(s)", "CPU(s)", "并行度", "产出"

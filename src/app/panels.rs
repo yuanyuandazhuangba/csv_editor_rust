@@ -187,6 +187,10 @@ impl CsvEditorApp {
                         self.dialogs.col_stats_window = true;
                         ui.close_menu();
                     }
+                    if ui.button("频次分布 / Top-N…").clicked() {
+                        self.dialogs.freq_window = true;
+                        ui.close_menu();
+                    }
                     // 结果窗被关掉后仍可回看上次的统计结果（无需重跑）
                     let has_stats = self.last_stats.is_some();
                     if ui
@@ -305,6 +309,15 @@ impl CsvEditorApp {
                             .clicked()
                         {
                             self.dialogs.col_stats_window = true;
+                        }
+                        if ui
+                            .button("🔢 频次分布…")
+                            .on_hover_text(
+                                "统计选定列各取值的出现次数与占比，按次数降序取前 N 项（找重复最集中的值），结果可查看并导出 CSV/XLSX",
+                            )
+                            .clicked()
+                        {
+                            self.dialogs.freq_window = true;
                         }
                     });
                 });
@@ -987,6 +1000,68 @@ impl CsvEditorApp {
             }
         }));
         self.set_busy("数值列统计", "正在统计各列...", 0.0);
+    }
+
+    /// 执行「取值频次分布 / Top-N」（后台线程）：统计选定列各取值的出现次数与占比。
+    /// 结果只在结果窗中查看/导出，**不**改变当前数据视图。
+    pub fn run_value_frequency(&mut self) {
+        if self.busy.is_some() {
+            self.log("已有任务在执行，请稍候");
+            return;
+        }
+        let Some(model) = self.model.clone() else {
+            self.log("请先加载数据");
+            return;
+        };
+        // 视图列 → 原始列（派生列不参与统计）
+        let cols: Vec<usize> = self
+            .dialogs
+            .freq_cols
+            .iter()
+            .filter_map(|&c| self.ops.as_ref().and_then(|o| o.view_to_base(c)))
+            .collect();
+        if cols.is_empty() {
+            self.log("请至少选择一个要统计的列（派生列不能统计）");
+            return;
+        }
+        let top_n = if self.dialogs.freq_top_n == 0 {
+            20
+        } else {
+            self.dialogs.freq_top_n.clamp(1, stats::MAX_FREQ_TOP_N)
+        };
+        self.dialogs.freq_top_n = top_n;
+        let names: Vec<String> = cols
+            .iter()
+            .filter_map(|&c| model.header().get(c).cloned())
+            .collect();
+        let scope = match self.visible_rows() {
+            Some(v) => format!("当前筛选结果 {} 行", v.len()),
+            None => format!("全部数据 {} 行", model.row_count()),
+        };
+        self.log(&format!(
+            "开始频次分布统计：{} 列 [{}]；每列前 {} 项；范围 {}",
+            cols.len(),
+            names.join("、"),
+            top_n,
+            scope
+        ));
+        let rows = self.visible_rows().map(|v| v.to_vec());
+        let tx = self.tx.clone();
+        self.worker = Some(Worker::spawn(tx.clone(), move |ctl| {
+            let result =
+                stats::value_frequency(&model, rows.as_deref(), &cols, top_n, Some(&|p| {
+                    ctl.report_progress(p as f32, "正在统计出现次数...")
+                }));
+            match result {
+                Ok(table) => {
+                    let _ = tx.send(BgMsg::StatsDone(std::sync::Arc::new(table)));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::Error(format!("频次分布统计失败：{}", e)));
+                }
+            }
+        }));
+        self.set_busy("频次分布 / Top-N", "正在统计出现次数...", 0.0);
     }
 
     /// 刷新预览视图：滚动回首行（表格内容本身每帧重渲染）

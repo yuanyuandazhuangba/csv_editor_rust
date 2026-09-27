@@ -131,6 +131,8 @@ pub enum StatsKind {
     GroupBy,
     /// 数值列描述统计
     ColumnSummary,
+    /// 取值频次分布 / Top-N
+    ValueFrequency,
 }
 
 impl StatsKind {
@@ -139,6 +141,7 @@ impl StatsKind {
         match self {
             StatsKind::GroupBy => "分组汇总",
             StatsKind::ColumnSummary => "列统计",
+            StatsKind::ValueFrequency => "频次分布",
         }
     }
 
@@ -147,6 +150,7 @@ impl StatsKind {
         match self {
             StatsKind::GroupBy => "分组汇总结果",
             StatsKind::ColumnSummary => "列统计结果",
+            StatsKind::ValueFrequency => "频次分布结果",
         }
     }
 
@@ -155,6 +159,7 @@ impl StatsKind {
         match self {
             StatsKind::GroupBy => "分组汇总",
             StatsKind::ColumnSummary => "列统计",
+            StatsKind::ValueFrequency => "频次分布",
         }
     }
 }
@@ -189,6 +194,7 @@ impl StatsTable {
         match self.kind {
             StatsKind::GroupBy => "组",
             StatsKind::ColumnSummary => "列",
+            StatsKind::ValueFrequency => "项",
         }
     }
 
@@ -205,6 +211,12 @@ impl StatsTable {
             StatsKind::ColumnSummary => {
                 format!("统计范围 {} 行 → {} 列", self.input_rows, self.rows.len())
             }
+            StatsKind::ValueFrequency => format!(
+                "统计范围 {} 行 → {} 列的取值频次（共 {} 项）",
+                self.input_rows,
+                self.aggs,
+                self.rows.len()
+            ),
         }
     }
 }
@@ -578,10 +590,279 @@ pub fn describe_columns(
     Ok(table)
 }
 
+/// 「频次分布 / Top-N」的指标表头（每列若干行）
+const FREQUENCY_HEADERS: [&str; 5] = ["列名", "排名", "取值", "出现次数", "占比(%)"];
+
+/// 频次分布可容纳的不同取值总数预算（所有统计列共享，超出报错）
+const FREQ_TOTAL_BUDGET: usize = 3_000_000;
+/// 单列可容纳的不同取值个数上限
+const FREQ_MAX_PER_COLUMN: usize = 1_000_000;
+/// 单列可容纳的不同取值个数下限（列很多时也不至于小到不可用）
+const FREQ_MIN_PER_COLUMN: usize = 200_000;
+/// 引擎允许的最大 Top-N（界面输入也已限制，这里再兜底一次）
+pub const MAX_FREQ_TOP_N: usize = 1000;
+
+/// 取值频次分布 / Top-N：对每个选定列统计各取值的出现次数与占比，按次数降序取前 `top_n`。
+///
+/// 语义与取舍：
+/// - 作用范围是传入的行集合（界面传当前筛选结果；未筛选时为全部数据）；
+/// - **按原值统计**（不 trim、区分大小写，与去重判重一致）；`trim` 后为空的值统一归入
+///   `(空)` 一类（空值也是数据质量的重要信息，因此参与排名与占比）；
+/// - 排序：出现次数降序，次数相同按取值升序（结果稳定、可复现）；
+/// - 超出 `top_n` 的取值不逐个列出，而是追加一行 `(其余 N 个取值)` 汇总其次数与占比，
+///   这样各行的占比之和始终是整体的 100%；
+/// - 占比分母是**统计范围行数**（含空值行）；
+/// - 内存护栏：不同取值总数超过预算（[`FREQ_TOTAL_BUDGET`]，按列数均分、每列上限
+///   [`FREQ_MAX_PER_COLUMN`]）时**报错**并提示缩小范围 —— Top-N 依赖完整计数，
+///   丢弃部分取值会得出错误的"最高频"结论，因此宁可拒绝也不给错的结果。
+pub fn value_frequency(
+    model: &DataModel,
+    rows: Option<&[u32]>,
+    cols: &[usize],
+    top_n: usize,
+    progress: Option<&(dyn Fn(f64) + Sync)>,
+) -> Result<StatsTable, String> {
+    let column_count = model.column_count();
+    // 丢弃越界列（界面可能传入陈旧的列索引）、去重、保持用户选择顺序
+    let mut list: Vec<usize> = Vec::new();
+    for &c in cols {
+        if c < column_count && !list.contains(&c) {
+            list.push(c);
+        }
+    }
+    if list.is_empty() {
+        return Err("请至少选择一个有效的列（列可能已删除或隐藏）".to_string());
+    }
+    let top_n = top_n.clamp(1, MAX_FREQ_TOP_N);
+    let cap = (FREQ_TOTAL_BUDGET / list.len()).clamp(FREQ_MIN_PER_COLUMN, FREQ_MAX_PER_COLUMN);
+    value_frequency_with_cap(model, rows, &list, top_n, cap, progress)
+}
+
+/// [`value_frequency`] 的内部实现（`cap` 显式传入，便于测试用极小上限驱动超限路径）
+fn value_frequency_with_cap(
+    model: &DataModel,
+    rows: Option<&[u32]>,
+    list: &[usize],
+    top_n: usize,
+    cap: usize,
+    progress: Option<&(dyn Fn(f64) + Sync)>,
+) -> Result<StatsTable, String> {
+    let total = rows.map(|v| v.len()).unwrap_or_else(|| model.row_count());
+    let mut table = StatsTable {
+        kind: StatsKind::ValueFrequency,
+        headers: FREQUENCY_HEADERS.iter().map(|s| s.to_string()).collect(),
+        rows: Vec::new(),
+        input_rows: total,
+        group_columns: 0,
+        aggs: list.len(),
+        notes: Vec::new(),
+    };
+    if total == 0 {
+        for &c in list {
+            table.rows.push(vec![
+                column_name(model, c),
+                String::new(),
+                "(无数据)".to_string(),
+                "0".to_string(),
+                "0.00".to_string(),
+            ]);
+        }
+        if let Some(p) = progress {
+            p(1.0);
+        }
+        return Ok(table);
+    }
+
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(MAX_STATS_THREADS)
+        .min(total);
+    let chunk = (total / threads).max(1);
+    let done = AtomicUsize::new(0);
+    let mut blocks: Vec<FreqBlock> = Vec::new();
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        let mut start = 0usize;
+        while start < total {
+            let end = (start + chunk).min(total);
+            let model_ref = model;
+            let list_ref = list;
+            let rows_ref = rows;
+            let done_ref = &done;
+            let prog = progress;
+            handles.push(s.spawn(move || {
+                let mut reader = RowReader::new(list_ref.to_vec());
+                let mut block = FreqBlock::new(list_ref.len());
+                for i in start..end {
+                    let row = match rows_ref {
+                        Some(l) => l[i] as usize,
+                        None => i,
+                    };
+                    reader.load(model_ref.file(), row);
+                    for (idx, &c) in list_ref.iter().enumerate() {
+                        block.push(idx, reader.value(c), cap);
+                    }
+                }
+                done_ref.fetch_add(end - start, AtomicOrdering::Relaxed);
+                if let Some(p) = prog {
+                    p(done_ref.load(AtomicOrdering::Relaxed) as f64 / total as f64);
+                }
+                block
+            }));
+            start = end;
+        }
+        for h in handles {
+            blocks.push(h.join().unwrap_or_default());
+        }
+    });
+
+    // 按列合并各块的频次表（内存有界：每列不超过 cap 个不同取值）
+    let mut maps: Vec<HashMap<String, u64>> = list.iter().map(|_| HashMap::new()).collect();
+    let mut empties: Vec<u64> = vec![0; list.len()];
+    let mut overflow: Vec<bool> = vec![false; list.len()];
+    for mut block in blocks {
+        for (i, m) in block.maps.drain(..).enumerate() {
+            empties[i] += block.empties[i];
+            overflow[i] |= block.overflow[i];
+            let dst = &mut maps[i];
+            for (k, v) in m {
+                match dst.get_mut(k.as_str()) {
+                    Some(count) => *count += v,
+                    None => {
+                        if dst.len() >= cap {
+                            overflow[i] = true; // 已达上限：内存有界，最终报错
+                        } else {
+                            dst.insert(k, v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(i) = overflow.iter().position(|&x| x) {
+        return Err(format!(
+            "列「{}」的不同取值超过上限 {}（统计范围 {} 行），已停止统计：请先用筛选缩小范围，\
+             或减少一次统计的列数，再重新执行",
+            column_name(model, list[i]),
+            cap,
+            total
+        ));
+    }
+
+    // 每列取 Top-N（超出部分汇总为「(其余 N 个取值)」行）
+    for (i, &c) in list.iter().enumerate() {
+        let name = column_name(model, c);
+        let mut items: Vec<(String, u64)> = maps[i].drain().collect();
+        if empties[i] > 0 {
+            items.push(("(空)".to_string(), empties[i]));
+        }
+        if items.is_empty() {
+            table.rows.push(vec![
+                name.clone(),
+                String::new(),
+                "(无数据)".to_string(),
+                "0".to_string(),
+                "0.00".to_string(),
+            ]);
+            continue;
+        }
+        // 次数降序；次数相同按取值升序（结果稳定可复现）
+        items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let distinct = items.len();
+        let shown = top_n.min(distinct);
+        let pct = |n: u64| format!("{:.2}", n as f64 * 100.0 / total as f64);
+        for (rank, (value, count)) in items.iter().take(shown).enumerate() {
+            table.rows.push(vec![
+                name.clone(),
+                (rank + 1).to_string(),
+                value.clone(),
+                count.to_string(),
+                pct(*count),
+            ]);
+        }
+        if distinct > shown {
+            let rest_count: u64 = items[shown..].iter().map(|(_, c)| *c).sum();
+            table.rows.push(vec![
+                name.clone(),
+                String::new(),
+                format!("(其余 {} 个取值)", distinct - shown),
+                rest_count.to_string(),
+                pct(rest_count),
+            ]);
+        }
+        if empties[i] > 0 {
+            table.notes.push(format!(
+                "{}：{} 行为空值（已作为「(空)」参与频次与占比）",
+                name, empties[i]
+            ));
+        }
+        table.notes.push(if distinct > shown {
+            format!(
+                "{}：共 {} 个不同取值，已列出前 {} 项，其余 {} 个汇总为「(其余 …)」一行",
+                name,
+                distinct,
+                shown,
+                distinct - shown
+            )
+        } else {
+            format!("{}：共 {} 个不同取值（已全部列出）", name, distinct)
+        });
+    }
+    table
+        .notes
+        .push("占比分母是统计范围行数（含空值行）；按原值统计（区分大小写与首尾空格，与去重一致）。".to_string());
+    if let Some(p) = progress {
+        p(1.0);
+    }
+    Ok(table)
+}
+
+/// 一个行块内、所有统计列的频次表
+#[derive(Debug, Default)]
+struct FreqBlock {
+    /// 每列：取值 → 出现次数
+    maps: Vec<HashMap<String, u64>>,
+    /// 每列的空值（trim 后为空）行数
+    empties: Vec<u64>,
+    /// 每列是否因超过上限而停止收集新取值
+    overflow: Vec<bool>,
+}
+
+impl FreqBlock {
+    fn new(cols: usize) -> Self {
+        Self {
+            maps: (0..cols).map(|_| HashMap::new()).collect(),
+            empties: vec![0; cols],
+            overflow: vec![false; cols],
+        }
+    }
+
+    /// 累加一行中某一列的取值；超过 `cap` 时只置超限标记（内存有界，最终由调用方报错）
+    fn push(&mut self, idx: usize, value: &str, cap: usize) {
+        let t = value.trim();
+        if t.is_empty() {
+            self.empties[idx] += 1;
+            return;
+        }
+        let map = &mut self.maps[idx];
+        match map.get_mut(value) {
+            // 命中已有取值：借用查询，不分配
+            Some(count) => *count += 1,
+            None => {
+                if map.len() >= cap {
+                    self.overflow[idx] = true;
+                } else {
+                    map.insert(value.to_string(), 1);
+                }
+            }
+        }
+    }
+}
+
 /// 单列的描述统计累加器
 #[derive(Debug, Clone)]
-struct ColAcc {
-    /// 参与统计的行数（含空值）
+struct ColAcc {    /// 参与统计的行数（含空值）
     rows: u64,
     /// 非空值个数
     count: u64,
@@ -1803,6 +2084,187 @@ mod tests {
         // 数据只有 1、2 两个不同取值 → 2 组
         assert_eq!(g.summary(), "统计范围 2 行 → 2 组（分组字段 1 个，聚合列 1 个）");
         assert_eq!(g.row_unit(), "组");
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ===== 取值频次分布 / Top-N（value_frequency）=====
+
+    fn freq(m: &DataModel, cols: &[usize], top_n: usize) -> StatsTable {
+        value_frequency(m, None, cols, top_n, None).unwrap()
+    }
+
+    #[test]
+    fn frequency_ranks_by_count_desc_then_value() {
+        // c 3 次、a 2 次、b 1 次 → 排名按次数降序，次数相同按取值升序
+        let p = write_temp("城市\nc\na\nb\nc\na\nc\n".as_bytes(), "_fq1.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = freq(&m, &[0], 10);
+        assert_eq!(t.kind, StatsKind::ValueFrequency);
+        assert_eq!(t.headers, vec!["列名", "排名", "取值", "出现次数", "占比(%)"]);
+        assert_eq!(t.input_rows, 6);
+        assert_eq!(t.rows[0], vec!["城市", "1", "c", "3", "50.00"]);
+        assert_eq!(t.rows[1], vec!["城市", "2", "a", "2", "33.33"]);
+        assert_eq!(t.rows[2], vec!["城市", "3", "b", "1", "16.67"]);
+        assert_eq!(t.rows.len(), 3);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn frequency_top_n_truncates_with_rest_row() {
+        // Top-2：只列前 2 名，剩余取值汇总为「(其余 N 个取值)」一行，占比之和 = 100%
+        let p = write_temp(
+            "卡号\nA\nA\nA\nB\nB\nC\nD\nD\n".as_bytes(),
+            "_fq2.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = freq(&m, &[0], 2);
+        assert_eq!(t.rows.len(), 3); // 2 名 + 其余
+        assert_eq!(t.rows[0], vec!["卡号", "1", "A", "3", "37.50"]);
+        // B 与 D 都是 2 次 → 按取值升序，B 在前
+        assert_eq!(t.rows[1], vec!["卡号", "2", "B", "2", "25.00"]);
+        assert_eq!(t.rows[2], vec!["卡号", "", "(其余 2 个取值)", "3", "37.50"]);
+        // 各「出现次数」之和 == 统计范围行数（占比之和 100%）
+        let sum: u64 = t
+            .rows
+            .iter()
+            .map(|r| r[3].parse::<u64>().unwrap())
+            .sum();
+        assert_eq!(sum, 8);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn frequency_counts_empty_as_its_own_value() {
+        // 空/全空白行归入「(空)」一类，并参与排名与占比
+        let p = write_temp(
+            "备注\n\nx\n   \nx\n\n".as_bytes(),
+            "_fq3.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = freq(&m, &[0], 10);
+        assert_eq!(t.input_rows, 5);
+        assert_eq!(t.rows[0], vec!["备注", "1", "(空)", "3", "60.00"]);
+        assert_eq!(t.rows[1], vec!["备注", "2", "x", "2", "40.00"]);
+        assert!(t.notes.iter().any(|n| n.contains("3 行为空值")), "{:?}", t.notes);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn frequency_multi_column_and_row_subset() {
+        // 多列：每列各自一组 Top-N，输出带「列名」列；统计范围可传行子集
+        let p = write_temp(
+            "城市,渠道\n北京,网银\n上海,网银\n北京,手机\n深圳,柜面\n".as_bytes(),
+            "_fq4.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = freq(&m, &[0, 1], 10);
+        assert_eq!(t.aggs, 2);
+        assert_eq!(t.row_unit(), "项");
+        // 城市：北京 2/4 = 50%；渠道：网银 2 次居首，其余各 1 次按取值升序（手机 < 柜面）
+        assert_eq!(t.rows[0], vec!["城市", "1", "北京", "2", "50.00"]);
+        assert_eq!(t.rows[1], vec!["城市", "2", "上海", "1", "25.00"]);
+        assert_eq!(t.rows[2], vec!["城市", "3", "深圳", "1", "25.00"]);
+        assert_eq!(t.rows[3], vec!["渠道", "1", "网银", "2", "50.00"]);
+        assert_eq!(t.rows[4], vec!["渠道", "2", "手机", "1", "25.00"]);
+        assert_eq!(t.rows[5], vec!["渠道", "3", "柜面", "1", "25.00"]);
+        // 行子集：只看第 0、2 行（都是北京）
+        let t2 = value_frequency(&m, Some(&[0, 2]), &[0], 10, None).unwrap();
+        assert_eq!(t2.input_rows, 2);
+        assert_eq!(t2.rows[0], vec!["城市", "1", "北京", "2", "100.00"]);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn frequency_chinese_quoted_and_whitespace_values() {
+        // 中文、含逗号的引号字段、含制表符的值都按原值区分（与去重判重一致）
+        let p = write_temp(
+            "备注,\"城市\"\n\"a,b\",北京\na,北京 \n\"a,b\",北京\n".as_bytes(),
+            "_fq5.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = freq(&m, &[1], 10);
+        // "北京" 与 "北京 " 是两类（不 trim）
+        assert_eq!(t.rows[0][2], "北京");
+        assert_eq!(t.rows[0][3], "2");
+        assert_eq!(t.rows[1][2], "北京 ");
+        assert_eq!(t.rows[1][3], "1");
+        let t2 = freq(&m, &[0], 10);
+        assert_eq!(t2.rows[0], vec!["备注", "1", "a,b", "2", "66.67"]);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn frequency_parallel_merge_matches_expected() {
+        // 12000 行、7 个取值 → 跨块合并后计数正确（并行分块路径）
+        let mut data = String::from("组\n");
+        for i in 0..12000u32 {
+            data.push_str(&format!("g{}\n", i % 7));
+        }
+        let p = write_temp(data.as_bytes(), "_fq6.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = freq(&m, &[0], 10);
+        assert_eq!(t.rows.len(), 7);
+        for (i, r) in t.rows.iter().enumerate() {
+            assert_eq!(r[2], format!("g{}", i), "并列时按取值升序");
+            let expect = (0..12000).filter(|x| x % 7 == i as u32).count();
+            assert_eq!(r[3], expect.to_string());
+        }
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn frequency_rejects_invalid_columns_and_empty_range() {
+        let p = write_temp("A\n1\n".as_bytes(), "_fq7.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        assert!(value_frequency(&m, None, &[], 10, None).is_err());
+        assert!(value_frequency(&m, None, &[99], 10, None).is_err());
+        // 越界列被忽略，其余列正常
+        let t = freq(&m, &[0, 42], 10);
+        assert_eq!(t.aggs, 1);
+        // 空范围：每列一行「(无数据)」
+        let t2 = value_frequency(&m, Some(&[]), &[0], 10, None).unwrap();
+        assert_eq!(t2.rows, vec![vec!["A", "", "(无数据)", "0", "0.00"]]);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn frequency_reports_error_when_too_many_distinct_values() {
+        // 不同取值超过上限时**报错**（Top-N 依赖完整计数，不能悄悄丢弃取值）
+        let p = write_temp("卡号\nA\nB\nC\n".as_bytes(), "_fq8.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let err = value_frequency_with_cap(&m, None, &[0], 10, 2, None).unwrap_err();
+        assert!(err.contains("卡号"), "{err}");
+        assert!(err.contains("超过上限 2"), "{err}");
+        // 上限内正常返回
+        let ok = value_frequency_with_cap(&m, None, &[0], 10, 3, None).unwrap();
+        assert_eq!(ok.rows.len(), 3);
+
+        // 块级：超过 cap 时只保留 cap 个不同取值（内存有界），已有取值继续计数
+        let mut block = FreqBlock::new(1);
+        for v in ["a", "b", "c"] {
+            block.push(0, v, 2);
+        }
+        assert!(block.overflow[0], "超过 cap 应置超限标记");
+        assert_eq!(block.maps[0].len(), 2, "内存有界：只保留 cap 个不同取值");
+        assert_eq!(block.maps[0].get("a"), Some(&1));
+        block.push(0, "a", 2);
+        assert_eq!(block.maps[0].get("a"), Some(&2));
+        // 空值单独计数、不占取值配额
+        block.push(0, "   ", 2);
+        assert_eq!(block.empties[0], 1);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn frequency_notes_and_summary_text() {
+        let p = write_temp("城市\n北京\n上海\n".as_bytes(), "_fq9.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = freq(&m, &[0], 20);
+        assert_eq!(t.summary(), "统计范围 2 行 → 1 列的取值频次（共 2 项）");
+        assert!(t.notes.iter().any(|n| n.contains("2 个不同取值")));
+        assert!(t.notes.iter().any(|n| n.contains("占比分母")));
+        assert_eq!(t.kind.file_stem(), "频次分布");
+        assert_eq!(t.kind.title(), "频次分布结果");
         std::fs::remove_file(&p).ok();
     }
 }
