@@ -2627,6 +2627,9 @@ impl CsvEditorApp {
         // 「重复情况统计」才有的行号集合（用于把结果落到当前数据视图）
         let filter_rows = self.stats_filter_rows.clone();
         let mut apply_rows: Option<(Vec<u32>, &'static str)> = None;
+        // 「频次分布」才有的"按出现次数筛选"上下文（单列时可用）
+        let freq_filter_col = self.freq_filter_cols.first().copied();
+        let mut run_freq_filter = false;
         // 结果类型决定窗口标题（标题同时是 egui 窗口 Id）
         let kind = self.last_stats.as_ref().map(|t| t.kind).unwrap_or_default();
         let title = kind.title();
@@ -2722,6 +2725,35 @@ impl CsvEditorApp {
                 }
                 ui.weak("行号从 1 开始；表格可拖动列宽、滚动查看全部行");
             });
+            // 频次分布：把"高频取值对应的行"一键筛回当前视图
+            if kind == stats::StatsKind::ValueFrequency && freq_filter_col.is_some() {
+                if self.dialogs.freq_min_count == 0 {
+                    self.dialogs.freq_min_count = 2; // 懒初始化默认值
+                }
+                ui.horizontal(|ui| {
+                    ui.label("只看出现次数 ≥");
+                    ui.add(
+                        egui::DragValue::new(&mut self.dialogs.freq_min_count)
+                            .clamp_range(1usize..=1_000_000usize)
+                            .speed(1.0),
+                    )
+                    .on_hover_text(
+                        "填 2 即「只看重复/高频的值」；填 1 等于把全部行按取值分组重排",
+                    );
+                    ui.label("的行");
+                    if ui
+                        .button("筛出这些行")
+                        .on_hover_text(
+                            "把当前视图切换为这些取值对应的行（按取值分组排列，同值相邻）；\
+                             用工具栏「清除筛选」可恢复全部",
+                        )
+                        .clicked()
+                    {
+                        run_freq_filter = true;
+                    }
+                    ui.weak("仅统计单列时可用");
+                });
+            }
             ui.separator();
 
             // 结果行数可能上万：沿用预览表的虚拟化渲染（只布局可见行）
@@ -2784,6 +2816,9 @@ impl CsvEditorApp {
         if let Some((path, is_xlsx)) = export {
             // 导出是「额外动作」：结果窗保持打开，方便继续查看或再导出另一种格式
             self.export_stats(path, is_xlsx);
+        }
+        if run_freq_filter {
+            self.run_frequency_filter();
         }
         if let Some((rows, what)) = apply_rows {
             let n = rows.len();

@@ -64,6 +64,8 @@ pub struct DialogStates {
     pub freq_cols: Vec<usize>,
     /// 每列显示前 N 项（0 = 尚未初始化，界面按 20 处理）
     pub freq_top_n: usize,
+    /// 「按频次筛选」的最小出现次数（0 = 尚未初始化，界面按 2 处理）
+    pub freq_min_count: usize,
     // 数据分析：重复情况统计
     pub dup_window: bool,
     /// 判重字段（视图列索引；空 = 全部字段）

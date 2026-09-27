@@ -2191,6 +2191,93 @@ impl QualityAcc {
     }
 }
 
+/// 按「某列取值的出现次数 ≥ `min_count`」筛出行号 —— 把频次分布的结果**落回当前视图**。
+///
+/// 返回的行号按**取值的分组顺序**排列：组间按「该取值出现次数降序、取值升序」、
+/// 组内按行号升序 —— 与「重复情况统计」的行号约定一致，这样预览区里同一个取值的行
+/// 挨在一起，便于直接核对。空值（trim 后为空）作为一种取值单独成组。
+///
+/// `min_count = 1` 即"全部行"（只是按取值分组重排）；`min_count = 2` 即"只看重复/高频的值"。
+/// 不同取值个数受 [`StatsLimits::freq_budget`] 约束（超出报错，提示先筛选缩小范围）。
+pub fn rows_by_frequency_threshold(
+    model: &DataModel,
+    rows: Option<&[u32]>,
+    col: usize,
+    min_count: u64,
+    limits: StatsLimits,
+    progress: Option<&(dyn Fn(f64) + Sync)>,
+) -> Result<Vec<u32>, String> {
+    let column_count = model.column_count();
+    if col >= column_count {
+        return Err("列无效（可能已删除或隐藏）".to_string());
+    }
+    let min_count = min_count.max(1);
+    let total = rows.map(|v| v.len()).unwrap_or_else(|| model.row_count());
+
+    // 取值 → 行号列表（保序：首次出现顺序；最后再按次数排序）
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut groups: Vec<(String, Vec<u32>)> = Vec::new();
+    let cap = limits.freq_budget.max(1);
+    let mut empty_rows: Vec<u32> = Vec::new();
+    let mut reader = RowReader::new(vec![col]);
+    for i in 0..total {
+        let row = match rows {
+            Some(list) => list[i] as usize,
+            None => i,
+        };
+        reader.load(model.file(), row);
+        let v = reader.value(col);
+        if v.trim().is_empty() {
+            empty_rows.push(row as u32);
+        } else {
+            match index.get(v) {
+                Some(&gi) => groups[gi].1.push(row as u32),
+                None => {
+                    if groups.len() >= cap {
+                        return Err(format!(
+                            "该列的不同取值超过上限 {}：请先用筛选缩小范围，或在「规模上限」里调大",
+                            cap
+                        ));
+                    }
+                    index.insert(v.to_string(), groups.len());
+                    groups.push((v.to_string(), vec![row as u32]));
+                }
+            }
+        }
+        if let Some(p) = progress {
+            if i % 50_000 == 0 {
+                p(i as f64 / total.max(1) as f64);
+            }
+        }
+    }
+    if let Some(p) = progress {
+        p(1.0);
+    }
+
+    // 组间：次数降序 + 取值升序（空值组用 "‹空›" 之类的排序键会破坏语义，
+    // 因此把空值组单独参与"按次数排序"的比较即可）
+    let mut order: Vec<(usize, bool)> = (0..groups.len()).map(|i| (i, false)).collect();
+    if !empty_rows.is_empty() {
+        order.push((0, true));
+    }
+    order.sort_by(|a, b| {
+        let len_a = if a.1 { empty_rows.len() } else { groups[a.0].1.len() };
+        let len_b = if b.1 { empty_rows.len() } else { groups[b.0].1.len() };
+        let key_a = if a.1 { "" } else { groups[a.0].0.as_str() };
+        let key_b = if b.1 { "" } else { groups[b.0].0.as_str() };
+        len_b.cmp(&len_a).then_with(|| key_a.cmp(key_b))
+    });
+
+    let mut out: Vec<u32> = Vec::new();
+    for (i, is_empty) in order {
+        let rows_of_group = if is_empty { &empty_rows } else { &groups[i].1 };
+        if rows_of_group.len() as u64 >= min_count {
+            out.extend_from_slice(rows_of_group);
+        }
+    }
+    Ok(out)
+}
+
 /// 一个行块内、所有统计列的频次表
 #[derive(Debug, Default)]
 struct FreqBlock {
@@ -4049,6 +4136,68 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("不同组合数超过上限 1"), "{err}");
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ===== 按频次筛选写回视图（rows_by_frequency_threshold）=====
+
+    #[test]
+    fn frequency_filter_keeps_high_count_rows_grouped_by_value() {
+        // 数据：A×2、B×3、C×1（含一行空值）
+        let p = write_temp(
+            "卡号\nA\nB\nA\nB\nC\nB\n\n".as_bytes(),
+            "_ff1.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        // min_count = 2：只看 A、B 两组（C 与空值组被排除）
+        // 组间按次数降序（B 3 次在前、A 2 次），组内按行号升序
+        let rows = rows_by_frequency_threshold(&m, None, 0, 2, StatsLimits::default(), None).unwrap();
+        assert_eq!(rows, vec![1, 3, 5, 0, 2]);
+        // min_count = 1：返回全部行，但按取值分组排列（同值相邻，便于核对）
+        let all = rows_by_frequency_threshold(&m, None, 0, 1, StatsLimits::default(), None).unwrap();
+        assert_eq!(all.len(), 7);
+        let mut sorted = all.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..7).collect::<Vec<u32>>());
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn frequency_filter_counts_empty_as_its_own_group() {
+        // 空值（含全空白）作为一组；min_count 判定同样适用
+        let p = write_temp("备注\nx\n\n   \ny\n".as_bytes(), "_ff2.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let rows = rows_by_frequency_threshold(&m, None, 0, 2, StatsLimits::default(), None).unwrap();
+        // 空值组 2 行（行 1、2）在前，x 组 1 行不满足
+        assert_eq!(rows, vec![1, 2]);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn frequency_filter_respects_row_subset_and_limits() {
+        let p = write_temp("K\na\nb\na\n".as_bytes(), "_ff3.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        // 行子集：只看第 0、1 行 → a、b 各 1 次
+        let rows =
+            rows_by_frequency_threshold(&m, Some(&[0, 1]), 0, 2, StatsLimits::default(), None)
+                .unwrap();
+        assert!(rows.is_empty());
+        // 上限调小到 1 → 报错
+        let err = rows_by_frequency_threshold(
+            &m,
+            None,
+            0,
+            1,
+            StatsLimits {
+                freq_budget: 1,
+                ..StatsLimits::default()
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("不同取值超过上限 1"), "{err}");
+        // 越界列
+        assert!(rows_by_frequency_threshold(&m, None, 9, 1, StatsLimits::default(), None).is_err());
         std::fs::remove_file(&p).ok();
     }
 

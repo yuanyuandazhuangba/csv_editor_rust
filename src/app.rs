@@ -72,6 +72,8 @@ pub struct CsvEditorApp {
     last_stats: Option<Arc<stats::StatsTable>>,
     /// 最近一次「重复情况统计」可直接落回当前视图的行号（有结果窗内的「只看…」按钮用）
     stats_filter_rows: Option<Arc<StatsFilterRows>>,
+    /// 最近一次「频次分布」统计的原始列（结果窗里"只看出现次数 ≥ N 的行"要用）
+    freq_filter_cols: Vec<usize>,
     /// 是否把操作日志追加写入 exe 同目录的「操作日志.txt」（默认关闭）
     log_to_file: bool,
     // 界面缩放（按钮大小）的唯一真值源。拖动过程中不立即应用缩放：
@@ -174,6 +176,7 @@ impl CsvEditorApp {
             last_dedup: None,
             last_stats: None,
             stats_filter_rows: None,
+            freq_filter_cols: Vec::new(),
             log_to_file: cc.egui_ctx.memory(|m| {
                 m.data
                     .get_temp::<bool>(egui::Id::new("ops_log_to_file"))
@@ -283,6 +286,7 @@ impl CsvEditorApp {
                     // 换了数据源：上一次的统计结果不再对应当前数据，清掉
                     self.last_stats = None;
                     self.stats_filter_rows = None;
+                    self.freq_filter_cols.clear();
                     self.dialogs.stats_result_window = false;
                     self.model = Some(Arc::new(model));
                     self.log(&format!(
@@ -407,6 +411,10 @@ impl CsvEditorApp {
                     for note in &table.notes {
                         self.log(&format!("    注意：{}", note));
                     }
+                    // 只有「频次分布」的结果才支持"按出现次数筛回视图"；其它统计清空该上下文
+                    if table.kind != stats::StatsKind::ValueFrequency {
+                        self.freq_filter_cols.clear();
+                    }
                     self.last_stats = Some(table);
                     // 换了一次非重复情况统计：结果窗里的「只看重复行/唯一行」不再适用
                     self.stats_filter_rows = None;
@@ -463,6 +471,7 @@ impl CsvEditorApp {
         self.filtered_rows = None;
         self.last_stats = None;
         self.stats_filter_rows = None;
+        self.freq_filter_cols.clear();
         self.dialogs.stats_result_window = false;
         self.log("已清空所有数据");
     }

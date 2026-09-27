@@ -658,6 +658,52 @@ fn main() {
         println!("WARN 无「交易时间」列，跳过文本列最早/最晚核对");
     }
 
+    // 14. 按频次筛选写回视图：只看某列取值出现次数 ≥ N 的行
+    //     （核对：命中行数 == 频次分布里"次数 ≥ N 的取值"行数之和 —— 两个引擎互相印证）
+    if let Some(c_f) = col_of("数据来源_银行名称").or(group_col) {
+        let t = Instant::now();
+        match stats::rows_by_frequency_threshold(
+            &m,
+            filtered.as_deref(),
+            c_f,
+            2,
+            stats::StatsLimits::default(),
+            None,
+        ) {
+            Ok(rows) => {
+                let tb = stats::value_frequency(&m, filtered.as_deref(), &[c_f], 1000, None).unwrap();
+                let expect: u64 = tb
+                    .rows
+                    .iter()
+                    .filter(|r| !r[2].starts_with("(其余") && r[2] != "(合计)")
+                    .filter_map(|r| {
+                        let n: u64 = r[3].parse().ok()?;
+                        if n >= 2 {
+                            Some(n)
+                        } else {
+                            None
+                        }
+                    })
+                    .sum();
+                let ok = rows.len() as u64 == expect;
+                println!(
+                    "OK  按频次筛选（出现次数 ≥ 2 的行）{}: 命中 {} 行，与频次分布口径核对 {} ({:.2}s)",
+                    if filtered.is_some() { "(当前筛选结果)" } else { "(全量)" },
+                    rows.len(),
+                    if ok { "通过" } else { "未通过" },
+                    t.elapsed().as_secs_f64()
+                );
+                if !ok {
+                    fails += 1;
+                }
+            }
+            Err(e) => {
+                println!("FAIL 按频次筛选: {}", e);
+                fails += 1;
+            }
+        }
+    }
+
     if fails == 0 {
         println!("=== 端到端回归: 全部通过 ===");    } else {
         println!("=== 端到端回归: {} 项失败 ===", fails);

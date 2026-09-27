@@ -1118,6 +1118,8 @@ impl CsvEditorApp {
             scope
         ));
         self.log_custom_limits();
+        // 记下本次统计的列：结果窗里可据此"只看出现次数 ≥ N 的行"
+        self.freq_filter_cols = cols.clone();
         let rows = self.visible_rows().map(|v| v.to_vec());
         let limits = self.dialogs.stats_limits;
         let tx = self.tx.clone();
@@ -1140,6 +1142,56 @@ impl CsvEditorApp {
             }
         }));
         self.set_busy("频次分布 / Top-N", "正在统计出现次数...", 0.0);
+    }
+
+    /// 把「频次分布」的结果落回当前视图：只看某列取值出现次数 ≥ N 的行。
+    /// 行序按取值分组（同值相邻、次数多的在前），便于直接核对。
+    pub fn run_frequency_filter(&mut self) {
+        if self.busy.is_some() {
+            self.log("已有任务在执行，请稍候");
+            return;
+        }
+        let Some(model) = self.model.clone() else {
+            self.log("请先加载数据");
+            return;
+        };
+        let Some(&col) = self.freq_filter_cols.first() else {
+            self.log("请先做一次单列的「频次分布」统计，再用结果窗里的「只看出现次数 ≥ N 的行」");
+            return;
+        };
+        let min_count = self.dialogs.freq_min_count.max(1);
+        let scope = match self.visible_rows() {
+            Some(v) => format!("当前筛选结果 {} 行", v.len()),
+            None => format!("全部数据 {} 行", model.row_count()),
+        };
+        self.log(&format!(
+            "按频次筛选：{} 出现次数 ≥ {} 的行；范围 {}（结果按取值分组排列，同值相邻）",
+            model.header().get(col).cloned().unwrap_or_default(),
+            min_count,
+            scope
+        ));
+        let rows = self.visible_rows().map(|v| v.to_vec());
+        let limits = self.dialogs.stats_limits;
+        let tx = self.tx.clone();
+        self.worker = Some(Worker::spawn(tx.clone(), move |ctl| {
+            let result = stats::rows_by_frequency_threshold(
+                &model,
+                rows.as_deref(),
+                col,
+                min_count as u64,
+                limits,
+                Some(&|p| ctl.report_progress(p as f32, "正在筛选...")),
+            );
+            match result {
+                Ok(hits) => {
+                    let _ = tx.send(BgMsg::Filtered(hits));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::Error(format!("按频次筛选失败：{}", e)));
+                }
+            }
+        }));
+        self.set_busy("按频次筛选", "正在筛选...", 0.0);
     }
 
     /// 执行「重复情况统计」（后台线程）：找重复键、各重复几次、重复行占比，
