@@ -449,17 +449,27 @@ pub fn group_by(
         }
         table.rows.push(row);
     }
-    // 非数值提示：逐聚合列给出「有多少个非数值未参与计算」
-    for (i, spec) in specs.iter().enumerate() {
-        let n: u64 = accs.iter().map(|a| a[i].non_numeric).sum();
-        if n > 0 {
-            table.notes.push(format!(
-                "{}({})：{} 个非数值未参与计算（求和/均值/最大/最小忽略它们）",
-                column_name(model, spec.column),
-                spec.kind.label(),
-                n
-            ));
+    // 非数值提示：逐聚合列给出「有多少个非数值未参与计算」；
+    // 「最小/最大」在整列无数值时按文本顺序比较，文案要与之相符
+    for (idx, spec) in specs.iter().enumerate() {
+        let n: u64 = accs.iter().map(|a| a[idx].non_numeric).sum();
+        if n == 0 {
+            continue;
         }
+        let numeric_total: u64 = accs.iter().map(|a| a[idx].numeric).sum();
+        let name = column_name(model, spec.column);
+        let label = spec.kind.label();
+        table.notes.push(match spec.kind {
+            AggKind::Min | AggKind::Max if numeric_total == 0 => format!(
+                "{}({})：该列没有可解析的数值，最小/最大按文本顺序比较（日期时间这类定长文本即最早/最晚）",
+                name, label
+            ),
+            AggKind::Min | AggKind::Max => format!(
+                "{}({})：{} 个非数值未参与数值比较（最小/最大按数值取）",
+                name, label, n
+            ),
+            _ => format!("{}({})：{} 个非数值未参与计算（求和/均值忽略它们）", name, label, n),
+        });
     }
     if let Some(p) = progress {
         p(1.0);
@@ -615,8 +625,15 @@ pub fn describe_columns(
         // 非数值个数本身已在结果表的「非数值数」列里
         if acc.non_numeric > 0 && acc.numeric > 0 {
             table.notes.push(format!(
-                "{}：{} 个非数值未参与计算（数值判定与筛选一致）",
+                "{}：{} 个非数值未参与数值统计（最小/最大按数值取，忽略它们）",
                 name, acc.non_numeric
+            ));
+        }
+        if acc.numeric == 0 && acc.non_numeric > 0 {
+            table.notes.push(format!(
+                "{}：没有可解析的数值（求和/均值/中位数/标准差为空）；最小/最大按文本顺序比较\
+                 —— 日期时间这类定长文本即可看出最早/最晚",
+                name
             ));
         }
         if acc.numeric > acc.values.len() as u64 {
@@ -1763,6 +1780,16 @@ pub fn pivot_table(
             "表头为「列取值-值列(聚合)」；每行末尾与末行是各指标的整体聚合".to_string(),
         );
     }
+    if specs
+        .iter()
+        .any(|s| matches!(s.kind, AggKind::Min | AggKind::Max))
+    {
+        table.notes.push(
+            "「最小/最大」按数值比较；某列若整列都没有可解析数值（如 YYYY-MM-DD HH:MM:SS 的\
+             交易时间），则按文本顺序比较 —— 定长时间文本的字典序即时间先后，可直接看出最早/最晚"
+                .to_string(),
+        );
+    }
     table.notes.push(format!(
         "所有「(合计)」都是该范围的整体聚合（不是把各行数值相加）—— 均值/计数等非可加指标\
          因此在合计处依然正确；本次上限：行组合 ≤ {}、列字段取值 ≤ {}、单元格 ≤ {}（可在参数窗调整）",
@@ -2125,6 +2152,9 @@ struct ColAcc {    /// 参与统计的行数（含空值）
     m2: f64,
     min: Option<Num>,
     max: Option<Num>,
+    /// 文本极值：整列都没有可解析数值时用于「最小/最大」（日期时间等可排序文本）
+    text_min: Option<String>,
+    text_max: Option<String>,
     /// 保留的原始数值（精确中位数用；最多 `cap` 个）
     values: Vec<f64>,
     /// 单列保留上限
@@ -2145,6 +2175,8 @@ impl ColAcc {
             m2: 0.0,
             min: None,
             max: None,
+            text_min: None,
+            text_max: None,
             values: Vec::new(),
             cap,
         }
@@ -2177,8 +2209,12 @@ impl ColAcc {
                 self.push_num(Num::Float(f));
                 self.keep(f);
             }
-            // NaN / ±inf 与解析失败一样，都不算数值
-            _ => self.non_numeric += 1,
+            // NaN / ±inf 与解析失败一样，都不算数值；同时记录文本极值，
+            // 供「最小/最大」在整列无数值时按字典序给出最早/最晚
+            _ => {
+                self.non_numeric += 1;
+                update_text_extremes(&mut self.text_min, &mut self.text_max, t);
+            }
         }
     }
 
@@ -2239,6 +2275,12 @@ impl ColAcc {
                 _ => m,
             });
         }
+        merge_text_extremes(
+            &mut self.text_min,
+            &mut self.text_max,
+            other.text_min.as_ref(),
+            other.text_max.as_ref(),
+        );
         if let Some(m) = other.max {
             self.max = Some(match self.max {
                 Some(x) if cmp_num(&x, &m) != Ordering::Less => x,
@@ -2306,12 +2348,13 @@ impl ColAcc {
             if has_num {
                 self.min.map(fmt_num).unwrap_or_default()
             } else {
-                String::new()
+                // 整列没有可解析数值：给出文本（字典序）最小，日期时间即"最早"
+                self.text_min.clone().unwrap_or_default()
             },
             if has_num {
                 self.max.map(fmt_num).unwrap_or_default()
             } else {
-                String::new()
+                self.text_max.clone().unwrap_or_default()
             },
             std_dev,
         ]
@@ -2450,6 +2493,11 @@ struct Acc {
     float_sum: f64,
     min: Option<Num>,
     max: Option<Num>,
+    /// 文本极值（字典序最小/最大）：**整列都没有可解析数值时**用于「最小/最大」——
+    /// 例如「交易时间」是 `2026-01-05 10:30:00` 这类定长文本，字典序即时间序，
+    /// 于是能直接取到"最早/最晚"，不必先转成数值。
+    text_min: Option<String>,
+    text_max: Option<String>,
     /// 去重计数用的集合（仅当聚合方式为去重计数时存在）
     distinct: Option<HashSet<String>>,
     /// 去重计数是否因超过 [`MAX_DISTINCT_VALUES`] 而变成「≥N」
@@ -2505,9 +2553,36 @@ impl Acc {
                     self.float_sum += f;
                     self.push_num(Num::Float(f));
                 }
-                // NaN / ±inf 与解析失败一样，都不算用户意义上的数值（与 model::classify 一致）
-                _ => self.non_numeric += 1,
+                // NaN / ±inf 与解析失败一样，都不算用户意义上的数值（与 model::classify 一致）；
+                // 但为「最小/最大」额外记录文本极值，供纯文本列（日期时间等）取最早/最晚
+                _ => {
+                    self.non_numeric += 1;
+                    self.push_text(t);
+                }
             },
+        }
+    }
+
+    /// 记录文本极值（见 [`update_text_extremes`]）
+    fn push_text(&mut self, t: &str) {
+        update_text_extremes(&mut self.text_min, &mut self.text_max, t);
+    }
+
+    /// 「最小」文本：有可解析数值时按数值比较；整列无数值时退化为文本（字典序）最小
+    fn min_text(&self) -> String {
+        if self.numeric > 0 {
+            self.min.map(fmt_num).unwrap_or_default()
+        } else {
+            self.text_min.clone().unwrap_or_default()
+        }
+    }
+
+    /// 「最大」文本：规则同 [`Acc::min_text`]
+    fn max_text(&self) -> String {
+        if self.numeric > 0 {
+            self.max.map(fmt_num).unwrap_or_default()
+        } else {
+            self.text_max.clone().unwrap_or_default()
         }
     }
 
@@ -2537,6 +2612,12 @@ impl Acc {
                 _ => m,
             });
         }
+        merge_text_extremes(
+            &mut self.text_min,
+            &mut self.text_max,
+            other.text_min.as_ref(),
+            other.text_max.as_ref(),
+        );
         if let Some(m) = other.max {
             self.max = Some(match self.max {
                 Some(x) if cmp_num(&x, &m) != Ordering::Less => x,
@@ -2582,8 +2663,8 @@ impl Acc {
                     fmt_float(total / self.numeric as f64)
                 }
             }
-            AggKind::Min => self.min.map(fmt_num).unwrap_or_default(),
-            AggKind::Max => self.max.map(fmt_num).unwrap_or_default(),
+            AggKind::Min => self.min_text(),
+            AggKind::Max => self.max_text(),
         }
     }
 }
@@ -2682,6 +2763,60 @@ fn fmt_dec(sum: i128, scale: u32) -> String {
         out.push_str(frac_part);
     }
     out
+}
+
+/// 更新文本极值（字典序最小/最大）：命中时用借用比较并复用已有 `String` 容量，
+/// 只有极值被刷新时才写入。
+fn update_text_extremes(min: &mut Option<String>, max: &mut Option<String>, t: &str) {
+    match min.as_mut() {
+        Some(cur) => {
+            if t < cur.as_str() {
+                cur.clear();
+                cur.push_str(t);
+            }
+        }
+        None => *min = Some(t.to_string()),
+    }
+    match max.as_mut() {
+        Some(cur) => {
+            if t > cur.as_str() {
+                cur.clear();
+                cur.push_str(t);
+            }
+        }
+        None => *max = Some(t.to_string()),
+    }
+}
+
+/// 合并两边的文本极值（并行分块的局部结果汇总）
+fn merge_text_extremes(
+    min: &mut Option<String>,
+    max: &mut Option<String>,
+    other_min: Option<&String>,
+    other_max: Option<&String>,
+) {
+    if let Some(other_min) = other_min {
+        match min.as_mut() {
+            Some(cur) => {
+                if other_min.as_str() < cur.as_str() {
+                    cur.clear();
+                    cur.push_str(other_min);
+                }
+            }
+            None => *min = Some(other_min.clone()),
+        }
+    }
+    if let Some(other_max) = other_max {
+        match max.as_mut() {
+            Some(cur) => {
+                if other_max.as_str() > cur.as_str() {
+                    cur.clear();
+                    cur.push_str(other_max);
+                }
+            }
+            None => *max = Some(other_max.clone()),
+        }
+    }
 }
 
 fn fmt_num(n: Num) -> String {
@@ -3541,6 +3676,130 @@ mod tests {
         assert!(r2.table.rows.is_empty());
         assert_eq!(r2.relation, "一对一（每个取值互相唯一对应）");
         assert_eq!(r2.table.kind.file_stem(), "交叉统计");
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ===== 文本列的「最小/最大」退化为字典序比较（用户实测反馈）=====
+
+    #[test]
+    fn group_by_text_min_max_for_timestamp_column() {
+        // 「交易时间」这类定长文本无法解析为数值，最小/最大应退化为文本比较
+        // —— 字典序即时间序，因此可直接看出"最早/最晚"（用户诉求：找开始/结束时间）
+        let p = write_temp(
+            "城市,交易时间\n北京,2026-01-05 10:30:00\n北京,2026-01-03 08:00:00\n北京,2026-01-08 23:59:59\n上海,2026-02-01 00:00:00\n上海,2026-01-31 23:59:59\n"
+                .as_bytes(),
+            "_tminmax.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = group_by(
+            &m,
+            None,
+            &[0],
+            &[spec(1, AggKind::Min), spec(1, AggKind::Max)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(t.rows[0][2], "2026-01-03 08:00:00", "北京最早");
+        assert_eq!(t.rows[0][3], "2026-01-08 23:59:59", "北京最晚");
+        assert_eq!(t.rows[1][2], "2026-01-31 23:59:59", "上海最早");
+        assert_eq!(t.rows[1][3], "2026-02-01 00:00:00", "上海最晚");
+        assert!(
+            t.notes.iter().any(|n| n.contains("按文本顺序比较")),
+            "{:?}",
+            t.notes
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn group_by_numeric_min_max_still_numeric() {
+        // 数值列的既有行为不变：min/max 仍按数值比较（不能退化为文本）
+        let p = write_temp("组,值\nA,9\nA,100\nA,20\n".as_bytes(), "_nminmax.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = group_by(
+            &m,
+            None,
+            &[0],
+            &[spec(1, AggKind::Min), spec(1, AggKind::Max)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(t.rows[0][2], "9", "数值最小（文本序会是 100）");
+        assert_eq!(t.rows[0][3], "100", "数值最大（文本序会是 9）");
+        // 混合列（有数值也有文字）：仍用数值极值，文字不参与
+        let p2 = write_temp("组,值\nA,9\nA,100\nA,未知\n".as_bytes(), "_mix.csv");
+        let m2 = DataModel::open(&p2, 100).unwrap();
+        let t2 = group_by(
+            &m2,
+            None,
+            &[0],
+            &[spec(1, AggKind::Min), spec(1, AggKind::Max)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(t2.rows[0][2], "9");
+        assert_eq!(t2.rows[0][3], "100");
+        assert!(t2.notes.iter().any(|n| n.contains("按数值取")), "{:?}", t2.notes);
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(&p2).ok();
+    }
+
+    #[test]
+    fn column_summary_text_min_max() {
+        // 列统计同样支持：纯文本列的最小/最大给出最早/最晚，数值列指标为空
+        let p = write_temp(
+            "交易时间\n2026-03-02 09:00:00\n2026-03-01 08:30:00\n2026-03-05 18:00:00\n"
+                .as_bytes(),
+            "_cstm.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = describe(&m, &[0]);
+        // 列统计的列序：列名/行数/计数/空值数/非数值数/求和/均值/中位数/最小/最大/标准差
+        let r = &t.rows[0];
+        assert_eq!(r[2], "3", "计数（非空）");
+        assert_eq!(r[4], "3", "全部为非数值");
+        assert_eq!(r[5], "", "文本列无求和");
+        assert_eq!(r[7], "", "文本列无中位数");
+        assert_eq!(r[8], "2026-03-01 08:30:00", "最小 = 最早");
+        assert_eq!(r[9], "2026-03-05 18:00:00", "最大 = 最晚");
+        assert_eq!(r[10], "", "文本列无标准差");
+        assert!(
+            t.notes.iter().any(|n| n.contains("按文本顺序比较")),
+            "{:?}",
+            t.notes
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn pivot_text_min_max() {
+        // 透视表：值列是时间文本时，最小/最大同样给出最早/最晚
+        let p = write_temp(
+            "城市,月份,交易时间\n北京,1,2026-01-05 10:00:00\n北京,1,2026-01-02 08:00:00\n北京,2,2026-02-10 12:00:00\n"
+                .as_bytes(),
+            "_pvtm.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = pivot_table(
+            &m,
+            None,
+            &[0],
+            1,
+            &[pv(2, AggKind::Min), pv(2, AggKind::Max)],
+            PivotLimits::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(t.headers[1], "1-交易时间(最小)");
+        assert_eq!(t.headers[2], "1-交易时间(最大)");
+        assert_eq!(t.rows[0][1], "2026-01-02 08:00:00");
+        assert_eq!(t.rows[0][2], "2026-01-05 10:00:00");
+        assert_eq!(t.rows[0][3], "2026-02-10 12:00:00", "北京整体最晚");
+        assert!(
+            t.notes.iter().any(|n| n.contains("文本顺序比较")),
+            "{:?}",
+            t.notes
+        );
         std::fs::remove_file(&p).ok();
     }
 

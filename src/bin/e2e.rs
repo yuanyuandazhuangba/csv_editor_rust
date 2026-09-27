@@ -607,6 +607,57 @@ fn main() {
         println!("WARN 无可用于交叉统计的列，跳过交叉统计");
     }
 
+    // 13. 文本可排序列的「最早/最晚」：交易时间这类定长文本按字典序取最小/最大
+    //     （数值解析不出来的列，最小/最大退化为文本比较 —— 用户实测反馈的场景）
+    if let (Some(c_g), Some(c_t)) = (group_col, col_of("交易时间")) {
+        let t = Instant::now();
+        let aggs = [
+            AggSpec {
+                column: c_t,
+                kind: AggKind::Min,
+            },
+            AggSpec {
+                column: c_t,
+                kind: AggKind::Max,
+            },
+        ];
+        match stats::group_by(&m, filtered.as_deref(), &[c_g], &aggs, None) {
+            Ok(tb) => {
+                // 核对：最小 ≤ 最大（按文本比较），且都非空
+                let ok = tb.rows.iter().all(|r| {
+                    let min = r.get(tb.group_columns + 1).map(String::as_str).unwrap_or("");
+                    let max = r.get(tb.group_columns + 2).map(String::as_str).unwrap_or("");
+                    !min.is_empty() && !max.is_empty() && min <= max
+                });
+                println!(
+                    "OK  文本列最早/最晚（交易时间）{}: {} 组，核对 {} ({:.2}s)",
+                    if filtered.is_some() { "(当前筛选结果)" } else { "(全量)" },
+                    tb.rows.len(),
+                    if ok { "通过" } else { "未通过" },
+                    t.elapsed().as_secs_f64()
+                );
+                if let Some(first) = tb.rows.first() {
+                    println!(
+                        "      「{}」最早 {} / 最晚 {}",
+                        first[0], first[tb.group_columns + 1], first[tb.group_columns + 2]
+                    );
+                }
+                for note in tb.notes.iter().filter(|n| n.contains("文本顺序")) {
+                    println!("      {}", note);
+                }
+                if !ok {
+                    fails += 1;
+                }
+            }
+            Err(e) => {
+                println!("FAIL 文本列最早/最晚: {}", e);
+                fails += 1;
+            }
+        }
+    } else {
+        println!("WARN 无「交易时间」列，跳过文本列最早/最晚核对");
+    }
+
     if fails == 0 {
         println!("=== 端到端回归: 全部通过 ===");    } else {
         println!("=== 端到端回归: {} 项失败 ===", fails);
