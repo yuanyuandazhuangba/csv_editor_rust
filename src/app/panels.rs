@@ -183,14 +183,18 @@ impl CsvEditorApp {
                         self.dialogs.stats_window = true;
                         ui.close_menu();
                     }
-                    // 结果窗被关掉后仍可回看上次的汇总结果（无需重跑）
+                    if ui.button("数值列统计…").clicked() {
+                        self.dialogs.col_stats_window = true;
+                        ui.close_menu();
+                    }
+                    // 结果窗被关掉后仍可回看上次的统计结果（无需重跑）
                     let has_stats = self.last_stats.is_some();
                     if ui
                         .add_enabled(
                             has_stats,
-                            egui::Button::new("查看上次汇总结果…"),
+                            egui::Button::new("查看上次统计结果…"),
                         )
-                        .on_hover_text("重新打开上一次「字段分组汇总」的结果窗（若被最小化则同时展开）")
+                        .on_hover_text("重新打开上一次统计（分组汇总 / 列统计）的结果窗（若被最小化则同时展开）")
                         .clicked()
                     {
                         self.dialogs.stats_result_expand_pending = true;
@@ -292,6 +296,15 @@ impl CsvEditorApp {
                             .clicked()
                         {
                             self.dialogs.stats_window = true;
+                        }
+                        if ui
+                            .button("📈 列统计…")
+                            .on_hover_text(
+                                "对选定列做描述统计：计数/空值数/求和/均值/中位数/最小/最大/标准差，结果可查看并导出 CSV/XLSX",
+                            )
+                            .clicked()
+                        {
+                            self.dialogs.col_stats_window = true;
                         }
                     });
                 });
@@ -920,6 +933,60 @@ impl CsvEditorApp {
             }
         }));
         self.set_busy("字段分组汇总", "正在分组统计...", 0.0);
+    }
+
+    /// 执行「数值列统计」（后台线程）：对选定列做描述统计。
+    /// 与分组汇总一样，结果只在结果窗中查看/导出，**不**改变当前数据视图。
+    pub fn run_column_stats(&mut self) {
+        if self.busy.is_some() {
+            self.log("已有任务在执行，请稍候");
+            return;
+        }
+        let Some(model) = self.model.clone() else {
+            self.log("请先加载数据");
+            return;
+        };
+        // 视图列 → 原始列（派生列不参与统计）
+        let cols: Vec<usize> = self
+            .dialogs
+            .col_stats_cols
+            .iter()
+            .filter_map(|&c| self.ops.as_ref().and_then(|o| o.view_to_base(c)))
+            .collect();
+        if cols.is_empty() {
+            self.log("请至少选择一个要统计的列（派生列不能统计）");
+            return;
+        }
+        let names: Vec<String> = cols
+            .iter()
+            .filter_map(|&c| model.header().get(c).cloned())
+            .collect();
+        let scope = match self.visible_rows() {
+            Some(v) => format!("当前筛选结果 {} 行", v.len()),
+            None => format!("全部数据 {} 行", model.row_count()),
+        };
+        self.log(&format!(
+            "开始数值列统计：{} 列 [{}]；范围 {}",
+            cols.len(),
+            names.join("、"),
+            scope
+        ));
+        let rows = self.visible_rows().map(|v| v.to_vec());
+        let tx = self.tx.clone();
+        self.worker = Some(Worker::spawn(tx.clone(), move |ctl| {
+            let result = stats::describe_columns(&model, rows.as_deref(), &cols, Some(&|p| {
+                ctl.report_progress(p as f32, "正在统计各列...")
+            }));
+            match result {
+                Ok(table) => {
+                    let _ = tx.send(BgMsg::StatsDone(std::sync::Arc::new(table)));
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMsg::Error(format!("数值列统计失败：{}", e)));
+                }
+            }
+        }));
+        self.set_busy("数值列统计", "正在统计各列...", 0.0);
     }
 
     /// 刷新预览视图：滚动回首行（表格内容本身每帧重渲染）

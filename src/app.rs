@@ -271,6 +271,7 @@ impl CsvEditorApp {
                     self.filter_conditions.clear();
                     // 换了数据源：上一次的统计结果不再对应当前数据，清掉
                     self.last_stats = None;
+                    self.dialogs.stats_result_window = false;
                     self.model = Some(Arc::new(model));
                     self.log(&format!(
                         "文件读取完成，总行数: {}，列数: {}",
@@ -387,18 +388,12 @@ impl CsvEditorApp {
                     self.busy = None;
                     // 记录参数与结果规模（便于事后审计），并弹出结果窗
                     self.log(&format!(
-                        "分组汇总完成：统计范围 {} 行 → {} 组（分组字段 {} 个，聚合列 {} 个）",
-                        table.input_rows,
-                        table.group_count(),
-                        table.group_columns,
-                        table.aggs
+                        "{}完成：{}",
+                        table.kind.label(),
+                        table.summary()
                     ));
-                    for (i, n) in table.non_numeric.iter().enumerate() {
-                        if *n > 0 {
-                            if let Some(h) = table.headers.get(table.group_columns + 1 + i) {
-                                self.log(&format!("    注意：{} 有 {} 个非数值未参与计算", h, n));
-                            }
-                        }
+                    for note in &table.notes {
+                        self.log(&format!("    注意：{}", note));
                     }
                     self.last_stats = Some(table);
                     // 新结果 → 结果窗打开并（若上次被最小化）强制展开
@@ -438,6 +433,7 @@ impl CsvEditorApp {
         self.filter_conditions.clear();
         self.filtered_rows = None;
         self.last_stats = None;
+        self.dialogs.stats_result_window = false;
         self.log("已清空所有数据");
     }
 }

@@ -117,7 +117,7 @@
   <!-- 一、项目概览 -->
   <div class="card">
     <h2>一、项目概览</h2>
-    <p>原 Python/PyQt6 工具（<code>1.3_nodask.py</code>，4227 行）的 Rust 重构，专注超大 CSV 文件的读取、预览、筛选、拆分、列操作、哈希与导出。实测可处理 <b>6.5GB / 901 万行 / 55 列</b> 的数据，打开约 4 秒、峰值内存约 148MB，最终产物为<b>兼容 Windows 7 的单文件 exe</b>（约 7.4MB，无外部 DLL 依赖）。</p>
+    <p>原 Python/PyQt6 工具（<code>1.3_nodask.py</code>，4227 行）的 Rust 重构，专注超大 CSV 文件的读取、预览、筛选、拆分、列操作、哈希、统计分析（去重 / 分组汇总 / 数值列统计）与导出。实测可处理 <b>6.5GB / 901 万行 / 55 列</b> 的数据，打开约 4 秒、峰值内存约 148MB，最终产物为<b>兼容 Windows 7 的单文件 exe</b>（约 7.4MB，无外部 DLL 依赖）。</p>
     <div class="grid">
       <div class="cell"><b>语言</b><br>Rust 2021 edition</div>
       <div class="cell"><b>GUI</b><br>egui / eframe 0.27</div>
@@ -151,7 +151,7 @@
 │   ├── column_ops.rs     # 列操作 + 命令式 undo/redo
 │   ├── hash.rs           # 行哈希（4 算法并行）
 │   ├── dedup.rs          # 去重（提取唯一行：按字段组合判重，保留首次出现）
-│   ├── stats.rs          # 统计分析（字段分组汇总：并行局部聚合 + 按块合并）
+│   ├── stats.rs          # 统计分析（字段分组汇总 + 数值列描述统计：并行局部聚合 + 按块合并）
 │   ├── merge.rs          # 多文件合并（表头校验/共有字段交集/流式写出）
 │   └── export.rs         # CSV/XLSX 导出（自动分 sheet/全文本导出）
 ├── app/                  # GUI 层
@@ -273,6 +273,19 @@
       <li><b>结果去向</b>：结果表（<code>StatsTable</code>：表头 + 行 + 输入行数/分组数/非数值计数）在结果窗中<b>虚拟化展示</b>（复用预览表的 <code>TableBuilder</code> 经验与 <code>truncate_cell</code>），并可直接导出 CSV（utf-8-sig + 公式注入防护）或 XLSX（全文本、超 104 万行自动分 sheet）—— 复用 <code>export.rs</code> 的 <code>export_rows_csv/xlsx</code>，导出同样走后台线程 + 进度 + <code>BgMsg::ExportDone</code>。统计<b>不改变</b>当前数据视图（与去重不同：去重会把结果作为新的当前视图）。</li>
       <li><b>可核对性</b>：<code>e2e</code> 端到端回归把「各组行数之和 == 统计范围行数」作为内置一致性检查，并导出统计结果 CSV/XLSX 各一份供人工抽查。</li>
     </ul>
+
+    <h3>3.11 数值列统计（stats.rs::describe_columns）</h3>
+    <ul>
+      <li><b>指标</b>：对每个选定列给出 行数、计数（非空）、空值数、非数值数、求和、均值、<b>中位数</b>、最小、最大、<b>标准差</b>（每列一行，导出即一张表）。</li>
+      <li><b>一次扫描算完所有列</b>：与分组汇总同款「按行块并行 + 按块合并」，每线程持有一组线程局部的 <code>ColAcc</code>；不按列反复读表（否则 N 列就是 N 遍全表解析）。</li>
+      <li><b>求和/均值分子</b>复用同一套定点十进制累加（<code>DecSum</code>），因此金额列不会出现 f64 尾差；<b>均值分母是数值个数</b>（非数值不计入，见下）。</li>
+      <li><b>标准差用 Welford 在线算法</b>（<code>mean</code> + <code>M2</code>），避免 <code>Σx² − n·mean²</code> 在数值大时的灾难性抵消；分块合并用 Chan 公式的<b>稳定形式</b> <code>mean += δ·n₂/n</code>。踩过的坑：教科书形式 <code>(n₁·m₁ + n₂·m₂)/n</code> 即使两边均值<b>完全相同</b>，也会因 <code>n₁·m₁</code> 的舍入让均值漂移，进而让 <code>M2</code> 凭空增长——同一数值重复 40 万次本应得到标准差 0，却会算出 <code>2.09e-7</code>（已修复，测试 <code>column_summary_exact_sum_and_std_dev</code>）。输出为<b>总体标准差</b>（分母 n），并在结果表 notes 里说明换算样本标准差的方法。</li>
+      <li><b>中位数必须保留原始数值</b>，所以是本功能唯一有内存预算的部分：单列上限 <code>MEDIAN_MAX_PER_COLUMN = 10_000_000</code>（80MB）、总预算 <code>MEDIAN_TOTAL_BUDGET = 20_000_000</code>（约 160MB）按列数均分（下限 <code>MEDIAN_MIN_PER_COLUMN = 200_000</code>）。某列数值个数超过保留上限时，中位数输出 <code>—</code> 并在 notes 里给出「数值 N 个，超过上限 M」——<b>不静默给近似值</b>（与 XLSX 核对「未读回验证」同样的诚实标注思路）。精确性判据是 <code>values.len() == numeric</code>，合并时若任一侧已不完整就停止拼接。</li>
+      <li><b>NaN / ±inf 不算数值</b>：与 <code>model::classify</code> 的判定一致，计入非数值数（否则会把均值/标准差污染成 NaN）。分组汇总的数值聚合同步采用该判定。</li>
+      <li><b>「计数」与「数值个数」是两个概念</b>：计数 = 非空值个数（含文字），数值个数 = 可解析为数值的个数（均值/中位数的基数）。分组汇总的均值也改用数值个数作分母（此前用非空个数，含文字时均值会偏低）。</li>
+      <li><b>性能实测</b>（200 万行 × 15 列 / 326MB，本机 32 逻辑核，重复 3 次取最小）：1 列（金额）<b>0.091s</b>（并行度 15.6）、4 列 0.125s（17.5）、10 列 0.158s（18.4）——中位数排序在块合并后单线程做，重复值多时很快。</li>
+      <li><b>结果去向</b>：与分组汇总共用同一个结果窗（虚拟化表格 / 最小化 / 导出 CSV、XLSX）与同一份 <code>StatsTable</code> 结构（<code>kind</code> 区分标题与导出文件名，<code>notes</code> 承载提示）；<code>e2e</code> 也加了「计数 + 空值数 == 行数」的一致性核对。</li>
+    </ul>
   </div>
 
   <!-- 四、GUI 与后台线程 -->
@@ -293,7 +306,7 @@
       <li><b>操作日志可选落盘</b>（「设置 → 操作日志落盘」，默认关闭）：开启后每条日志追加写入 exe 同目录的 <code>操作日志.txt</code>（不可写时回退 <code>%TEMP%</code>），超过 2MB 自动轮转为 <code>.1</code>。纯文本、零依赖、可搜索，适合事后审计；开关状态经 egui <code>memory.data</code> 记忆。</li>
       <li><b>操作日志的两道护栏（为什么不需要日志数据库）</b>：内存日志有 <b>5000 条硬上限</b>（超出丢弃最旧，约 0.4MB），且日志是「操作级」而非「行级」——一次千万行拆分最多也只产生 51 条（50 条逐文件行数 + 1 条汇总），<b>日志量与数据规模无关</b>；日志面板用 <code>ScrollArea::show_rows</code> 虚拟化渲染，只布局可见行。启动诊断日志（exe 同目录 <code>csv_editor_rust.log</code>）超过 2MB 自动轮转为 <code>.log.1</code>。<br><b>结论：不引入 SQLite 等日志数据库。</b><code>rusqlite</code> 的 bundled 特性需用 C 工具链编译 SQLite，与本项目 Win7 自包含链接链（<code>rust-lld</code> + <code>-C link-self-contained=yes</code> + <code>build-std</code>）冲突且验证成本高；动态链接 <code>sqlite3.dll</code> 则在 Win7 上并不存在，会直接破坏「单文件、无外部 DLL 依赖」这一核心特性；纯 Rust 实现尚不成熟。几百到几千条日志用文本搜索已足够，数据库属于过度设计。</li>
       <li><b>底部状态栏</b>（<code>TopBottomPanel::bottom</code>）：显示总行数 / 筛选后行数 / 列数 / 进程峰值内存，以及文件名、大小与编码。它先于右侧日志面板渲染，因此横跨窗口底部全宽。</li>
-      <li><b>三条工具栏</b>：主工具栏（打开/合并/导出/筛选/清除筛选/界面缩放/自愿捐助等）、「数据处理」工具栏（拆分数据、8 项列操作、撤销/恢复、清理筛选缓存、文件信息）、「数据分析」工具栏（提取唯一行/去重、分组汇总）。后两条由「工具 → 数据处理工具栏 / 数据分析工具栏」切换显示，<b>默认显示</b>；菜单项以对号标记当前状态，两态文本等长（尾部空格占位）以保证与其它菜单项左对齐、且宽度不跳动。三条工具栏都包在 <code>ScrollArea::horizontal</code> 中，界面放大到 1.5 倍时仍可横向滚动访问全部按钮。</li>
+      <li><b>三条工具栏</b>：主工具栏（打开/合并/导出/筛选/清除筛选/界面缩放/自愿捐助等）、「数据处理」工具栏（拆分数据、8 项列操作、撤销/恢复、清理筛选缓存、文件信息）、「数据分析」工具栏（提取唯一行/去重、分组汇总、数值列统计）。后两条由「工具 → 数据处理工具栏 / 数据分析工具栏」切换显示，<b>默认显示</b>；菜单项以对号标记当前状态，两态文本等长（尾部空格占位）以保证与其它菜单项左对齐、且宽度不跳动。三条工具栏都包在 <code>ScrollArea::horizontal</code> 中，界面放大到 1.5 倍时仍可横向滚动访问全部按钮。</li>
       <li><b>进度窗口必须 <code>constrain_to(screen)</code></b>：该窗口用 <code>egui::Area</code> 实现，而 <code>Area</code> 默认 <code>constrain = false</code>（不夹取到屏幕内），位置又取自持久化的“上次拖动位置”。界面缩放（按钮大小）或窗口尺寸变化后逻辑屏幕变小，记忆位置可能落到可视区之外，进度窗口便“消失”。对话框用 <code>Window</code>（默认 <code>constrain = true</code>）故不受影响——这正是“只有进度条不见了、对话框都正常”的原因。</li>
     </ul>
     <h3>4.5 IME 修补（中文输入，<code>app::patch_ime_events</code>）</h3>
@@ -308,7 +321,7 @@
     <h3>4.6 新增对话框与动作（多文件合并 / 使用说明 / 捐助）</h3>
     <ul>
       <li><b>多文件合并对话框</b>：文件列表（可逐项「移除」或「清空列表」）+ 一次性多选与「追加选择文件」；实时显示表头校验结论与差异字段；表头不一致时提供「只保留相同字段名」选项，条件不满足时按钮禁用并说明原因。</li>
-      <li><b>使用说明对话框</b>（菜单「帮助 → 使用说明」）：分十一节讲解（上手三步、打开与合并、预览、筛选、拆分、列操作、导出、界面缩放、数据分析（去重与分组汇总）、常见问题、支持开发者），以 <code>collapsing</code> 折叠分节。</li>
+      <li><b>使用说明对话框</b>（菜单「帮助 → 使用说明」）：分十一节讲解（上手三步、打开与合并、预览、筛选、拆分、列操作、导出、界面缩放、数据分析（去重 / 分组汇总 / 列统计）、常见问题、支持开发者），以 <code>collapsing</code> 折叠分节。</li>
       <li><b>自愿捐助对话框</b>：微信收款码用 <code>include_bytes!</code> 内嵌（单文件发布不能依赖外部图片），经 <code>image</code> crate 解码为 RGBA 后由 <code>Context::load_texture</code> 缓存为纹理，只解码一次。</li>
       <li>工具栏「🧹 清除筛选」与筛选窗口内的同名按钮等价（清空条件 + 回到完整数据视图），供不打开窗口时一键恢复。</li>
     </ul>
@@ -321,13 +334,15 @@
       <li>「自愿捐助」与「按钮大小」<b>不右对齐</b>，按顺序排在工具栏按钮之后（输入框位于「按钮大小」与「倍」之间）；由于工具栏按钮较多（放大后总宽可超过窗口宽度），整行用 <code>ScrollArea::horizontal</code> 包住，溢出时可横向滚动访问，保证各按钮始终可达。</li>
     </ul>
 
-    <h3>4.8 分组汇总对话框与结果窗</h3>
+    <h3>4.8 统计对话框与结果窗（分组汇总 / 数值列统计）</h3>
     <ul>
       <li><b>参数窗（字段分组汇总）</b>：3 个固定槽位的分组字段下拉（「（不使用）」= 不参与分组，槽位顺序 = 分组键顺序）、聚合列表（每个条目 = 一列 × 一种聚合方式，同一列可添加多个，条目内的下拉可改聚合方式、<code>×</code> 删除）、以及「列 + 聚合方式 + 添加」的新增行；底部按钮为「开始汇总 / 取消」并实时显示已选分组字段数与聚合数。</li>
-      <li><b>只列出原始列</b>：派生列（拆分/合并/复制/常量/哈希）不从下拉中出现，从根上避免「选了却被忽略」；窗口顶部另有一行说明。渲染时对三个槽位与聚合列表做<b>陈旧索引过滤</b>（列数可能因之前的增删而变化，见坑 18），全部无效时报错进日志。</li>
-      <li><b>结果窗</b>：摘要（统计范围行数 → 分组数、分组字段数、聚合列数）+ 非数值告警（橙色，逐列列出「N 个非数值未参与求和/均值/最大/最小」）+「导出 CSV… / 导出 XLSX… / 关闭」+ <code>egui_extras</code> 虚拟化表格（只布局可见行，分组上万个也不卡）。结果表用 <code>Arc&lt;StatsTable&gt;</code> 持有：结果窗每帧渲染只克隆一次 <code>Arc</code>，不复制数据。</li>
-      <li><b>日志</b>：开始汇总时记录分组字段、聚合方式与统计范围；完成时记录输入行数、分组数、分组字段数与聚合列数，以及各列的非数值提示 —— 便于事后审计「这份汇总表是怎么算出来的」。</li>
-      <li><b>最小化（稍后再导出）</b>：结果窗工具栏有「最小化」按钮，点击后窗口收起为一条标题栏（统计结果仍保留在程序内），点标题栏左侧三角或双击标题栏即可展开，继续查看或导出。egui 0.27 的 <code>Window</code> 只有 <code>collapsible</code>、没有公开的 <code>minimized()</code>，其折叠状态实际存在 <code>Id::new(标题).with("collapsing")</code> 的 <code>CollapsingState</code> 里（见 egui <code>containers/window.rs</code>），因此按同一约定读写（<code>set_window_collapsed</code>）；并用 headless 渲染测试守护「标题 = 窗口 Id」这一约定，避免升级 egui 后静默失效。产生新结果、或点「查看上次汇总结果…」时会强制展开，防止上次的最小化状态把新结果藏起来。</li>
+      <li><b>参数窗（数值列统计）</b>：勾选要统计的列（全选 / 全不选 + 实时显示「已选 x / y 列」），说明文字写明指标清单、标准差口径（总体，分母 n）与中位数保留上限；底部「开始统计 / 取消」。</li>
+      <li><b>只列出原始列</b>：派生列（拆分/合并/复制/常量/哈希）不出现在下拉与勾选列表里，从根上避免「选了却被忽略」；渲染时对槽位与列勾选做<b>陈旧索引过滤</b>（列数可能因之前的增删而变化，见坑 18），全部无效时报错进日志。</li>
+      <li><b>结果窗（两种统计共用）</b>：摘要（<code>StatsTable::summary()</code> 按来源给出「→ N 组（分组字段 a 个，聚合列 b 个）」或「→ N 列」）+ 逐条提示（非数值未参与计算、中位数未计算、标准差口径等 <code>notes</code>，橙色）+「导出 CSV… / 导出 XLSX…（默认文件名取 <code>kind.file_stem()</code>）/ 最小化 / 关闭」+ <code>egui_extras</code> 虚拟化表格（只布局可见行，分组上万个也不卡）。结果表用 <code>Arc&lt;StatsTable&gt;</code> 持有：结果窗每帧渲染只克隆一次 <code>Arc</code>，不复制数据。</li>
+      <li><b>窗口标题 = 结果来源</b>（「分组汇总结果」/「列统计结果」）：egui 用标题作窗口 Id，因此两种统计各自记忆位置与最小化状态、互不干扰。</li>
+      <li><b>日志</b>：开始统计时记录参数（分组字段 + 聚合方式 / 列清单）与统计范围；完成时记录 <code>summary()</code> 与全部 <code>notes</code> —— 便于事后审计「这份统计表是怎么算出来的」。切换数据源、清空数据时，上一次的结果与结果窗一起清掉。</li>
+      <li><b>最小化（稍后再导出）</b>：结果窗工具栏有「最小化」按钮，点击后窗口收起为一条标题栏（统计结果仍保留在程序内），点标题栏左侧三角或双击标题栏即可展开，继续查看或导出。egui 0.27 的 <code>Window</code> 只有 <code>collapsible</code>、没有公开的 <code>minimized()</code>，其折叠状态实际存在 <code>Id::new(标题).with("collapsing")</code> 的 <code>CollapsingState</code> 里（见 egui <code>containers/window.rs</code>），因此按同一约定读写（<code>set_window_collapsed</code>）；并用 headless 渲染测试守护「标题 = 窗口 Id」这一约定（两种结果标题都测），避免升级 egui 后静默失效。产生新结果、或点「查看上次统计结果…」时会强制展开，防止上次的最小化状态把新结果藏起来。</li>
       <li><b>耗时走后台线程</b>：<code>Worker::spawn</code> + 进度回调 + <code>BgMsg::StatsDone(Arc&lt;StatsTable&gt;)</code>；导出同样在后台线程写出并用 <code>BgMsg::ExportDone</code> 回报行数与路径（复用既有导出消息，不再新增一条）。</li>
     </ul>
   </div>
@@ -361,7 +376,7 @@ cargo +nightly-2025-06-23-x86_64-pc-windows-gnu build --release \
     <h2>六、构建与测试</h2>
     <h3>6.1 开发 / 测试（stable）</h3>
     <pre><code>set PATH=D:\project_xiangmu\.rust-toolchain\rust-1.88.0-x86_64-pc-windows-gnu\rustc\bin;D:\project_xiangmu\.rust-toolchain\rust-1.88.0-x86_64-pc-windows-gnu\cargo\bin;%PATH%
-cargo test          # 138 项单元测试（132 lib + 6 bin）
+cargo test          # 150 项单元测试（144 lib + 6 bin）
 cargo run --bin csv_editor_rust</code></pre>
     <h3>6.2 Win7 单文件发布</h3>
     <p>运行项目根目录的 <code>build_win7.bat</code>（或手动执行上文 5.1 命令）。</p>
@@ -369,13 +384,13 @@ cargo run --bin csv_editor_rust</code></pre>
     <h3>6.3 测试与验证工具</h3>
     <table>
       <tr><th style="width:150px;">工具</th><th>用途</th></tr>
-      <tr><td><code>cargo test</code></td><td>138 项单元测试（132 lib + 6 bin），覆盖编码检测、行索引边界、字段切分、筛选语义、列操作、导出、多文件合并、去重、分组汇总（含定点十进制求和精度、f64 累加误差对照、跨行块小数位对齐与合并、越界列容错、分组数上限、去重计数上限、非数值隔离）、筛选与拆分并行化、IME 事件修补、结果窗最小化的窗口 Id 约定等。</td></tr>
+      <tr><td><code>cargo test</code></td><td>150 项单元测试（144 lib + 6 bin），覆盖编码检测、行索引边界、字段切分、筛选语义、列操作、导出、多文件合并、去重、分组汇总（定点十进制求和精度、f64 累加误差对照、跨行块小数位对齐与合并、均值分母口径、NaN/inf 判定、越界列容错、分组数上限、去重计数上限）、数值列统计（中位数/标准差/极值/空值与非数值计数、跨块 Welford 合并、中位数上限、多列单遍扫描、行子集与空范围）、筛选与拆分并行化、IME 事件修补、结果窗最小化的窗口 Id 约定等。</td></tr>
       <tr><td><code>bin/inspect</code></td><td>打开报告：行数/列数/编码/耗时/峰值内存/采样预览。</td></tr>
       <tr><td><code>bin/verify</code></td><td>与 <code>testdata/verify_ref.py</code> 输出同结构 JSON（筛选行号 + 行哈希），验证 Rust 与 Python 语义一致。</td></tr>
       <tr><td><code>bin/filter_bench</code></td><td>筛选性能基准：不同条件类型/数量的耗时、CPU 时间与并行度（用 <code>--release</code> 运行）。</td></tr>
       <tr><td><code>bin/split_bench</code></td><td>拆分性能基准：各场景耗时、CPU 时间与并行度（用 <code>--release</code> 运行）。</td></tr>
-      <tr><td><code>bin/stats_bench</code></td><td>分组汇总性能基准：不同分组深度/聚合方式（含去重计数）的耗时、CPU 时间与并行度（用 <code>--release</code> 运行）。</td></tr>
-      <tr><td><code>bin/e2e</code></td><td>端到端回归：打开 → 类型推断 → 筛选 → 列操作(undo/redo) → 拆分 → 导出 CSV/XLSX → 分组汇总（含「各组行数之和 == 统计范围行数」核对）→ 导出统计结果 CSV/XLSX。</td></tr>
+      <tr><td><code>bin/stats_bench</code></td><td>统计性能基准：不同分组深度/聚合方式（含去重计数）的分组汇总，以及 1/4/10 列的数值列统计的耗时、CPU 时间与并行度（用 <code>--release</code> 运行）。</td></tr>
+      <tr><td><code>bin/e2e</code></td><td>端到端回归：打开 → 类型推断 → 筛选 → 列操作(undo/redo) → 拆分 → 导出 CSV/XLSX → 分组汇总（含「各组行数之和 == 统计范围行数」核对）→ 数值列统计（含「计数 + 空值数 == 行数」核对）→ 导出统计结果与列统计的 CSV/XLSX。</td></tr>
     </table>
     <div class="note">testdata/ 含 jymxb_1000.csv（真实数据子集）、ref_result.json / rust_result.json（对照结果）。</div>
   </div>
@@ -391,12 +406,14 @@ cargo run --bin csv_editor_rust</code></pre>
       <tr><td>全量筛选</td><td>分钟级</td><td>并行秒级</td></tr>
       <tr><td>文件体积</td><td>~300MB（PyInstaller）</td><td><b>7.4 MB</b></td></tr>
     </table>
-    <div class="note"><b>分组汇总实测</b>（合成数据 200 万行 × 15 列 / 326MB，本机 32 逻辑核，重复 3 次取最小，见 <code>bin/stats_bench</code>）：1 字段分组 × 求和/均值/最大/最小 <b>0.081s</b>（并行度 25.1）、× 计数/空值数 0.056s（26.3）、2 字段分组 0.073s（22.6）、3 字段分组 700 组 0.080s（19.0）；含「去重计数」的 6 聚合列 1.009s（3.8）—— 去重计数需要按组维护值集合，其合并阶段是单线程，是该功能里唯一偏慢的场景。</div>
+    <div class="note"><b>分组汇总实测</b>（合成数据 200 万行 × 15 列 / 326MB，本机 32 逻辑核，重复 3 次取最小，见 <code>bin/stats_bench</code>）：1 字段分组 × 求和/均值/最大/最小 <b>0.081s</b>（并行度 25.1）、× 计数/空值数 0.056s（26.3）、2 字段分组 0.073s（22.6）、3 字段分组 700 组 0.080s（19.0）；含「去重计数」的 6 聚合列 1.009s（3.8）—— 去重计数需要按组维护值集合，其合并阶段是单线程，是该功能里唯一偏慢的场景。<br><b>数值列统计</b>（同机同期）：1 列 <b>0.091s</b>（并行度 15.6）、4 列 0.125s（17.5）、10 列 0.158s（18.4，含各列中位数排序）。</div>
     <h3>7.2 已知限制</h3>
     <ul>
       <li>按字段拆分对唯一值超过 20,000 个的字段会拒绝（提示改用按行数拆分），避免生成海量文件。</li>
       <li>分组汇总的分组数上限同样是 20,000：超过则报错并提示改用取值较少的字段（或用筛选先缩小范围）；单个「去重计数」最多保存 200,000 个不同值，超出后结果标注为 <code>&gt;=N</code>。</li>
       <li>分组汇总的求和/均值用<b>定点十进制</b>精确累加（小数位上限 9 位）；若某列出现科学计数法写法（如 <code>1e5</code>）或超过 9 位小数，该列会整体回退浮点累加 —— 结果仍可用，但可能出现极小的尾差。</li>
+      <li>数值列统计的<b>中位数</b>需要保留该列原始数值：单列上限 1000 万个、所有列合计 2000 万个（按列数均分，约 160MB）。超出时该列中位数显示 <code>—</code>（不提供近似值），可先筛选缩小范围或减少一次统计的列数。</li>
+      <li>数值列统计的<b>标准差是总体标准差</b>（分母 n）；样本标准差 = 该值 × <code>sqrt(n/(n-1))</code>。统计口径里 <code>NaN</code>/<code>±inf</code> 与文字一样算「非数值」，不计入数值统计。</li>
       <li>分组汇总的统计字段只接受<b>原始列</b>，派生列（拆分/合并/复制/哈希生成的新列）不参与；聚合按<b>文本数值语义</b>解析（与筛选一致，不做列类型推断），非数值单独计数并在界面/日志中提示。</li>
       <li>XLSX 导出超 1,048,576 行自动分 sheet；列数超 16,384 报错改用 CSV。</li>
       <li>XLSX 为<b>全文本导出</b>：所有单元格按文本写入（Excel 中数字左对齐、不参与求和等数值计算），以此换取长数字、前导零与大整数的零精度损失。</li>

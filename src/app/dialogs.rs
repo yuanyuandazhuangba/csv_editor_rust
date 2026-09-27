@@ -54,6 +54,10 @@ pub struct DialogStates {
     pub stats_new_col: usize,
     /// 「添加聚合」时选中的聚合方式（`AggKind::ALL` 的下标）
     pub stats_new_kind: usize,
+    // 数据分析：数值列统计
+    pub col_stats_window: bool,
+    /// 要统计的列（视图列索引）
+    pub col_stats_cols: Vec<usize>,
     // 筛选/拆分/文件信息 弹出窗口
     pub filter_window: bool,
     pub split_window: bool,

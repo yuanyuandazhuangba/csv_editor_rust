@@ -17,10 +17,6 @@ use super::{CsvEditorApp, DialogPosition};
 /// 内嵌的微信收款码（自愿捐助窗口用；单文件发布无法依赖外部图片）
 const WECHAT_QR_PNG: &[u8] = include_bytes!("../../assets/wechat_qr.png");
 
-/// 「分组汇总结果」窗口标题。它同时是 egui 窗口的 Id（`Window::new(title)`），
-/// 因此改这里时必须同步 `set_window_collapsed` 的调用，否则最小化/展开会失配。
-const STATS_RESULT_TITLE: &str = "分组汇总结果";
-
 /// 程序化设置某个 egui 窗口的「折叠（最小化）」状态。
 ///
 /// egui 0.27 的 `Window` 只有 `collapsible`，没有公开的 `minimized()`；
@@ -136,6 +132,9 @@ impl CsvEditorApp {
         let mut f = std::mem::take(&mut self.dialogs.stats_window);
         self.dialog_stats(ctx, &mut f);
         self.dialogs.stats_window = f;
+        let mut f = std::mem::take(&mut self.dialogs.col_stats_window);
+        self.dialog_column_stats(ctx, &mut f);
+        self.dialogs.col_stats_window = f;
         let mut f = std::mem::take(&mut self.dialogs.stats_result_window);
         self.dialog_stats_result(ctx, &mut f);
         self.dialogs.stats_result_window = f;
@@ -1234,14 +1233,15 @@ impl CsvEditorApp {
                         ui.label("• 输入或拖动数值即可把菜单、菜单命令、工具栏按钮、表格文字整体等比放大，方便视力不佳的用户；");
                         ui.weak("设置会被记住，下次启动仍然生效。");
                     });
-                    ui.collapsing("九、数据分析（消除重复行 / 分组汇总）", |ui| {
-                        ui.label("两条命令都在「数据分析」工具栏与菜单「数据分析」下；作用范围都是当前筛选结果（未筛选则为全部数据）。");
-                        ui.label("• 提取唯一行（去重）：勾选判重字段（一个都不勾 = 按整行判重），执行后保留唯一行并作为当前视图，可继续导出、拆分、统计；完成后可导出「重复行对应表」，逐条核对「保留行 ↔ 被剔除行」。");
-                        ui.label("• 字段分组汇总：选 1~3 个分组字段，再为若干列添加汇总方式（求和/均值/最大/最小/计数/去重计数/空值数，同一列可添加多个），点「开始汇总」；");
-                        ui.label("    结果是每组一行的汇总表（含「行数」），在弹窗中虚拟化查看，可「导出 CSV / 导出 XLSX」；");
+                    ui.collapsing("九、数据分析（消除重复行 / 分组汇总 / 列统计）", |ui| {
+                        ui.label("三条命令都在「数据分析」工具栏与菜单「数据分析」下；作用范围都是当前筛选结果（未筛选则为全部数据）。");
+                        ui.label("• 提取唯一行（去重）：勾选判重字段（一个都不勾 = 按整行判重），执行后保留唯一行并作为当前视图，可继续导出、拆分、统计；完成后可导出「重复行对应表」。");
+                        ui.label("• 字段分组汇总：选 1~3 个分组字段，再为若干列添加汇总方式（求和/均值/最大/最小/计数/去重计数/空值数），点「开始汇总」；结果是每组一行的汇总表（含「行数」）。");
+                        ui.label("• 数值列统计：勾选要统计的列（可多选），点「开始统计」；给出每列的行数、计数、空值数、非数值数、求和、均值、中位数、最小、最大、标准差（总体）。");
                         ui.label("    金额等按数值精确计算（定点十进制累加，两位小数的合计不会出现 3613134567.580001 这类多余尾数）；某列若混有文字会被跳过，并在结果窗提示「N 个非数值未参与计算」；");
+                        ui.label("    中位数需要保留该列的原始数值：数据量特别大时（超过用内存上限）该列中位数显示「—」，并提示先用筛选缩小范围；");
                         ui.label("    结果窗可「最小化」成一条标题栏（结果不丢），稍后点标题栏左侧三角展开即可继续查看或导出；");
-                        ui.weak("汇总不改变当前数据视图；只能选原始列统计（拆分/合并/复制/哈希产生的新列不参与）；分组数超过 2 万会提示改用取值较少的字段。");
+                        ui.weak("统计不改变当前数据视图；只能选原始列统计（拆分/合并/复制/哈希产生的新列不参与）；分组数超过 2 万会提示改用取值较少的字段。");
                     });
                     ui.collapsing("十、常见问题", |ui| {
                         ui.label("• 打开很慢或卡住？ 读文件在后台进行，请看进度窗口与右下「操作日志」面板；");
@@ -1641,20 +1641,117 @@ impl CsvEditorApp {
         *open = keep;
     }
 
-    /// 分组汇总结果窗：虚拟化表格展示 + 导出 CSV / XLSX（可最小化为标题栏稍后再导出）
+    /// 「数值列统计」参数对话框：勾选要统计的原始列。
+    /// 与分组汇总参数窗一致，只列出原始列（派生列的值不是文件原始数据）。
+    fn dialog_column_stats(&mut self, ctx: &egui::Context, open: &mut bool) {
+        let mut keep = *open;
+        let mut done = false;
+        apply_dialog_pos(
+            egui::Window::new("数值列统计")
+                .open(&mut keep)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([600.0, 520.0]),
+            self.dialog_position,
+            ctx,
+        )
+        .show(ctx, |ui| {
+            let header = self.header_names();
+            if header.is_empty() {
+                ui.label("请先加载数据");
+                return;
+            }
+            // 可作为统计字段的视图列（派生列 = false）
+            let base_ok: Vec<bool> = (0..header.len())
+                .map(|i| self.ops.as_ref().and_then(|o| o.view_to_base(i)).is_some())
+                .collect();
+            let scope = match self.visible_rows() {
+                Some(v) => format!("当前筛选结果（{} 行）", v.len()),
+                None => format!(
+                    "全部数据（{} 行）",
+                    self.model.as_ref().map(|m| m.row_count()).unwrap_or(0)
+                ),
+            };
+            ui.label(format!("统计范围：{scope}"));
+            ui.weak(
+                "对勾选的列计算：计数（非空）、空值数、非数值数、求和、均值、中位数、最小、最大、\
+                 标准差（总体，分母 n）。数值判定与筛选一致（整数 i128 精确、金额定点十进制精确累加）；\
+                 结果可查看并导出 CSV / XLSX。派生列不参与统计。",
+            );
+            ui.separator();
+
+            ui.label("选择要统计的列:");
+            // 丢弃越界/陈旧/派生列索引（列数可能因之前的增删而变化）
+            self.dialogs
+                .col_stats_cols
+                .retain(|&i| i < header.len() && base_ok[i]);
+            let mut sel = self.dialogs.col_stats_cols.clone();
+            let selectable = base_ok.iter().filter(|b| **b).count();
+            ui.horizontal(|ui| {
+                if ui.small_button("全选").clicked() {
+                    sel = (0..header.len()).filter(|&i| base_ok[i]).collect();
+                }
+                if ui.small_button("全不选").clicked() {
+                    sel.clear();
+                }
+                ui.weak(format!("已选 {} / {} 列（可统计列）", sel.len(), selectable));
+            });
+            egui::ScrollArea::vertical()
+                .max_height(240.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (i, h) in header.iter().enumerate() {
+                        if !base_ok[i] {
+                            continue; // 派生列不列出
+                        }
+                        let mut on = sel.contains(&i);
+                        ui.checkbox(&mut on, h);
+                        if on && !sel.contains(&i) {
+                            sel.push(i);
+                        } else if !on {
+                            sel.retain(|&x| x != i);
+                        }
+                    }
+                });
+            self.dialogs.col_stats_cols = sel.clone();
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("开始统计").clicked() {
+                    self.run_column_stats();
+                    done = true;
+                }
+                if ui.button("取消").clicked() {
+                    done = true;
+                }
+                ui.weak(format!("已选 {} 列", sel.len()));
+            });
+        });
+        if done {
+            keep = false;
+        }
+        *open = keep;
+    }
+
+    /// 统计结果窗（分组汇总 / 数值列统计共用）：虚拟化表格展示 + 导出 CSV / XLSX
+    /// （可最小化为标题栏稍后再导出）。两个统计各自有不同的窗口标题，因此位置、
+    /// 最小化状态互不干扰。
     fn dialog_stats_result(&mut self, ctx: &egui::Context, open: &mut bool) {
         let mut keep = *open;
         let mut done = false;
         let mut export: Option<(String, bool)> = None;
-        // 新结果、或用户点「查看上次汇总结果…」时，强制从最小化状态展开
+        // 结果类型决定窗口标题（标题同时是 egui 窗口 Id）
+        let kind = self.last_stats.as_ref().map(|t| t.kind).unwrap_or_default();
+        let title = kind.title();
+        // 新结果、或用户点「查看上次统计结果…」时，强制从最小化状态展开
         if self.dialogs.stats_result_expand_pending {
             self.dialogs.stats_result_expand_pending = false;
-            set_window_collapsed(ctx, STATS_RESULT_TITLE, false);
+            set_window_collapsed(ctx, title, false);
         }
         // Arc：结果窗每帧渲染都共享同一份结果表，不复制数据
         let table = self.last_stats.clone();
         apply_dialog_pos(
-            egui::Window::new(STATS_RESULT_TITLE)
+            egui::Window::new(title)
                 .open(&mut keep)
                 .collapsible(true)
                 .default_open(true)
@@ -1671,34 +1768,20 @@ impl CsvEditorApp {
                 }
                 return;
             };
-            ui.label(format!(
-                "统计范围 {} 行 → {} 组（分组字段 {} 个，聚合列 {} 个）",
-                table.input_rows,
-                table.group_count(),
-                table.group_columns,
-                table.aggs
-            ));
-            if table.has_non_numeric() {
-                for (i, n) in table.non_numeric.iter().enumerate() {
-                    if *n == 0 {
-                        continue;
-                    }
-                    if let Some(h) = table.headers.get(table.group_columns + 1 + i) {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "⚠ {}：{} 个非数值未参与求和/均值/最大/最小",
-                                h, n
-                            ))
-                            .color(egui::Color32::from_rgb(200, 120, 0)),
-                        );
-                    }
-                }
+            ui.label(table.summary());
+            // 结果级提示（非数值未参与计算、中位数未计算、标准差口径等）
+            for note in &table.notes {
+                ui.label(
+                    egui::RichText::new(format!("⚠ {}", note))
+                        .color(egui::Color32::from_rgb(200, 120, 0)),
+                );
             }
             ui.horizontal(|ui| {
+                let stem = kind.file_stem();
                 if ui.button("导出 CSV…").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("CSV", &["csv"])
-                        .set_file_name("分组汇总.csv")
+                        .set_file_name(format!("{}.csv", stem))
                         .save_file()
                     {
                         export = Some((path.to_string_lossy().into_owned(), false));
@@ -1707,7 +1790,7 @@ impl CsvEditorApp {
                 if ui.button("导出 XLSX…").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("XLSX", &["xlsx"])
-                        .set_file_name("分组汇总.xlsx")
+                        .set_file_name(format!("{}.xlsx", stem))
                         .save_file()
                     {
                         export = Some((path.to_string_lossy().into_owned(), true));
@@ -1720,7 +1803,7 @@ impl CsvEditorApp {
                     )
                     .clicked()
                 {
-                    set_window_collapsed(ctx, STATS_RESULT_TITLE, true);
+                    set_window_collapsed(ctx, title, true);
                 }
                 if ui.button("关闭").clicked() {
                     done = true;
@@ -2050,16 +2133,16 @@ mod tests {
     use super::*;
 
     /// headless 渲染：返回 `Some(内容)` = 窗口展开了；`None` = 处于最小化（折叠）状态。
-    fn render(collapsed: bool) -> Option<bool> {
+    fn render(title: &str, collapsed: bool) -> Option<bool> {
         let ctx = egui::Context::default();
-        set_window_collapsed(&ctx, STATS_RESULT_TITLE, collapsed);
+        set_window_collapsed(&ctx, title, collapsed);
         let mut inner = None;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            let r = egui::Window::new(STATS_RESULT_TITLE)
+            let r = egui::Window::new(title)
                 .collapsible(true)
                 .default_open(true)
                 .show(ctx, |ui| {
-                    ui.label("分组汇总结果内容");
+                    ui.label("统计结果内容");
                     true
                 });
             inner = r.and_then(|r| r.inner);
@@ -2071,20 +2154,24 @@ mod tests {
     fn set_window_collapsed_matches_egui_window_id_convention() {
         // 「最小化」依赖 egui 把折叠状态存在 `Id::new(标题).with("collapsing")` 这一约定，
         // 用 headless 渲染验证：折叠 ⇒ 不渲染内容，展开 ⇒ 渲染内容（守护该约定的正确性）
-        assert_eq!(render(false), Some(true), "展开状态应渲染窗口内容");
-        assert_eq!(render(true), None, "最小化后应只剩标题栏（不渲染内容）");
+        for kind in [stats::StatsKind::GroupBy, stats::StatsKind::ColumnSummary] {
+            let title = kind.title();
+            assert_eq!(render(title, false), Some(true), "{title}: 应渲染内容");
+            assert_eq!(render(title, true), None, "{title}: 最小化后不渲染内容");
+        }
     }
 
     #[test]
     fn collapse_state_persists_across_frames() {
         // 同一 Context 连续渲染：状态由 egui memory 记忆（窗口不会自己弹回展开）
         let ctx = egui::Context::default();
+        let title = stats::StatsKind::ColumnSummary.title();
         let mut shown = Vec::new();
         for collapsed in [true, true, false, true] {
-            set_window_collapsed(&ctx, STATS_RESULT_TITLE, collapsed);
+            set_window_collapsed(&ctx, title, collapsed);
             let mut inner = None;
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                let r = egui::Window::new(STATS_RESULT_TITLE)
+                let r = egui::Window::new(title)
                     .collapsible(true)
                     .default_open(true)
                     .show(ctx, |_ui| true);

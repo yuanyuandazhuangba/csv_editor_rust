@@ -197,6 +197,72 @@ fn main() {
         println!("WARN 无可用于分组汇总的列，跳过统计");
     }
 
+    // 7. 数值列统计：对数值列（与分组字段）做描述统计
+    let mut col_stats_cols: Vec<usize> = Vec::new();
+    if let Some(c) = value_col {
+        col_stats_cols.push(c);
+    }
+    if let Some(c) = group_col {
+        if !col_stats_cols.contains(&c) {
+            col_stats_cols.push(c);
+        }
+    }
+    if !col_stats_cols.is_empty() {
+        let cols = col_stats_cols.clone();
+        let t = Instant::now();
+        match stats::describe_columns(&m, filtered.as_deref(), &cols, None) {
+            Ok(tb) => {
+                // 内置一致性核对：每列「计数 + 空值数 == 行数」
+                let rows_ok = tb.rows.iter().all(|r| {
+                    match (
+                        r.get(1).and_then(|v| v.parse::<u64>().ok()),
+                        r.get(2).and_then(|v| v.parse::<u64>().ok()),
+                        r.get(3).and_then(|v| v.parse::<u64>().ok()),
+                    ) {
+                        (Some(rows), Some(count), Some(empty)) => count + empty == rows,
+                        _ => false,
+                    }
+                });
+                println!(
+                    "OK  列统计 {}: {} 行 × {} 列（列名/计数/空值/求和/均值/中位数…），行数核对 {} ({:.2}s)",
+                    if filtered.is_some() { "(当前筛选结果)" } else { "(全量)" },
+                    tb.input_rows,
+                    cols.len(),
+                    if rows_ok { "通过" } else { "未通过" },
+                    t.elapsed().as_secs_f64()
+                );
+                for note in &tb.notes {
+                    println!("     注意：{}", note);
+                }
+                if !rows_ok {
+                    fails += 1;
+                }
+                let sc = format!("{}\\e2e_colstats.csv", out_dir);
+                match export::export_rows_csv(&sc, &tb.headers, tb.rows.iter().cloned()) {
+                    Ok(n) => println!("OK  导出列统计 CSV: {} 列 -> {}", n, sc),
+                    Err(e) => {
+                        println!("FAIL 导出列统计 CSV: {}", e);
+                        fails += 1;
+                    }
+                }
+                let sx = format!("{}\\e2e_colstats.xlsx", out_dir);
+                match export::export_rows_xlsx(&sx, &tb.headers, tb.rows.iter().cloned()) {
+                    Ok(n) => println!("OK  导出列统计 XLSX: {} 列 -> {}", n, sx),
+                    Err(e) => {
+                        println!("FAIL 导出列统计 XLSX: {}", e);
+                        fails += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                println!("FAIL 数值列统计: {}", e);
+                fails += 1;
+            }
+        }
+    } else {
+        println!("WARN 无可用于数值列统计的列，跳过统计");
+    }
+
     if fails == 0 {
         println!("=== 端到端回归: 全部通过 ===");    } else {
         println!("=== 端到端回归: {} 项失败 ===", fails);

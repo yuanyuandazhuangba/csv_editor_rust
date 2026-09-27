@@ -1,4 +1,6 @@
-//! 统计分析（第一期）：**字段分组汇总**。
+//! 统计分析：**字段分组汇总** 与 **数值列统计**。
+//!
+//! ### 字段分组汇总（[`group_by`]）
 //!
 //! 语义（与界面说明一致）：
 //! - 作用范围是**传入的行集合**（界面传入的是当前筛选结果；未筛选时为全部数据行）；
@@ -7,14 +9,21 @@
 //! - 分组 key 用 `\x1F` 连接（字段值中几乎不会出现），避免「a|b」这类拼接歧义；
 //! - **输出顺序 = 分组在行序中首次出现的顺序**（稳定、可复现，与输入行序一致）。
 //!
-//! 数值语义与筛选一致（复用 `filter.rs` 的 `try_num`/`cmp_num`）：
+//! ### 数值列统计（[`describe_columns`]）
+//!
+//! 对每个选定的原始列给出：行数、计数（非空）、空值数、非数值数、求和、均值、
+//! 中位数、最小、最大、标准差（总体，分母 n）。一次并行扫描算完所有列。
+//!
+//! ### 共同的数值语义
+//!
+//! 与筛选一致（复用 `filter.rs` 的 `try_num`/`cmp_num`）：
 //! 整数用 `i128` 精确累加（19 位卡号/大金额不丢精度）；**求和与均值的分子用
 //! 「定点十进制」累加**（把各值按小数位数放大成 `i128` 整数再相加，见 [`parse_dec`]），
 //! 因此金额列不会出现 `3613134567.580001` 这类 f64 累积误差——只有当某个值无法用
 //! 十进制字面量精确表示（科学计数法、超过 [`DEC_MAX_SCALE`] 位小数或超长数字）时，
 //! 才整体回退到 `f64` 累加。
-//! 非空但**无法解析为数值**的值不计入求和/均值/最大/最小，而是单独计数
-//! （结果里的 `non_numeric`，供界面提示"该列有 N 个非数值未参与计算"）。
+//! 非空但**无法解析为数值**的值（含 `NaN`/`±inf`）不计入求和/均值/最大/最小，
+//! 而是单独计数，并通过结果表的 `notes` 提示"该列有 N 个非数值未参与计算"。
 //!
 //! 性能：聚合是可交换的（局部聚合可合并），因此按行块并行 ——
 //! 各线程用 [`RowReader`] 零分配逐行取值、构建局部 `HashMap<key, Acc>`，
@@ -114,32 +123,89 @@ pub struct AggSpec {
     pub kind: AggKind,
 }
 
-/// 分组汇总结果表（可直接交给 `export.rs` 的 CsvWriter/XlsxWriter 导出）
+/// 统计结果表的来源（界面据此显示标题、日志口径与导出文件名）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StatsKind {
+    /// 字段分组汇总
+    #[default]
+    GroupBy,
+    /// 数值列描述统计
+    ColumnSummary,
+}
+
+impl StatsKind {
+    /// 功能名（日志与提示口径）
+    pub fn label(&self) -> &'static str {
+        match self {
+            StatsKind::GroupBy => "分组汇总",
+            StatsKind::ColumnSummary => "列统计",
+        }
+    }
+
+    /// 结果窗标题（同时是 egui 窗口 Id，见 `app::dialog_ui::set_window_collapsed`）
+    pub fn title(&self) -> &'static str {
+        match self {
+            StatsKind::GroupBy => "分组汇总结果",
+            StatsKind::ColumnSummary => "列统计结果",
+        }
+    }
+
+    /// 导出默认文件名（不含扩展名）
+    pub fn file_stem(&self) -> &'static str {
+        match self {
+            StatsKind::GroupBy => "分组汇总",
+            StatsKind::ColumnSummary => "列统计",
+        }
+    }
+}
+
+/// 统计结果表（可直接交给 `export.rs` 的 CsvWriter/XlsxWriter 导出）
 #[derive(Debug, Clone, Default)]
 pub struct StatsTable {
-    /// 表头：分组字段名… +「行数」+ 每个聚合列（`列名(聚合)`）
+    /// 结果来源（分组汇总 / 数值列统计）
+    pub kind: StatsKind,
+    /// 表头：分组汇总为「分组字段名… + 行数 + 每个聚合列」；列统计为固定的指标列
     pub headers: Vec<String>,
-    /// 数据行：每行一个分组
+    /// 数据行：分组汇总每行一个分组；列统计每行一列
     pub rows: Vec<Vec<String>>,
     /// 参与统计的输入行数（筛选结果行数或全部数据行数）
     pub input_rows: usize,
-    /// 分组字段数
+    /// 分组字段数（列统计为 0）
     pub group_columns: usize,
-    /// 聚合列数
+    /// 分组汇总的聚合列数 / 列统计的列数
     pub aggs: usize,
-    /// 各聚合列累计的「非空但非数值」个数（求和/均值/最大/最小会忽略它们）
-    pub non_numeric: Vec<u64>,
+    /// 结果级补充说明（非数值个数、中位数是否可用等），界面与日志逐条提示
+    pub notes: Vec<String>,
 }
 
 impl StatsTable {
-    /// 分组数（结果行数）
+    /// 结果行数（分组汇总 = 分组数；列统计 = 统计的列数）
     pub fn group_count(&self) -> usize {
         self.rows.len()
     }
 
-    /// 是否存在非数值被忽略的聚合列（供界面提示）
-    pub fn has_non_numeric(&self) -> bool {
-        self.non_numeric.iter().any(|&n| n > 0)
+    /// 结果行数的口径名（用于界面摘要文字）
+    pub fn row_unit(&self) -> &'static str {
+        match self.kind {
+            StatsKind::GroupBy => "组",
+            StatsKind::ColumnSummary => "列",
+        }
+    }
+
+    /// 结果窗顶部的一行摘要
+    pub fn summary(&self) -> String {
+        match self.kind {
+            StatsKind::GroupBy => format!(
+                "统计范围 {} 行 → {} 组（分组字段 {} 个，聚合列 {} 个）",
+                self.input_rows,
+                self.rows.len(),
+                self.group_columns,
+                self.aggs
+            ),
+            StatsKind::ColumnSummary => {
+                format!("统计范围 {} 行 → {} 列", self.input_rows, self.rows.len())
+            }
+        }
     }
 }
 
@@ -194,15 +260,15 @@ pub fn group_by(
 
     let total = rows.map(|v| v.len()).unwrap_or_else(|| model.row_count());
     let mut table = StatsTable {
+        kind: StatsKind::GroupBy,
         headers,
         rows: Vec::new(),
         input_rows: total,
         group_columns: gcols.len(),
         aggs: specs.len(),
-        non_numeric: Vec::new(),
+        notes: Vec::new(),
     };
     if total == 0 {
-        table.non_numeric = vec![0; specs.len()];
         if let Some(p) = progress {
             p(1.0);
         }
@@ -326,9 +392,18 @@ pub fn group_by(
         }
         table.rows.push(row);
     }
-    table.non_numeric = (0..specs.len())
-        .map(|i| accs.iter().map(|a| a[i].non_numeric).sum())
-        .collect();
+    // 非数值提示：逐聚合列给出「有多少个非数值未参与计算」
+    for (i, spec) in specs.iter().enumerate() {
+        let n: u64 = accs.iter().map(|a| a[i].non_numeric).sum();
+        if n > 0 {
+            table.notes.push(format!(
+                "{}({})：{} 个非数值未参与计算（求和/均值/最大/最小忽略它们）",
+                column_name(model, spec.column),
+                spec.kind.label(),
+                n
+            ));
+        }
+    }
     if let Some(p) = progress {
         p(1.0);
     }
@@ -343,9 +418,493 @@ fn column_name(model: &DataModel, col: usize) -> String {
         .unwrap_or_else(|| format!("列{}", col + 1))
 }
 
+/// 「数值列统计」的指标表头（每列一行）
+const COLUMN_SUMMARY_HEADERS: [&str; 11] = [
+    "列名",
+    "行数",
+    "计数",
+    "空值数",
+    "非数值数",
+    "求和",
+    "均值",
+    "中位数",
+    "最小",
+    "最大",
+    "标准差",
+];
+
+/// 精确中位数可保留的数值总数预算（约 160MB；在所有统计列之间均分）
+const MEDIAN_TOTAL_BUDGET: usize = 20_000_000;
+/// 单列可保留的数值个数下限（列很多时也尽量能算中位数）
+const MEDIAN_MIN_PER_COLUMN: usize = 200_000;
+/// 单列可保留的数值个数上限
+const MEDIAN_MAX_PER_COLUMN: usize = 10_000_000;
+
+/// 数值列描述统计：对每个选定的原始列计算
+/// 行数 / 计数（非空）/ 空值数 / 非数值数 / 求和 / 均值 / 中位数 / 最小 / 最大 / 标准差。
+///
+/// 设计取舍：
+/// - **一次并行扫描同时算所有列**（不按列反复读表），每列用线程局部的
+///   [`ColAcc`]，块结果按列合并；
+/// - 求和与均值分子用与分组汇总同一套**定点十进制**累加（金额不出现 f64 尾差）；
+/// - 标准差用 **Welford 在线算法**（数值稳定，避免 `Σx² − n·mean²` 的灾难性抵消），
+///   分块合并用 Chan 的并行合并公式；输出**总体标准差**（分母 n）；
+/// - **中位数**必须保留数值本身：单列最多保留 [`MEDIAN_MAX_PER_COLUMN`] 个、
+///   总预算 [`MEDIAN_TOTAL_BUDGET`] 个（按列数均分）。若某列数值个数超过保留上限，
+///   该列中位数输出 `—` 并在 `notes` 里说明 —— 不静默给出近似值；
+/// - `NaN` / `±inf` 不算用户意义上的数值（与 `model::classify` 一致），计入非数值。
+pub fn describe_columns(
+    model: &DataModel,
+    rows: Option<&[u32]>,
+    cols: &[usize],
+    progress: Option<&(dyn Fn(f64) + Sync)>,
+) -> Result<StatsTable, String> {
+    let column_count = model.column_count();
+    // 丢弃越界列（界面可能传入陈旧的列索引）、去重、保持用户选择顺序
+    let mut list: Vec<usize> = Vec::new();
+    for &c in cols {
+        if c < column_count && !list.contains(&c) {
+            list.push(c);
+        }
+    }
+    if list.is_empty() {
+        return Err("请至少选择一个有效的列（列可能已删除或隐藏）".to_string());
+    }
+    // 每列保留多少原始数值（用于精确中位数）
+    let cap = (MEDIAN_TOTAL_BUDGET / list.len()).clamp(MEDIAN_MIN_PER_COLUMN, MEDIAN_MAX_PER_COLUMN);
+
+    let total = rows.map(|v| v.len()).unwrap_or_else(|| model.row_count());
+    let mut table = StatsTable {
+        kind: StatsKind::ColumnSummary,
+        headers: COLUMN_SUMMARY_HEADERS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        rows: Vec::new(),
+        input_rows: total,
+        group_columns: 0,
+        aggs: list.len(),
+        notes: Vec::new(),
+    };
+    if total == 0 {
+        for &c in &list {
+            let mut acc = ColAcc::new(cap);
+            table.rows.push(acc.finish(model, c, 0));
+        }
+        if let Some(p) = progress {
+            p(1.0);
+        }
+        return Ok(table);
+    }
+
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(MAX_STATS_THREADS)
+        .min(total);
+    let chunk = (total / threads).max(1);
+    let done = AtomicUsize::new(0);
+    let mut blocks: Vec<Vec<ColAcc>> = Vec::new();
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        let mut start = 0usize;
+        while start < total {
+            let end = (start + chunk).min(total);
+            let model_ref = model;
+            let list_ref = &list;
+            let rows_ref = rows;
+            let done_ref = &done;
+            let prog = progress;
+            handles.push(s.spawn(move || {
+                let mut reader = RowReader::new(list_ref.clone());
+                let mut accs: Vec<ColAcc> = list_ref.iter().map(|_| ColAcc::new(cap)).collect();
+                for i in start..end {
+                    let row = match rows_ref {
+                        Some(l) => l[i] as usize,
+                        None => i,
+                    };
+                    reader.load(model_ref.file(), row);
+                    for (acc, &c) in accs.iter_mut().zip(list_ref.iter()) {
+                        acc.push(reader.value(c));
+                    }
+                }
+                done_ref.fetch_add(end - start, AtomicOrdering::Relaxed);
+                if let Some(p) = prog {
+                    p(done_ref.load(AtomicOrdering::Relaxed) as f64 / total as f64);
+                }
+                accs
+            }));
+            start = end;
+        }
+        for h in handles {
+            blocks.push(h.join().unwrap_or_default());
+        }
+    });
+
+    // 按列合并各块的局部统计
+    let mut accs: Vec<ColAcc> = list.iter().map(|_| ColAcc::new(cap)).collect();
+    for block in blocks {
+        for (a, b) in accs.iter_mut().zip(block.iter()) {
+            a.merge(b);
+        }
+    }
+
+    for (acc, &c) in accs.iter_mut().zip(list.iter()) {
+        table.rows.push(acc.finish(model, c, total as u64));
+    }
+    for (acc, &c) in accs.iter().zip(list.iter()) {
+        let name = column_name(model, c);
+        // 只在「既含数值又含非数值」的列上提示：整列都是文本（无数值）时不必刷提示，
+        // 非数值个数本身已在结果表的「非数值数」列里
+        if acc.non_numeric > 0 && acc.numeric > 0 {
+            table.notes.push(format!(
+                "{}：{} 个非数值未参与计算（数值判定与筛选一致）",
+                name, acc.non_numeric
+            ));
+        }
+        if acc.numeric > acc.values.len() as u64 {
+            table.notes.push(format!(
+                "{}：数值 {} 个，超过精确中位数的保留上限 {} 个，中位数未计算（可先筛选缩小范围，或减少一次统计的列数）",
+                name, acc.numeric, cap
+            ));
+        }
+    }
+    table
+        .notes
+        .push("标准差为总体标准差（分母 n）；如需样本标准差，用该值乘以 sqrt(n/(n-1)) 即可。".to_string());
+    if let Some(p) = progress {
+        p(1.0);
+    }
+    Ok(table)
+}
+
+/// 单列的描述统计累加器
+#[derive(Debug, Clone)]
+struct ColAcc {
+    /// 参与统计的行数（含空值）
+    rows: u64,
+    /// 非空值个数
+    count: u64,
+    /// 空值个数（trim 后为空）
+    empty: u64,
+    /// 非空但非数值的个数
+    non_numeric: u64,
+    /// 数值个数（均值分母、中位数基数）
+    numeric: u64,
+    /// 定点十进制求和
+    dec: DecSum,
+    /// f64 求和（定点不可用时的回退）
+    float_sum: f64,
+    /// Welford 在线均值
+    mean: f64,
+    /// Welford 二阶中心矩累积量（Σ(x-mean)²）
+    m2: f64,
+    min: Option<Num>,
+    max: Option<Num>,
+    /// 保留的原始数值（精确中位数用；最多 `cap` 个）
+    values: Vec<f64>,
+    /// 单列保留上限
+    cap: usize,
+}
+
+impl ColAcc {
+    fn new(cap: usize) -> Self {
+        Self {
+            rows: 0,
+            count: 0,
+            empty: 0,
+            non_numeric: 0,
+            numeric: 0,
+            dec: DecSum::default(),
+            float_sum: 0.0,
+            mean: 0.0,
+            m2: 0.0,
+            min: None,
+            max: None,
+            values: Vec::new(),
+            cap,
+        }
+    }
+
+    /// 累加一个字段值（原始文本）
+    fn push(&mut self, value: &str) {
+        self.rows += 1;
+        let t = value.trim();
+        if t.is_empty() {
+            self.empty += 1;
+            return;
+        }
+        self.count += 1;
+        match try_num(t) {
+            Some(Num::Int(i)) => {
+                self.numeric += 1;
+                self.dec.add(i, 0);
+                let f = i as f64;
+                self.float_sum += f;
+                self.welford(f);
+                self.push_num(Num::Int(i));
+                self.keep(f);
+            }
+            Some(Num::Float(f)) if f.is_finite() => {
+                self.numeric += 1;
+                self.dec.add_text(t);
+                self.float_sum += f;
+                self.welford(f);
+                self.push_num(Num::Float(f));
+                self.keep(f);
+            }
+            // NaN / ±inf 与解析失败一样，都不算数值
+            _ => self.non_numeric += 1,
+        }
+    }
+
+    /// Welford 在线更新（调用前 `numeric` 已 +1）
+    fn welford(&mut self, v: f64) {
+        let n = self.numeric as f64;
+        let delta = v - self.mean;
+        self.mean += delta / n;
+        self.m2 += delta * (v - self.mean);
+    }
+
+    fn push_num(&mut self, n: Num) {
+        self.min = Some(match self.min {
+            Some(m) if cmp_num(&m, &n) != Ordering::Greater => m,
+            _ => n,
+        });
+        self.max = Some(match self.max {
+            Some(m) if cmp_num(&m, &n) != Ordering::Less => m,
+            _ => n,
+        });
+    }
+
+    /// 保留原始数值（超出上限就自然停止，`values.len() != numeric` 即「中位数不可精确」）
+    fn keep(&mut self, v: f64) {
+        if self.values.len() < self.cap {
+            self.values.push(v);
+        }
+    }
+
+    /// 合并另一个块的同列结果
+    fn merge(&mut self, other: &ColAcc) {
+        self.rows += other.rows;
+        self.count += other.count;
+        self.empty += other.empty;
+        self.non_numeric += other.non_numeric;
+        self.dec.merge(&other.dec);
+        self.float_sum += other.float_sum;
+        // Welford 并行合并（Chan 公式的稳定形式）：
+        //   mean = meanA + δ·n₂/n（而不是 (n₁·meanA + n₂·meanB)/n —— 后者即使两边均值
+        //   相同，也会因 n₁·meanA 的舍入让均值漂移，进而让 M2 凭空增长）
+        //   M2   = M2A + M2B + δ²·n₁·n₂/n
+        if other.numeric > 0 {
+            let n1 = self.numeric as f64;
+            let n2 = other.numeric as f64;
+            if n1 == 0.0 {
+                self.mean = other.mean;
+                self.m2 = other.m2;
+            } else {
+                let n = n1 + n2;
+                let delta = other.mean - self.mean;
+                self.mean += delta * (n2 / n);
+                self.m2 += other.m2 + delta * delta * n1 * n2 / n;
+            }
+        }
+        if let Some(m) = other.min {
+            self.min = Some(match self.min {
+                Some(x) if cmp_num(&x, &m) != Ordering::Greater => x,
+                _ => m,
+            });
+        }
+        if let Some(m) = other.max {
+            self.max = Some(match self.max {
+                Some(x) if cmp_num(&x, &m) != Ordering::Less => x,
+                _ => m,
+            });
+        }
+        // 中位数保留值：到合并前仍完整（values.len() == numeric）才继续拼接
+        if self.values.len() as u64 == self.numeric {
+            let room = self.cap.saturating_sub(self.values.len());
+            let take = other.values.len().min(room);
+            self.values.extend_from_slice(&other.values[..take]);
+        }
+        // 数值个数最后累加（上面的完整性判断用的是合并前的值）
+        self.numeric += other.numeric;
+    }
+
+    /// 中位数文本（`—` = 数值过多未保留全量）
+    fn median_text(&mut self) -> String {
+        if self.numeric == 0 {
+            return String::new();
+        }
+        if self.values.len() as u64 != self.numeric {
+            return "—".to_string();
+        }
+        self.values
+            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+        let n = self.values.len();
+        let median = if n % 2 == 1 {
+            self.values[n / 2]
+        } else {
+            (self.values[n / 2 - 1] + self.values[n / 2]) / 2.0
+        };
+        fmt_float(median)
+    }
+
+    /// 产出一行结果（每列一行）
+    fn finish(&mut self, model: &DataModel, col: usize, rows: u64) -> Vec<String> {
+        let has_num = self.numeric > 0;
+        let mean = if has_num {
+            let total = self.dec.exact_value().unwrap_or(self.float_sum);
+            fmt_float(total / self.numeric as f64)
+        } else {
+            String::new()
+        };
+        let std_dev = if has_num {
+            // 总体标准差（分母 n）；m2 理论上非负，防御性 max(0)
+            fmt_float((self.m2 / self.numeric as f64).max(0.0).sqrt())
+        } else {
+            String::new()
+        };
+        let median = self.median_text();
+        vec![
+            column_name(model, col),
+            rows.to_string(),
+            self.count.to_string(),
+            self.empty.to_string(),
+            self.non_numeric.to_string(),
+            if has_num {
+                self.dec.text(self.float_sum)
+            } else {
+                String::new()
+            },
+            mean,
+            median,
+            if has_num {
+                self.min.map(fmt_num).unwrap_or_default()
+            } else {
+                String::new()
+            },
+            if has_num {
+                self.max.map(fmt_num).unwrap_or_default()
+            } else {
+                String::new()
+            },
+            std_dev,
+        ]
+    }
+}
+
 /// 新建一组聚合累加器（仅「去重计数」才创建集合，避免不必要的内存）
 fn new_accs(specs: &[AggSpec]) -> Vec<Acc> {
     specs.iter().map(|s| Acc::new(s.kind)).collect()
+}
+
+/// 定点十进制累加器：把各数值按小数位数放大成 `i128` 整数相加，
+/// 从而避免 f64 的累积误差（`0.01` 这类十进制小数在 f64 里并不精确，
+/// 金额列成百上千次相加后会显形为 `3613134567.580001`）。
+///
+/// 只要遇到一个**无法**精确写成十进制字面量的值（科学计数法、超过
+/// [`DEC_MAX_SCALE`] 位小数、超过 [`DEC_MAX_DIGITS`] 位数字、或 i128 溢出），
+/// 就整体作废（`exact = false`），由调用方改用 f64 累加值兜底。
+#[derive(Debug, Clone)]
+struct DecSum {
+    /// 各值按 [`DecSum::scale`] 放大后的累加和
+    sum: i128,
+    /// 当前小数位数（组内各值小数位数的最大值）
+    scale: u32,
+    /// 是否仍可用定点精确表示
+    exact: bool,
+}
+
+impl Default for DecSum {
+    fn default() -> Self {
+        Self {
+            sum: 0,
+            scale: 0,
+            exact: true,
+        }
+    }
+}
+
+impl DecSum {
+    /// 累加一个已经解析好的定点值（`v` 为 `sc` 位小数的缩放整数）
+    fn add(&mut self, v: i128, sc: u32) {
+        if !self.exact {
+            return; // 已回退 f64，不必再算
+        }
+        if sc > DEC_MAX_SCALE {
+            self.exact = false;
+            return;
+        }
+        // 先把两个操作数对齐到较大的小数位数
+        let target = self.scale.max(sc);
+        let scaled_v = match pow10_i128(target - sc).and_then(|f| v.checked_mul(f)) {
+            Some(x) => x,
+            None => {
+                self.exact = false;
+                return;
+            }
+        };
+        if target > self.scale {
+            let f = pow10_i128(target - self.scale).expect("scale 受 DEC_MAX_SCALE 限制");
+            match self.sum.checked_mul(f) {
+                Some(s) => self.sum = s,
+                None => {
+                    self.exact = false;
+                    return;
+                }
+            }
+            self.scale = target;
+        }
+        match self.sum.checked_add(scaled_v) {
+            Some(s) => self.sum = s,
+            None => self.exact = false,
+        }
+    }
+
+    /// 累加一个数值文本（解析失败 → 回退 f64）
+    fn add_text(&mut self, t: &str) {
+        match parse_dec(t) {
+            Some((v, sc)) => self.add(v, sc),
+            None => self.exact = false,
+        }
+    }
+
+    /// 合并另一个累加器（两边小数位数可能不同，先对齐再相加）
+    fn merge(&mut self, other: &DecSum) {
+        self.exact &= other.exact;
+        if !self.exact {
+            return;
+        }
+        let target = self.scale.max(other.scale);
+        let a = pow10_i128(target - self.scale).and_then(|f| self.sum.checked_mul(f));
+        let b = pow10_i128(target - other.scale).and_then(|f| other.sum.checked_mul(f));
+        match a.and_then(|a| b.map(|b| (a, b))).and_then(|(a, b)| a.checked_add(b)) {
+            Some(s) => {
+                self.sum = s;
+                self.scale = target;
+            }
+            None => self.exact = false,
+        }
+    }
+
+    /// 精确值（不可精确时返回 `None`）
+    fn exact_value(&self) -> Option<f64> {
+        if self.exact {
+            Some(self.sum as f64 / pow10_f64(self.scale))
+        } else {
+            None
+        }
+    }
+
+    /// 输出文本：精确时用十进制（去掉尾随零），否则用 f64 兜底值
+    fn text(&self, fallback: f64) -> String {
+        if self.exact {
+            fmt_dec(self.sum, self.scale)
+        } else {
+            fmt_float(fallback)
+        }
+    }
 }
 
 /// 单个分组内、单个聚合列的累加器
@@ -359,13 +918,11 @@ struct Acc {
     empty: u64,
     /// 非空但不是数值的个数（求和/均值/最大/最小忽略这些值）
     non_numeric: u64,
-    /// 定点十进制求和：各值按 [`Acc::dec_scale`] 放大后的 `i128` 累加和
-    dec_sum: i128,
-    /// 定点求和当前的小数位数（组内各值小数位数的最大值）
-    dec_scale: u32,
-    /// 是否组内所有数值都能用定点十进制精确表示（false → 求和回退 `f64`）
-    dec_exact: bool,
-    /// f64 求和（始终累积；定点不可用时的回退，也是均值的分子来源之一）
+    /// 数值个数（可解析为数值的非空值）—— 均值的分母
+    numeric: u64,
+    /// 定点十进制求和
+    dec: DecSum,
+    /// f64 求和（始终累积；定点不可用时的回退）
     float_sum: f64,
     min: Option<Num>,
     max: Option<Num>,
@@ -383,44 +940,7 @@ impl Acc {
             } else {
                 None
             },
-            // 默认值派生出来的是 false，这里显式置为「可精确」
-            dec_exact: true,
             ..Default::default()
-        }
-    }
-
-    /// 定点累加一个十进制数值（`v` 为 `sc` 位小数的缩放整数表示）
-    fn add_dec(&mut self, v: i128, sc: u32) {
-        if !self.dec_exact {
-            return; // 已回退 f64，不必再算
-        }
-        if sc > DEC_MAX_SCALE {
-            self.dec_exact = false;
-            return;
-        }
-        // 先把两个操作数对齐到较大的小数位数
-        let target = self.dec_scale.max(sc);
-        let scaled_v = match pow10_i128(target - sc).and_then(|f| v.checked_mul(f)) {
-            Some(x) => x,
-            None => {
-                self.dec_exact = false;
-                return;
-            }
-        };
-        if target > self.dec_scale {
-            let f = pow10_i128(target - self.dec_scale).expect("scale 受 DEC_MAX_SCALE 限制");
-            match self.dec_sum.checked_mul(f) {
-                Some(s) => self.dec_sum = s,
-                None => {
-                    self.dec_exact = false;
-                    return;
-                }
-            }
-            self.dec_scale = target;
-        }
-        match self.dec_sum.checked_add(scaled_v) {
-            Some(s) => self.dec_sum = s,
-            None => self.dec_exact = false,
         }
     }
 
@@ -449,20 +969,20 @@ impl Acc {
             }
             AggKind::Sum | AggKind::Avg | AggKind::Min | AggKind::Max => match try_num(t) {
                 Some(Num::Int(i)) => {
-                    self.add_dec(i, 0);
+                    self.numeric += 1;
+                    self.dec.add(i, 0);
                     self.float_sum += i as f64;
                     self.push_num(Num::Int(i));
                 }
-                Some(Num::Float(f)) => {
-                    // 能写成十进制字面量就用定点精确累加，否则整体回退 f64
-                    match parse_dec(t) {
-                        Some((v, sc)) => self.add_dec(v, sc),
-                        None => self.dec_exact = false,
-                    }
+                // 能写成十进制字面量就用定点精确累加，否则整体回退 f64
+                Some(Num::Float(f)) if f.is_finite() => {
+                    self.numeric += 1;
+                    self.dec.add_text(t);
                     self.float_sum += f;
                     self.push_num(Num::Float(f));
                 }
-                None => self.non_numeric += 1,
+                // NaN / ±inf 与解析失败一样，都不算用户意义上的数值（与 model::classify 一致）
+                _ => self.non_numeric += 1,
             },
         }
     }
@@ -484,21 +1004,9 @@ impl Acc {
         self.non_empty += other.non_empty;
         self.empty += other.empty;
         self.non_numeric += other.non_numeric;
+        self.numeric += other.numeric;
         self.float_sum += other.float_sum;
-        // 定点求和：两边小数位数可能不同（不同行块的数值小数位数不一样），先对齐再相加
-        self.dec_exact &= other.dec_exact;
-        if self.dec_exact {
-            let target = self.dec_scale.max(other.dec_scale);
-            let a = pow10_i128(target - self.dec_scale).and_then(|f| self.dec_sum.checked_mul(f));
-            let b = pow10_i128(target - other.dec_scale).and_then(|f| other.dec_sum.checked_mul(f));
-            match a.and_then(|a| b.map(|b| (a, b))).and_then(|(a, b)| a.checked_add(b)) {
-                Some(s) => {
-                    self.dec_sum = s;
-                    self.dec_scale = target;
-                }
-                None => self.dec_exact = false,
-            }
-        }
+        self.dec.merge(&other.dec);
         if let Some(m) = other.min {
             self.min = Some(match self.min {
                 Some(x) if cmp_num(&x, &m) != Ordering::Greater => x,
@@ -540,31 +1048,18 @@ impl Acc {
                     n.to_string()
                 }
             }
-            AggKind::Sum => self.sum_text(),
+            AggKind::Sum => self.dec.text(self.float_sum),
             AggKind::Avg => {
-                if self.non_empty == 0 {
+                if self.numeric == 0 {
                     String::new()
                 } else {
-                    // 均值（分子取定点精确和；不可精确时用 f64 累加值）
-                    let total = if self.dec_exact {
-                        self.dec_sum as f64 / pow10_f64(self.dec_scale)
-                    } else {
-                        self.float_sum
-                    };
-                    fmt_float(total / self.non_empty as f64)
+                    // 均值 = 数值和 ÷ 数值个数（非数值不计入分母）；分子优先用定点精确和
+                    let total = self.dec.exact_value().unwrap_or(self.float_sum);
+                    fmt_float(total / self.numeric as f64)
                 }
             }
             AggKind::Min => self.min.map(fmt_num).unwrap_or_default(),
             AggKind::Max => self.max.map(fmt_num).unwrap_or_default(),
-        }
-    }
-
-    /// 求和结果文本：定点精确时输出精确十进制（去掉尾随零），否则回退 f64
-    fn sum_text(&self) -> String {
-        if self.dec_exact {
-            fmt_dec(self.dec_sum, self.dec_scale)
-        } else {
-            fmt_float(self.float_sum)
         }
     }
 }
@@ -732,7 +1227,7 @@ mod tests {
             t.rows[1],
             vec!["上海", "2", "50", "50", "1", "1", "50", "50"]
         );
-        assert!(!t.has_non_numeric());
+        assert!(t.notes.is_empty(), "没有非数值时不应有提示：{:?}", t.notes);
         std::fs::remove_file(&p).ok();
     }
 
@@ -926,7 +1421,7 @@ mod tests {
         assert_eq!(t2.group_count(), 0);
         assert_eq!(t2.input_rows, 0);
         assert_eq!(t2.headers.len(), 3); // 城市 + 行数 + 卡号(求和)
-        assert_eq!(t2.non_numeric.len(), 1);
+        assert!(t2.notes.is_empty(), "空输入不应有提示");
         std::fs::remove_file(&p).ok();
     }
 
@@ -952,8 +1447,58 @@ mod tests {
         .unwrap();
         // 求和 33.5（跳过 abc）、计数 4（非空有 4 个）、最大 20
         assert_eq!(t.rows[0], vec!["北京", "4", "33.5", "4", "20"]);
-        assert!(t.has_non_numeric());
-        assert_eq!(t.non_numeric, vec![1, 0, 1]);
+        // 提示逐聚合列给出：求和列与最大列各有 1 个非数值，计数列不受影响
+        assert_eq!(t.notes.len(), 2, "{:?}", t.notes);
+        assert!(t.notes.iter().any(|n| n.contains("金额(求和)：1 个非数值")));
+        assert!(t.notes.iter().any(|n| n.contains("金额(最大)：1 个非数值")));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn avg_denominator_excludes_non_numeric() {
+        // 均值 = 数值和 ÷ 数值个数；非数值（abc/未知）不计入分母，也不计入分子
+        let p = write_temp(
+            "组,金额\nA,10\nA,20\nA,abc\nA,未知\n".as_bytes(),
+            "_avgdenom.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = group_by(
+            &m,
+            None,
+            &[0],
+            &[spec(1, AggKind::Avg), spec(1, AggKind::Sum), spec(1, AggKind::Count)],
+            None,
+        )
+        .unwrap();
+        // 行数 4、均值 (10+20)/2 = 15、求和 30、非空计数 4
+        assert_eq!(t.rows[0], vec!["A", "4", "15", "30", "4"]);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn group_by_treats_nan_and_inf_as_non_numeric() {
+        // NaN / ±inf 不是用户意义上的数值（与 model::classify 一致）：不计入求和/极值
+        let p = write_temp(
+            "组,金额\nA,10\nA,NaN\nA,inf\nA,-inf\nA,20\n".as_bytes(),
+            "_nan.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = group_by(
+            &m,
+            None,
+            &[0],
+            &[
+                spec(1, AggKind::Sum),
+                spec(1, AggKind::Max),
+                spec(1, AggKind::Min),
+                spec(1, AggKind::Avg),
+            ],
+            None,
+        )
+        .unwrap();
+        // 只统计 10 与 20：求和 30、最大 20、最小 10、均值 15
+        assert_eq!(t.rows[0], vec!["A", "5", "30", "20", "10", "15"]);
+        assert_eq!(t.notes.len(), 4, "四个聚合列都应有非数值提示：{:?}", t.notes);
         std::fs::remove_file(&p).ok();
     }
 
@@ -1035,4 +1580,230 @@ mod tests {
         assert_eq!(fmt_float(-0.0), "0");
         assert_eq!(fmt_float(1e20), "100000000000000000000");
     }
+
+    // ===== 数值列统计（describe_columns）=====
+
+    fn describe(m: &DataModel, cols: &[usize]) -> StatsTable {
+        describe_columns(m, None, cols, None).unwrap()
+    }
+
+    #[test]
+    fn column_summary_basic_metrics() {
+        // 1,2,3,4 → 计数 4、空 0、非数值 0、和 10、均值 2.5、中位数 2.5、最小 1、最大 4
+        let p = write_temp("金额\n1\n2\n3\n4\n".as_bytes(), "_cs1.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = describe(&m, &[0]);
+        assert_eq!(t.kind, StatsKind::ColumnSummary);
+        assert_eq!(t.headers[0], "列名");
+        assert_eq!(t.headers.len(), 11);
+        assert_eq!(t.group_count(), 1);
+        assert_eq!(t.input_rows, 4);
+        assert_eq!(
+            t.rows[0],
+            vec!["金额", "4", "4", "0", "0", "10", "2.5", "2.5", "1", "4", "1.118034"]
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn column_summary_odd_median_and_zeros() {
+        // 奇数个数值 → 中位数取中间那个；全 0 → 标准差 0
+        let p = write_temp("金额\n5\n1\n3\n".as_bytes(), "_cs2.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = describe(&m, &[0]);
+        assert_eq!(t.rows[0][7], "3", "奇数个数的中位数");
+        assert_eq!(t.rows[0][5], "9");
+
+        let p2 = write_temp("金额\n0\n0\n0\n".as_bytes(), "_cs3.csv");
+        let m2 = DataModel::open(&p2, 100).unwrap();
+        let t2 = describe(&m2, &[0]);
+        assert_eq!(t2.rows[0][10], "0", "全 0 的标准差");
+        assert_eq!(t2.rows[0][7], "0", "全 0 的中位数");
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(&p2).ok();
+    }
+
+    #[test]
+    fn column_summary_counts_empty_and_non_numeric() {
+        // 空值、非数值、NaN/inf 分别计数，且不参与求和/均值/中位数/极值
+        let p = write_temp(
+            "金额\n10\n\n20\nabc\nNaN\ninf\n30\n".as_bytes(),
+            "_cs4.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = describe(&m, &[0]);
+        let r = &t.rows[0];
+        assert_eq!(r[1], "7", "行数（含空值）");
+        assert_eq!(r[2], "6", "计数（非空）");
+        assert_eq!(r[3], "1", "空值数");
+        assert_eq!(r[4], "3", "非数值数（abc / NaN / inf）");
+        // 只有 10/20/30 参与数值统计
+        assert_eq!(r[5], "60", "求和");
+        assert_eq!(r[6], "20", "均值（10+20+30)/3）");
+        assert_eq!(r[7], "20", "中位数");
+        assert_eq!(r[8], "10", "最小");
+        assert_eq!(r[9], "30", "最大");
+        assert!(
+            t.notes.iter().any(|n| n.contains("3 个非数值")),
+            "{:?}",
+            t.notes
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn column_summary_exact_sum_and_std_dev() {
+        // 求和用定点精确（不出现 f64 尾差）；标准差用 Welford（总体，分母 n）
+        let mut data = String::from("金额\n");
+        for _ in 0..400 {
+            data.push_str("1000000000.01\n");
+        }
+        let p = write_temp(data.as_bytes(), "_cs5.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = describe(&m, &[0]);
+        assert_eq!(t.rows[0][5], "400000000004", "精确求和");
+        assert_eq!(t.rows[0][10], "0", "全同值标准差为 0");
+
+        // 2,4,4,4,5,5,7,9 → 均值 5、总体标准差 2
+        let p2 = write_temp("金额\n2\n4\n4\n4\n5\n5\n7\n9\n".as_bytes(), "_cs6.csv");
+        let m2 = DataModel::open(&p2, 100).unwrap();
+        let t2 = describe(&m2, &[0]);
+        assert_eq!(t2.rows[0][6], "5", "均值");
+        assert_eq!(t2.rows[0][10], "2", "总体标准差");
+        assert_eq!(t2.rows[0][7], "4.5", "中位数");
+        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(&p2).ok();
+    }
+
+    #[test]
+    fn column_summary_multi_column_single_pass_and_order() {
+        // 多列：按用户选择顺序逐行输出，且各列统计互不影响
+        let p = write_temp(
+            "A,B,文本\n1,10,x\n2,20,y\n3,30,z\n".as_bytes(),
+            "_cs7.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = describe(&m, &[1, 0]);
+        assert_eq!(t.group_count(), 2);
+        assert_eq!(t.rows[0][0], "B");
+        assert_eq!(t.rows[0][5], "60");
+        assert_eq!(t.rows[1][0], "A");
+        assert_eq!(t.rows[1][5], "6");
+        // 文本列：既无求和也无均值/中位数/极值/标准差
+        let t2 = describe(&m, &[2]);
+        assert_eq!(t2.rows[0][2], "3", "计数（非空）");
+        assert_eq!(t2.rows[0][4], "3", "非数值数");
+        assert_eq!(t2.rows[0][5], "", "文本列无求和");
+        assert_eq!(t2.rows[0][7], "", "文本列无中位数");
+        assert_eq!(t2.rows[0][10], "", "文本列无标准差");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn column_summary_respects_row_subset_and_empty_range() {
+        // 统计范围 = 传入的行子集（当前筛选结果）
+        let p = write_temp("金额\n1\n2\n100\n200\n".as_bytes(), "_cs8.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = describe_columns(&m, Some(&[0, 1]), &[0], None).unwrap();
+        assert_eq!(t.input_rows, 2);
+        assert_eq!(t.rows[0][5], "3");
+        assert_eq!(t.rows[0][8], "1");
+
+        // 空范围：仍给出每个被选列一行（计数全 0）
+        let t2 = describe_columns(&m, Some(&[]), &[0], None).unwrap();
+        assert_eq!(t2.group_count(), 1);
+        assert_eq!(t2.input_rows, 0);
+        assert_eq!(t2.rows[0], vec!["金额", "0", "0", "0", "0", "", "", "", "", "", ""]);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn column_summary_median_unavailable_when_too_many_values() {
+        // 数值个数超过「精确中位数」保留上限 → 中位数输出 `—` 并在 notes 说明（不给近似值）
+        let p = write_temp("金额\n1\n2\n".as_bytes(), "_cs9.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        // 用极小的 cap 直接驱动这条路径（等价于数值超过默认上限）
+        let mut acc = ColAcc::new(1);
+        acc.push("1");
+        acc.push("2");
+        assert_eq!(acc.numeric, 2);
+        assert_eq!(acc.values.len(), 1);
+        let row = acc.finish(&m, 0, 2);
+        assert_eq!(row[7], "—");
+        // 合并也要保持「不完整」标记：把另一块并入后仍不可精确
+        let mut other = ColAcc::new(1);
+        other.push("3");
+        acc.merge(&other);
+        assert_eq!(acc.numeric, 3);
+        assert_ne!(acc.values.len() as u64, acc.numeric);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn column_summary_parallel_merge_matches_single_pass() {
+        // 12000 行（多分块）与手工计算一致；跨块 Welford/min/max/计数合并正确
+        let mut data = String::from("值\n");
+        let mut vals: Vec<f64> = Vec::new();
+        for i in 0..12000u32 {
+            let v = (i % 97) as f64 / 4.0;
+            vals.push(v);
+            data.push_str(&format!("{}\n", v));
+        }
+        let p = write_temp(data.as_bytes(), "_cs10.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = describe(&m, &[0]);
+        let n = vals.len() as f64;
+        let sum: f64 = vals.iter().sum();
+        let mean = sum / n;
+        let var = vals.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n;
+        let got = |i: usize| -> f64 { t.rows[0][i].parse().unwrap() };
+        assert_eq!(t.rows[0][1], "12000");
+        assert!((got(5) - sum).abs() < 1e-6, "求和 {} vs {}", got(5), sum);
+        assert!((got(6) - mean).abs() < 1e-6, "均值 {} vs {}", got(6), mean);
+        assert!(
+            (got(10) - var.sqrt()).abs() < 1e-6,
+            "标准差 {} vs {}",
+            got(10),
+            var.sqrt()
+        );
+        let mut sorted = vals.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(
+            got(7),
+            (sorted[5999] + sorted[6000]) / 2.0,
+            "中位数（偶数个取中间两个的平均）"
+        );
+        assert_eq!(got(8), sorted[0], "最小");
+        assert_eq!(got(9), sorted[11999], "最大");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn column_summary_rejects_invalid_columns() {
+        let p = write_temp("A\n1\n".as_bytes(), "_cs11.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        assert!(describe_columns(&m, None, &[99], None).is_err());
+        assert!(describe_columns(&m, None, &[], None).is_err());
+        // 越界列被忽略，其余列正常统计
+        let t = describe(&m, &[0, 42]);
+        assert_eq!(t.group_count(), 1);
+        assert_eq!(t.rows[0][0], "A");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn stats_table_summary_text() {
+        let p = write_temp("金额\n1\n2\n".as_bytes(), "_cs12.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = describe(&m, &[0]);
+        assert_eq!(t.summary(), "统计范围 2 行 → 1 列");
+        assert_eq!(t.row_unit(), "列");
+        assert!(t.notes.iter().any(|n| n.contains("总体标准差")));
+        let g = group_by(&m, None, &[0], &[spec(0, AggKind::Count)], None).unwrap();
+        // 数据只有 1、2 两个不同取值 → 2 组
+        assert_eq!(g.summary(), "统计范围 2 行 → 2 组（分组字段 1 个，聚合列 1 个）");
+        assert_eq!(g.row_unit(), "组");
+        std::fs::remove_file(&p).ok();
+    }
 }
+

@@ -185,6 +185,23 @@ fn main() {
         )
     }));
 
+    // 数值列统计（含中位数，需要保留并排序原始值）
+    let describe = |cols: &[usize]| -> String {
+        match csv_editor_rust::core::stats::describe_columns(&m, None, cols, None) {
+            Ok(t) => format!("{} 列", t.rows.len()),
+            Err(e) => format!("失败：{}", e),
+        }
+    };
+    results.push(bench("列统计：1 列（金额，2 位小数）", repeat, || {
+        describe(&[3])
+    }));
+    results.push(bench("列统计：4 列（金额/账号/网点/序号）", repeat, || {
+        describe(&[3, 2, 7, 14])
+    }));
+    results.push(bench("列统计：10 列（含长数字列）", repeat, || {
+        describe(&[0, 1, 2, 3, 4, 6, 7, 10, 11, 14])
+    }));
+
     println!(
         "\n{:<44} {:>9} {:>9} {:>8}  {}",
         "场景", "耗时(s)", "CPU(s)", "并行度", "产出"

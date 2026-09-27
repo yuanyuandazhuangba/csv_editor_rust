@@ -27,7 +27,7 @@ pub enum BgMsg {
     Merged(MergeReport),
     /// 提取唯一行完成（唯一行号, 统计, 重复行对应关系, 判重字段原始列索引）
     DedupDone(Vec<u32>, DedupReport, Vec<(u32, u32)>, Vec<usize>),
-    /// 字段分组汇总完成（结果表；用 Arc 便于结果窗每帧零成本共享）
+    /// 统计完成（分组汇总 / 数值列统计；结果表用 Arc 便于结果窗每帧零成本共享）
     StatsDone(std::sync::Arc<StatsTable>),
     /// 错误
     Error(String),
