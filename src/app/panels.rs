@@ -1217,7 +1217,7 @@ impl CsvEditorApp {
         self.set_busy("空值与数据质量统计", "正在检查各列...", 0.0);
     }
 
-    /// 执行「透视表」（后台线程）：行字段 × 列字段 × 值聚合。
+    /// 执行「透视表」（后台线程）：行字段 × 列字段 × 多项指标（值列 + 聚合方式）。
     pub fn run_pivot_table(&mut self) {
         if self.busy.is_some() {
             self.log("已有任务在执行，请稍候");
@@ -1228,43 +1228,85 @@ impl CsvEditorApp {
             return;
         };
         // 视图列 → 原始列（派生列不参与）
+        let to_base = |c: usize| self.ops.as_ref().and_then(|o| o.view_to_base(c));
         let rcols: Vec<usize> = self
             .dialogs
             .pivot_row_cols
             .iter()
-            .filter_map(|&c| self.ops.as_ref().and_then(|o| o.view_to_base(c)))
+            .filter_map(|&c| to_base(c))
             .collect();
         if rcols.is_empty() {
             self.log("请至少选择一个行字段（派生列不能作为统计字段）");
             return;
         }
-        let to_base = |c: usize| self.ops.as_ref().and_then(|o| o.view_to_base(c));
         let Some(col_col) = to_base(self.dialogs.pivot_col) else {
             self.log("列字段无效（派生列或列已删除），请重新选择");
             return;
         };
-        let Some(value_col) = to_base(self.dialogs.pivot_value_col) else {
-            self.log("值列无效（派生列或列已删除），请重新选择");
+        let mut specs: Vec<stats::PivotValue> = Vec::new();
+        for &(c, k) in &self.dialogs.pivot_values {
+            let Some(base) = to_base(c) else { continue };
+            let kind = stats::PIVOT_KINDS[k.min(stats::PIVOT_KINDS.len() - 1)];
+            let spec = stats::PivotValue {
+                column: base,
+                kind,
+            };
+            if !specs.contains(&spec) {
+                specs.push(spec);
+            }
+        }
+        if specs.is_empty() {
+            self.log("请至少添加一项指标（值列 + 聚合方式）");
             return;
+        }
+        // 规模上限（界面可调；0 表示用默认值）
+        let limits = stats::PivotLimits {
+            max_rows: if self.dialogs.pivot_max_rows == 0 {
+                stats::PIVOT_DEFAULT_MAX_ROWS
+            } else {
+                self.dialogs.pivot_max_rows
+            },
+            max_columns: if self.dialogs.pivot_max_cols == 0 {
+                stats::PIVOT_DEFAULT_MAX_COLUMNS
+            } else {
+                self.dialogs.pivot_max_cols
+            },
+            max_cells: if self.dialogs.pivot_max_cells == 0 {
+                stats::PIVOT_DEFAULT_MAX_CELLS
+            } else {
+                self.dialogs.pivot_max_cells
+            },
         };
-        let kind = stats::PIVOT_KINDS[self.dialogs.pivot_kind.min(stats::PIVOT_KINDS.len() - 1)];
         let names = |cols: &[usize]| -> String {
             cols.iter()
                 .filter_map(|&c| model.header().get(c).cloned())
                 .collect::<Vec<_>>()
                 .join("、")
         };
+        let value_desc = specs
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}({})",
+                    model.header().get(s.column).cloned().unwrap_or_default(),
+                    s.kind.label()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("、");
         let scope = match self.visible_rows() {
             Some(v) => format!("当前筛选结果 {} 行", v.len()),
             None => format!("全部数据 {} 行", model.row_count()),
         };
         self.log(&format!(
-            "开始透视表：行 [{}]；列 [{}]；值 [{}({})]；范围 {}",
+            "开始透视表：行 [{}]；列 [{}]；指标 [{}]；范围 {}；上限 行{}／列{}／格子{}",
             names(&rcols),
             model.header().get(col_col).cloned().unwrap_or_default(),
-            model.header().get(value_col).cloned().unwrap_or_default(),
-            kind.label(),
-            scope
+            value_desc,
+            scope,
+            limits.max_rows,
+            limits.max_columns,
+            limits.max_cells
         ));
         let rows = self.visible_rows().map(|v| v.to_vec());
         let tx = self.tx.clone();
@@ -1274,8 +1316,8 @@ impl CsvEditorApp {
                 rows.as_deref(),
                 &rcols,
                 col_col,
-                value_col,
-                kind,
+                &specs,
+                limits,
                 Some(&|p| ctl.report_progress(p as f32, "正在生成透视表...")),
             );
             match result {

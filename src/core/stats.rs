@@ -250,10 +250,11 @@ impl StatsTable {
                 format!("统计范围 {} 行 → {} 列", self.input_rows, self.rows.len())
             }
             StatsKind::Pivot => format!(
-                "统计范围 {} 行 → {} 行 × {} 列（含合计行列）",
+                "统计范围 {} 行 → {} 行 × {} 个列字段取值（{} 项指标，含合计）",
                 self.input_rows,
                 self.rows.len().saturating_sub(1),
-                self.group_columns
+                self.group_columns,
+                self.aggs
             ),
             StatsKind::CrossTab => format!(
                 "统计范围 {} 行 → {} 个 {}（含汇总说明）",
@@ -1417,32 +1418,70 @@ pub const PIVOT_KINDS: [AggKind; 5] = [
     AggKind::Count,
 ];
 
-/// 透视表的列字段取值个数上限（超出报错：列太多既看不清也意义有限）
-const MAX_PIVOT_COLUMNS: usize = 200;
-/// 透视表的单元格总数上限（行组合 × 出现过的列取值；每个单元格一个聚合器，约 60MB）
-const MAX_PIVOT_CELLS: usize = 500_000;
+/// 透视表的**默认**列字段取值个数上限（可在界面上按硬件情况调整）
+pub const PIVOT_DEFAULT_MAX_COLUMNS: usize = 200;
+/// 透视表的**默认**行组合数上限
+pub const PIVOT_DEFAULT_MAX_ROWS: usize = 20_000;
+/// 透视表的**默认**单元格（有数据的格子）数上限
+pub const PIVOT_DEFAULT_MAX_CELLS: usize = 500_000;
+/// 透视表允许的最大指标数（值列 × 聚合方式）
+pub const PIVOT_MAX_VALUES: usize = 12;
 
-/// 透视表（行字段 × 列字段 × 值聚合）。
+/// 透视表的一项指标：值列 + 聚合方式
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PivotValue {
+    /// 原始列索引
+    pub column: usize,
+    pub kind: AggKind,
+}
+
+/// 透视表的规模上限（界面可调，用于按硬件能力"放大"软件的处理能力）。
+///
+/// 三者都直接对应一块内存/规模：[`PivotLimits::max_rows`] 决定行键表大小、
+/// [`PivotLimits::max_columns`] 决定动态增长的列集合、
+/// [`PivotLimits::max_cells`] 决定"列值 × 行组合"的格子数
+/// （每个格子每个指标一个聚合器，约 100 字节）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PivotLimits {
+    pub max_rows: usize,
+    pub max_columns: usize,
+    pub max_cells: usize,
+}
+
+impl Default for PivotLimits {
+    fn default() -> Self {
+        Self {
+            max_rows: PIVOT_DEFAULT_MAX_ROWS,
+            max_columns: PIVOT_DEFAULT_MAX_COLUMNS,
+            max_cells: PIVOT_DEFAULT_MAX_CELLS,
+        }
+    }
+}
+
+/// 透视表（行字段 × 列字段 × 多个值指标的聚合）。
 ///
 /// 语义：
 /// - 行 = `row_cols`（1~2 个字段）的取值组合，列 = `col_col` 的各个取值，
-///   单元格 = `value_col` 在 `kind`（求和/均值/最小/最大/计数）下的聚合值；
-/// - 末行「(合计)」是各列的**整体聚合**（不是把各行相加）——所以均值、计数这类
-///   非可加聚合在合计行依然正确；每行末尾也是该行的整体聚合；
+///   单元格 = 每个 [`PivotValue`]（值列 + 聚合方式）在该组合下的聚合值；
+/// - **一次可以放多项指标**（如"金额求和 + 金额均值 + 笔数计数"）：此时表头形如
+///   `01-金额(求和)`、`01-金额(均值)`、`(合计)-金额(求和)`…；只有一项指标时表头
+///   保持简洁（直接用列字段取值 + `(合计)`）；
+/// - 所有合计（行末、末行）都是**整体重新聚合**（不是把各行数值相加），
+///   因此均值、计数这类非可加指标在合计处依然正确；
 /// - 列顺序按**列字段取值升序**（稳定、可预测；日期字符串升序即时间顺序）；
 ///   空值的列名显示为 `(空)`；行顺序为行键首次出现顺序（与分组汇总一致）；
 /// - 没有数据的单元格留空（与"聚合结果为 0"区分开）。
 ///
-/// 护栏：行组合数 ≤ [`MAX_GROUPS`]、列字段取值 ≤ [`MAX_PIVOT_COLUMNS`]、
-/// 单元格总数 ≤ [`MAX_PIVOT_CELLS`]（超出均报错并提示改用分组汇总或先筛选）；
+/// 护栏：行组合数、列字段取值数、单元格数分别受 [`PivotLimits`] 约束
+///（默认值见 `PIVOT_DEFAULT_*`，界面可调大）；指标数 ≤ [`PIVOT_MAX_VALUES`]；
 /// 不支持「去重计数」（每个单元格一个集合，内存不可控，可用分组汇总替代）。
 pub fn pivot_table(
     model: &DataModel,
     rows: Option<&[u32]>,
     row_cols: &[usize],
     col_col: usize,
-    value_col: usize,
-    kind: AggKind,
+    values: &[PivotValue],
+    limits: PivotLimits,
     progress: Option<&(dyn Fn(f64) + Sync)>,
 ) -> Result<StatsTable, String> {
     let column_count = model.column_count();
@@ -1462,18 +1501,31 @@ pub fn pivot_table(
     if col_col >= column_count {
         return Err("列字段无效（列可能已删除或隐藏）".to_string());
     }
-    if value_col >= column_count {
-        return Err("值列无效（列可能已删除或隐藏）".to_string());
-    }
     if rcols.contains(&col_col) {
         return Err("列字段不能与行字段相同".to_string());
     }
-    if kind == AggKind::DistinctCount {
-        return Err(
-            "透视表不支持「去重计数」（每个单元格都要维护一个值集合，内存不可控）；\
-             如需此口径请用「字段分组汇总」按两个字段分组"
-                .to_string(),
-        );
+    // 指标：丢弃越界、去重（同一列同一聚合方式只算一次）、拒绝去重计数
+    let mut specs: Vec<PivotValue> = Vec::new();
+    for v in values {
+        if v.column >= column_count {
+            return Err("值列无效（列可能已删除或隐藏）".to_string());
+        }
+        if v.kind == AggKind::DistinctCount {
+            return Err(
+                "透视表不支持「去重计数」（每个格子都要维护一个值集合，内存不可控）；\
+                 如需此口径请用「字段分组汇总」按两个字段分组"
+                    .to_string(),
+            );
+        }
+        if !specs.contains(v) {
+            specs.push(*v);
+        }
+    }
+    if specs.is_empty() {
+        return Err("请至少添加一项指标（值列 + 聚合方式）".to_string());
+    }
+    if specs.len() > PIVOT_MAX_VALUES {
+        return Err(format!("指标最多 {} 项", PIVOT_MAX_VALUES));
     }
 
     let total = rows.map(|v| v.len()).unwrap_or_else(|| model.row_count());
@@ -1482,13 +1534,14 @@ pub fn pivot_table(
     let mut row_aggs: Vec<RowPivot> = Vec::new();
     let mut col_index: HashMap<String, usize> = HashMap::new();
     let mut col_values: Vec<String> = Vec::new();
+    let mut col_totals: HashMap<String, Vec<Acc>> = HashMap::new();
     let mut cells_total: usize = 0;
-    let mut grand = Acc::new(kind);
+    let mut grand: Vec<Acc> = specs.iter().map(|s| Acc::new(s.kind)).collect();
 
-    // 只读这三类列（RowReader 整行只解析一次）
+    // 只读这几类列（RowReader 整行只解析一次，多指标共享同一次解析）
     let mut need: Vec<usize> = rcols.clone();
     need.push(col_col);
-    need.push(value_col);
+    need.extend(specs.iter().map(|s| s.column));
     let mut reader = RowReader::new(need);
     let mut key = String::with_capacity(128);
     for i in 0..total {
@@ -1507,58 +1560,81 @@ pub fn pivot_table(
         let ridx = match row_index.get(key.as_str()) {
             Some(&i) => i,
             None => {
-                if row_aggs.len() >= MAX_GROUPS {
+                if row_aggs.len() >= limits.max_rows {
                     return Err(format!(
-                        "透视表的行组合数超过上限 {}：请减少行字段、或先用筛选缩小范围",
-                        MAX_GROUPS
+                        "透视表的行组合数超过上限 {}：请减少行字段、调大「行组合数上限」，\
+                         或先用筛选缩小范围",
+                        limits.max_rows
                     ));
                 }
                 let i = row_aggs.len();
                 row_index.insert(key.clone(), i);
                 row_keys.push(key.clone());
-                row_aggs.push(RowPivot::new(kind));
+                row_aggs.push(RowPivot::new(&specs));
                 i
             }
         };
         let cv = reader.value(col_col);
         if !col_index.contains_key(cv) {
-            if col_values.len() >= MAX_PIVOT_COLUMNS {
+            if col_values.len() >= limits.max_columns {
                 return Err(format!(
-                    "列字段的不同取值超过上限 {}：请改用取值较少的列字段，\
-                     或先筛选缩小范围（也可用「字段分组汇总」按两个字段分组）",
-                    MAX_PIVOT_COLUMNS
+                    "列字段的不同取值超过上限 {}：请改用取值较少的列字段、调大「列字段取值上限」，\
+                     或先用筛选缩小范围",
+                    limits.max_columns
                 ));
             }
             col_index.insert(cv.to_string(), col_values.len());
             col_values.push(cv.to_string());
         }
-        let value = reader.value(value_col);
-        // 单元格（借用分开：先更新 cells，再更新行合计，避免同时可变借用同一结构）
-        let cell_missing = {
+        // 该行×列组合的单元格：每项指标一个聚合器
+        let missing = {
             let ra = &mut row_aggs[ridx];
             ra.rows += 1;
             match ra.cells.get_mut(cv) {
-                Some(acc) => {
-                    acc.push(kind, value);
+                Some(accs) => {
+                    for (acc, spec) in accs.iter_mut().zip(specs.iter()) {
+                        acc.push(spec.kind, reader.value(spec.column));
+                    }
                     false
                 }
                 None => true,
             }
         };
-        if cell_missing {
-            if cells_total >= MAX_PIVOT_CELLS {
+        if missing {
+            if cells_total >= limits.max_cells {
                 return Err(format!(
-                    "透视表的单元格数超过上限 {}：请减少行字段、换一个列字段，或先筛选缩小范围",
-                    MAX_PIVOT_CELLS
+                    "透视表的单元格数超过上限 {}：请减少行字段、换一个列字段、\
+                     调大「单元格数上限」，或先筛选缩小范围",
+                    limits.max_cells
                 ));
             }
             cells_total += 1;
-            let mut acc = Acc::new(kind);
-            acc.push(kind, value);
-            row_aggs[ridx].cells.insert(cv.to_string(), acc);
+            let mut accs: Vec<Acc> = specs.iter().map(|s| Acc::new(s.kind)).collect();
+            for (acc, spec) in accs.iter_mut().zip(specs.iter()) {
+                acc.push(spec.kind, reader.value(spec.column));
+            }
+            row_aggs[ridx].cells.insert(cv.to_string(), accs);
         }
-        row_aggs[ridx].total.push(kind, value);
-        grand.push(kind, value);
+        for (acc, spec) in row_aggs[ridx].total.iter_mut().zip(specs.iter()) {
+            acc.push(spec.kind, reader.value(spec.column));
+        }
+        match col_totals.get_mut(cv) {
+            Some(accs) => {
+                for (acc, spec) in accs.iter_mut().zip(specs.iter()) {
+                    acc.push(spec.kind, reader.value(spec.column));
+                }
+            }
+            None => {
+                let mut accs: Vec<Acc> = specs.iter().map(|s| Acc::new(s.kind)).collect();
+                for (acc, spec) in accs.iter_mut().zip(specs.iter()) {
+                    acc.push(spec.kind, reader.value(spec.column));
+                }
+                col_totals.insert(cv.to_string(), accs);
+            }
+        }
+        for (acc, spec) in grand.iter_mut().zip(specs.iter()) {
+            acc.push(spec.kind, reader.value(spec.column));
+        }
         if let Some(p) = progress {
             if i % 50_000 == 0 {
                 p(i as f64 / total.max(1) as f64);
@@ -1572,17 +1648,38 @@ pub fn pivot_table(
     // 列顺序：取值升序（空值排在最前，作为「(空)」列）
     let mut col_sorted = col_values.clone();
     col_sorted.sort_unstable();
+    let single = specs.len() == 1;
+    let value_label = |spec: &PivotValue| -> String {
+        format!(
+            "{}({})",
+            column_name(model, spec.column),
+            spec.kind.label()
+        )
+    };
 
-    // 表头：行字段名… + 各列取值 + 合计
+    // 表头：行字段名… + （列取值 × 指标） + （合计 × 指标）
     let mut headers: Vec<String> = rcols.iter().map(|&c| column_name(model, c)).collect();
     for cv in &col_sorted {
-        headers.push(if cv.is_empty() {
+        let label = if cv.is_empty() {
             "(空)".to_string()
         } else {
             cv.clone()
-        });
+        };
+        if single {
+            headers.push(label);
+        } else {
+            for spec in &specs {
+                headers.push(format!("{}-{}", label, value_label(spec)));
+            }
+        }
     }
-    headers.push("(合计)".to_string());
+    if single {
+        headers.push("(合计)".to_string());
+    } else {
+        for spec in &specs {
+            headers.push(format!("(合计)-{}", value_label(spec)));
+        }
+    }
 
     let mut out_rows: Vec<Vec<String>> = Vec::with_capacity(row_aggs.len() + 1);
     for (key, ra) in row_keys.iter().zip(row_aggs.iter()) {
@@ -1594,12 +1691,22 @@ pub fn pivot_table(
             row.push(String::new());
         }
         for cv in &col_sorted {
-            row.push(match ra.cells.get(cv) {
-                Some(acc) => acc.finish(kind),
-                None => String::new(), // 没有数据的单元格留空
-            });
+            match ra.cells.get(cv) {
+                Some(accs) => {
+                    for (acc, spec) in accs.iter().zip(specs.iter()) {
+                        row.push(acc.finish(spec.kind));
+                    }
+                }
+                None => {
+                    for _ in &specs {
+                        row.push(String::new()); // 没有数据的格子留空
+                    }
+                }
+            }
         }
-        row.push(ra.total.finish(kind));
+        for (acc, spec) in ra.total.iter().zip(specs.iter()) {
+            row.push(acc.finish(spec.kind));
+        }
         out_rows.push(row);
     }
     // 末行合计：逐列的整体聚合（各自的累加器，不是把行相加）
@@ -1609,15 +1716,16 @@ pub fn pivot_table(
             row.push(String::new());
         }
         for cv in &col_sorted {
-            let mut acc = Acc::new(kind);
-            for ra in row_aggs.iter() {
-                if let Some(cell) = ra.cells.get(cv) {
-                    acc.merge(cell);
-                }
+            for (i, spec) in specs.iter().enumerate() {
+                row.push(match col_totals.get(cv).and_then(|a| a.get(i)) {
+                    Some(acc) => acc.finish(spec.kind),
+                    None => String::new(),
+                });
             }
-            row.push(acc.finish(kind));
         }
-        row.push(grand.finish(kind));
+        for (acc, spec) in grand.iter().zip(specs.iter()) {
+            row.push(acc.finish(spec.kind));
+        }
         out_rows.push(row);
     }
 
@@ -1626,49 +1734,58 @@ pub fn pivot_table(
         .map(|&c| column_name(model, c))
         .collect::<Vec<_>>()
         .join("、");
+    let value_names = specs
+        .iter()
+        .map(|s| value_label(s))
+        .collect::<Vec<_>>()
+        .join("、");
     let mut table = StatsTable {
         kind: StatsKind::Pivot,
         headers,
         rows: out_rows,
         input_rows: total,
         group_columns: col_sorted.len(),
-        aggs: 0,
+        aggs: specs.len(),
         notes: Vec::new(),
     };
     table.notes.push(format!(
-        "行字段：{}；列字段：{}；值：{}({})",
+        "行字段：{}；列字段：{}；值指标：{}",
         row_name,
         column_name(model, col_col),
-        column_name(model, value_col),
-        kind.label()
+        value_names
     ));
     table.notes.push(format!(
         "列字段共 {} 个取值（按取值升序排列，空值为「(空)」列）；没有数据的单元格留空",
         col_sorted.len()
     ));
-    table.notes.push(
-        "每行末尾的「(合计)」是该行的整体聚合，末行是各列的整体聚合 —— 均值/计数等\
-         非可加指标因此在合计处依然正确（不是把各行数值相加）"
-            .to_string(),
-    );
+    if !single {
+        table.notes.push(
+            "表头为「列取值-值列(聚合)」；每行末尾与末行是各指标的整体聚合".to_string(),
+        );
+    }
+    table.notes.push(format!(
+        "所有「(合计)」都是该范围的整体聚合（不是把各行数值相加）—— 均值/计数等非可加指标\
+         因此在合计处依然正确；本次上限：行组合 ≤ {}、列字段取值 ≤ {}、单元格 ≤ {}（可在参数窗调整）",
+        limits.max_rows, limits.max_columns, limits.max_cells
+    ));
     Ok(table)
 }
 
-/// 透视表的一行：单元格 + 行合计
+/// 透视表的一行：各列的单元格 + 行合计（每个元素对应一项指标）
 struct RowPivot {
-    /// 列值 → 单元格聚合器（借用查询时避免重复分配）
-    cells: HashMap<String, Acc>,
-    /// 该行的整体聚合（行末「(合计)」列）
-    total: Acc,
+    /// 列值 → 各指标的单元格聚合器（借用查询时避免重复分配）
+    cells: HashMap<String, Vec<Acc>>,
+    /// 该行的各指标整体聚合（行末「(合计)」列）
+    total: Vec<Acc>,
     /// 该行参与统计的行数
     rows: u64,
 }
 
 impl RowPivot {
-    fn new(kind: AggKind) -> Self {
+    fn new(specs: &[PivotValue]) -> Self {
         Self {
             cells: HashMap::new(),
-            total: Acc::new(kind),
+            total: specs.iter().map(|s| Acc::new(s.kind)).collect(),
             rows: 0,
         }
     }
@@ -3074,6 +3191,168 @@ mod tests {
 
     // ===== 透视表（pivot_table）=====
 
+    /// 测试辅助：构造一项指标
+    fn pv(column: usize, kind: AggKind) -> PivotValue {
+        PivotValue { column, kind }
+    }
+
+    #[test]
+    fn pivot_table_multiple_values_and_kinds() {
+        // 一次透视放多项指标：金额求和 + 金额均值 + 笔数计数（用户诉求：多值列多聚合）
+        let p = write_temp(
+            "城市,月份,金额\n北京,1,10\n北京,1,30\n北京,2,20\n上海,1,5\n".as_bytes(),
+            "_pv6.csv",
+        );
+        let m = DataModel::open(&p, 100).unwrap();
+        let t = pivot_table(
+            &m,
+            None,
+            &[0],
+            1,
+            &[
+                pv(2, AggKind::Sum),
+                pv(2, AggKind::Avg),
+                pv(2, AggKind::Count),
+            ],
+            PivotLimits::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(t.aggs, 3, "指标数");
+        assert_eq!(
+            t.headers,
+            vec![
+                "城市",
+                "1-金额(求和)",
+                "1-金额(均值)",
+                "1-金额(计数)",
+                "2-金额(求和)",
+                "2-金额(均值)",
+                "2-金额(计数)",
+                "(合计)-金额(求和)",
+                "(合计)-金额(均值)",
+                "(合计)-金额(计数)",
+            ]
+        );
+        // 北京×1：求和 40、均值 20、计数 2；北京×2：20 / 20 / 1；上海×1：5 / 5 / 1
+        assert_eq!(
+            t.rows[0],
+            vec!["北京", "40", "20", "2", "20", "20", "1", "60", "20", "3"]
+        );
+        assert_eq!(
+            t.rows[1],
+            vec!["上海", "5", "5", "1", "", "", "", "5", "5", "1"]
+        );
+        // 末行合计：整体聚合（均值 65/4 = 16.25，不是各均值的平均）
+        assert_eq!(
+            t.rows[2],
+            vec!["(合计)", "45", "15", "3", "20", "20", "1", "65", "16.25", "4"]
+        );
+        // 重复添加同一项指标会被去重
+        let t2 = pivot_table(
+            &m,
+            None,
+            &[0],
+            1,
+            &[pv(2, AggKind::Sum), pv(2, AggKind::Sum)],
+            PivotLimits::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(t2.aggs, 1);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn pivot_table_respects_custom_limits() {
+        // 规模上限可由调用方调大/调小（界面里由用户按硬件设置）
+        let mut data = String::from("组,列,值\n");
+        for i in 0..20 {
+            data.push_str(&format!("g{},c{},1\n", i % 4, i));
+        }
+        let p = write_temp(data.as_bytes(), "_pv7.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+
+        // 默认上限下正常
+        let ok = pivot_table(
+            &m,
+            None,
+            &[0],
+            1,
+            &[pv(2, AggKind::Sum)],
+            PivotLimits::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(ok.group_columns, 20);
+
+        // 调小「行组合数上限」→ 报错并提示
+        let err = pivot_table(
+            &m,
+            None,
+            &[0],
+            1,
+            &[pv(2, AggKind::Sum)],
+            PivotLimits {
+                max_rows: 2,
+                ..PivotLimits::default()
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("行组合数超过上限 2"), "{err}");
+
+        // 调小「列字段取值上限」→ 报错并提示
+        let err = pivot_table(
+            &m,
+            None,
+            &[0],
+            1,
+            &[pv(2, AggKind::Sum)],
+            PivotLimits {
+                max_columns: 3,
+                ..PivotLimits::default()
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("列字段的不同取值超过上限 3"), "{err}");
+
+        // 调小「单元格数上限」→ 报错并提示
+        let err = pivot_table(
+            &m,
+            None,
+            &[0],
+            1,
+            &[pv(2, AggKind::Sum)],
+            PivotLimits {
+                max_cells: 10,
+                ..PivotLimits::default()
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("单元格数超过上限 10"), "{err}");
+
+        // 调大上限 → 原本会被拦下的场景现在可处理（这里用"列取值上限 20 → 25"验证方向）
+        let bigger = pivot_table(
+            &m,
+            None,
+            &[0],
+            1,
+            &[pv(2, AggKind::Sum)],
+            PivotLimits {
+                max_columns: 25,
+                max_cells: 100,
+                ..PivotLimits::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(bigger.group_columns, 20);
+        std::fs::remove_file(&p).ok();
+    }
+
     #[test]
     fn pivot_table_sums_by_row_and_column() {
         // 行=城市、列=月份、值=金额求和
@@ -3082,7 +3361,7 @@ mod tests {
             "_pv1.csv",
         );
         let m = DataModel::open(&p, 100).unwrap();
-        let t = pivot_table(&m, None, &[0], 1, 2, AggKind::Sum, None).unwrap();
+        let t = pivot_table(&m, None, &[0], 1, &[pv(2, AggKind::Sum)], PivotLimits::default(), None).unwrap();
         assert_eq!(t.kind, StatsKind::Pivot);
         assert_eq!(t.headers, vec!["城市", "1", "2", "3", "(合计)"]);
         // 行序 = 行键首次出现顺序：北京、上海
@@ -3103,7 +3382,7 @@ mod tests {
             "_pv2.csv",
         );
         let m = DataModel::open(&p, 100).unwrap();
-        let t = pivot_table(&m, None, &[0], 1, 2, AggKind::Avg, None).unwrap();
+        let t = pivot_table(&m, None, &[0], 1, &[pv(2, AggKind::Avg)], PivotLimits::default(), None).unwrap();
         // A 的均值 = 20、B 的均值 = 0；x 列整体均值 = (10+30+0)/3 = 13.333333
         assert_eq!(t.rows[0], vec!["A", "20", "20"]);
         assert_eq!(t.rows[1], vec!["B", "0", "0"]);
@@ -3119,7 +3398,7 @@ mod tests {
             "_pv3.csv",
         );
         let m = DataModel::open(&p, 100).unwrap();
-        let t = pivot_table(&m, None, &[0, 1], 2, 3, AggKind::Sum, None).unwrap();
+        let t = pivot_table(&m, None, &[0, 1], 2, &[pv(3, AggKind::Sum)], PivotLimits::default(), None).unwrap();
         assert_eq!(t.headers, vec!["省", "市", "(空)", "线上", "(合计)"]);
         assert_eq!(t.rows[0], vec!["江苏", "南京", "20", "10", "30"]);
         assert_eq!(t.rows[1], vec!["江苏", "苏州", "", "5", "5"]);
@@ -3135,13 +3414,13 @@ mod tests {
             "_pv4.csv",
         );
         let m = DataModel::open(&p, 100).unwrap();
-        let t = pivot_table(&m, None, &[0], 1, 2, AggKind::Count, None).unwrap();
+        let t = pivot_table(&m, None, &[0], 1, &[pv(2, AggKind::Count)], PivotLimits::default(), None).unwrap();
         // A×x 的非空计数 = 1（另一行为空）、A×y = 1、B×y = 1
         assert_eq!(t.rows[0], vec!["A", "1", "1", "2"]);
         assert_eq!(t.rows[1], vec!["B", "", "1", "1"]);
         assert_eq!(t.rows[2], vec!["(合计)", "1", "2", "3"]);
         // 行子集：只看第 0、1 行（都属 A×x）
-        let t2 = pivot_table(&m, Some(&[0, 1]), &[0], 1, 2, AggKind::Count, None).unwrap();
+        let t2 = pivot_table(&m, Some(&[0, 1]), &[0], 1, &[pv(2, AggKind::Count)], PivotLimits::default(), None).unwrap();
         assert_eq!(t2.input_rows, 2);
         assert_eq!(t2.rows[0], vec!["A", "1", "1"]);
         std::fs::remove_file(&p).ok();
@@ -3151,18 +3430,18 @@ mod tests {
     fn pivot_table_rejects_invalid_inputs() {
         let p = write_temp("A,B,C\nx,y,1\n".as_bytes(), "_pv5.csv");
         let m = DataModel::open(&p, 100).unwrap();
-        assert!(pivot_table(&m, None, &[], 1, 2, AggKind::Sum, None).is_err(), "无行字段");
-        assert!(pivot_table(&m, None, &[9], 1, 2, AggKind::Sum, None).is_err(), "行字段越界");
-        assert!(pivot_table(&m, None, &[0], 9, 2, AggKind::Sum, None).is_err(), "列字段越界");
-        assert!(pivot_table(&m, None, &[0], 1, 9, AggKind::Sum, None).is_err(), "值列越界");
+        assert!(pivot_table(&m, None, &[], 1, &[pv(2, AggKind::Sum)], PivotLimits::default(), None).is_err(), "无行字段");
+        assert!(pivot_table(&m, None, &[9], 1, &[pv(2, AggKind::Sum)], PivotLimits::default(), None).is_err(), "行字段越界");
+        assert!(pivot_table(&m, None, &[0], 9, &[pv(2, AggKind::Sum)], PivotLimits::default(), None).is_err(), "列字段越界");
+        assert!(pivot_table(&m, None, &[0], 1, &[pv(9, AggKind::Sum)], PivotLimits::default(), None).is_err(), "值列越界");
         assert!(
-            pivot_table(&m, None, &[0], 0, 2, AggKind::Sum, None).is_err(),
+            pivot_table(&m, None, &[0], 0, &[pv(2, AggKind::Sum)], PivotLimits::default(), None).is_err(),
             "列字段与行字段相同"
         );
-        let err = pivot_table(&m, None, &[0], 1, 2, AggKind::DistinctCount, None).unwrap_err();
+        let err = pivot_table(&m, None, &[0], 1, &[pv(2, AggKind::DistinctCount)], PivotLimits::default(), None).unwrap_err();
         assert!(err.contains("去重计数"), "{err}");
         // 空范围：只有表头（无行、无合计行）
-        let t = pivot_table(&m, Some(&[]), &[0], 1, 2, AggKind::Sum, None).unwrap();
+        let t = pivot_table(&m, Some(&[]), &[0], 1, &[pv(2, AggKind::Sum)], PivotLimits::default(), None).unwrap();
         assert!(t.rows.is_empty());
         assert_eq!(t.kind.file_stem(), "透视表");
         assert_eq!(t.kind.title(), "透视表结果");

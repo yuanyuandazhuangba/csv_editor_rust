@@ -76,10 +76,15 @@ pub struct DialogStates {
     pub pivot_row_cols: Vec<usize>,
     /// 列字段（视图列索引）
     pub pivot_col: usize,
-    /// 值列（视图列索引）
-    pub pivot_value_col: usize,
-    /// 聚合方式（`stats::PIVOT_KINDS` 的下标）
-    pub pivot_kind: usize,
+    /// 指标列表：视图列索引 + 聚合方式（`stats::PIVOT_KINDS` 的下标），可添加多项
+    pub pivot_values: Vec<(usize, usize)>,
+    /// 「添加指标」时选中的值列（视图列索引）与聚合方式下标
+    pub pivot_new_col: usize,
+    pub pivot_new_kind: usize,
+    /// 规模上限（0 = 尚未初始化，界面按 `stats::PIVOT_DEFAULT_*` 处理）
+    pub pivot_max_rows: usize,
+    pub pivot_max_cols: usize,
+    pub pivot_max_cells: usize,
     // 数据分析：交叉/关联统计
     pub cross_window: bool,
     /// A 字段（视图列索引）

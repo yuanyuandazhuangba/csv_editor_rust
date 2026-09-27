@@ -1259,7 +1259,7 @@ impl CsvEditorApp {
                         ui.label("• 频次分布 / Top-N：勾选列并设置「每列显示前 N 项」，点「开始统计」；列出各取值的出现次数与占比（按次数从多到少），空值作为「(空)」一类参与排名，超出前 N 项的汇总为一行「(其余 M 个取值)」，末行「(合计)」用于核对总量（占比 100%）。常用法：找出卡号/账号出现次数最多的前 20 条。");
                         ui.label("• 重复情况统计：选判重字段（不勾 = 按整行判重），点「开始统计」；给出不同键/重复键个数与重复行占比，明细按重复次数降序列出前 N 个重复键。结果窗里可一键「只看重复的行」或「只看唯一行」，把结果直接落到当前数据视图（用工具栏「清除筛选」可恢复全部）。");
                         ui.label("• 空值与数据质量统计：勾选列（想知道整份数据质量就点「全选」），点「开始检查」；逐列给出空值数、纯空白数、空值率、含控制字符数、最短/最长/平均长度、超长值数（>255 字符）。");
-                        ui.label("• 透视表：选 1~2 个行字段 + 1 个列字段 + 1 个值列与聚合方式（求和/均值/最大/最小/计数），点「生成透视表」；得到交叉表，行末与末行给出「(合计)」（整体聚合，均值/计数在合计处也正确）。列字段的不同取值最多 200 个。");
+                        ui.label("• 透视表：选 1~2 个行字段 + 1 个列字段，再添加若干项「指标」（值列 + 聚合方式，可多项，如金额求和+均值+笔数计数），点「生成透视表」；得到交叉表，行末与末行给出「(合计)」（整体聚合，均值/计数在合计处也正确）。窗口底部「规模上限」三项（行组合数 / 列字段取值 / 单元格数）可按电脑内存调整并会记住，界面会给出粗估内存。");
                         ui.label("• 交叉/关联统计：选 A、B 两个字段，点「开始统计」；给出关系判定（一对一 / 一对多 / 多对一 / 多对多）、两侧最大对应数，以及每个 A 值对应的 B 值个数与示例（如「同一卡号对应多少个账号」）。");
                         ui.label("    金额等按数值精确计算（定点十进制累加，两位小数的合计不会出现 3613134567.580001 这类多余尾数）；某列若混有文字会被跳过，并在结果窗提示「N 个非数值未参与计算」；");
                         ui.label("    中位数需要保留该列的原始数值：数据量特别大时（超过用内存上限）该列中位数显示「—」，并提示先用筛选缩小范围；");
@@ -1756,7 +1756,8 @@ impl CsvEditorApp {
         *open = keep;
     }
 
-    /// 「透视表」参数对话框：行字段（1~2）+ 列字段 + 值列 + 聚合方式。
+    /// 「透视表」参数对话框：行字段（1~2）+ 列字段 + 多项指标（值列 × 聚合方式）
+    /// + 规模上限（行组合/列字段取值/单元格，可按硬件情况调大）。
     fn dialog_pivot_table(&mut self, ctx: &egui::Context, open: &mut bool) {
         let mut keep = *open;
         let mut done = false;
@@ -1765,7 +1766,7 @@ impl CsvEditorApp {
                 .open(&mut keep)
                 .collapsible(false)
                 .resizable(true)
-                .default_size([620.0, 560.0]),
+                .default_size([680.0, 660.0]),
             self.dialog_position,
             ctx,
         )
@@ -1793,10 +1794,10 @@ impl CsvEditorApp {
             };
             ui.label(format!("统计范围：{scope}"));
             ui.weak(
-                "行字段 × 列字段 × 值聚合的交叉表：行是行字段的取值组合，列是列字段的各个取值，\
-                 单元格是值列在该组合下的聚合结果；每行末尾与末行给出「(合计)」（整体聚合，\
-                 均值/计数在合计处也正确）。列字段的不同取值最多 200 个（太多请改用分组汇总）。\
-                 派生列不参与统计。",
+                "行字段 × 列字段 × 指标（值列 + 聚合方式）的交叉表：行是行字段的取值组合，\
+                 列是列字段的各个取值，格子是指标在该组合下的聚合结果；可一次放多项指标\
+                 （如「金额求和 + 金额均值 + 笔数计数」）。每行末尾与末行是「(合计)」\
+                 （整体聚合，均值/计数在合计处也正确）。派生列不参与统计。",
             );
             ui.separator();
 
@@ -1818,7 +1819,7 @@ impl CsvEditorApp {
                     };
                     egui::ComboBox::from_id_source(("pivot_row", slot_i))
                         .selected_text(text)
-                        .width(220.0)
+                        .width(230.0)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(slot, None, "（不使用）");
                             for &i in &raw {
@@ -1844,7 +1845,7 @@ impl CsvEditorApp {
                 }
                 egui::ComboBox::from_id_source("pivot_col")
                     .selected_text(header[col].clone())
-                    .width(220.0)
+                    .width(230.0)
                     .show_ui(ui, |ui| {
                         for &i in &raw {
                             ui.selectable_value(&mut col, i, &header[i]);
@@ -1853,31 +1854,66 @@ impl CsvEditorApp {
                 self.dialogs.pivot_col = col;
             });
 
-            // —— 值列 ——
+            ui.separator();
+            // —— 指标列表（值列 × 聚合方式，可多项）——
+            ui.label(format!(
+                "指标（值列 × 聚合方式，最多 {} 项）:",
+                stats::PIVOT_MAX_VALUES
+            ));
+            self.dialogs
+                .pivot_values
+                .retain(|&(c, _)| c < header.len() && base_ok[c]);
+            let mut values = std::mem::take(&mut self.dialogs.pivot_values);
+            let mut remove: Option<usize> = None;
+            egui::ScrollArea::vertical()
+                .max_height(120.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    if values.is_empty() {
+                        ui.weak("（暂无指标：请在下方选择值列与聚合方式，再点「+ 添加」）");
+                    }
+                    for i in 0..values.len() {
+                        ui.horizontal(|ui| {
+                            ui.label(header[values[i].0].clone());
+                            let mut k = values[i].1.min(stats::PIVOT_KINDS.len() - 1);
+                            egui::ComboBox::from_id_source(("pivot_value_kind", i))
+                                .selected_text(stats::PIVOT_KINDS[k].label())
+                                .width(96.0)
+                                .show_ui(ui, |ui| {
+                                    for (j, kind) in stats::PIVOT_KINDS.iter().enumerate() {
+                                        ui.selectable_value(&mut k, j, kind.label());
+                                    }
+                                });
+                            values[i].1 = k;
+                            if ui.button("×").on_hover_text("删除此指标").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    }
+                });
+            if let Some(i) = remove {
+                values.remove(i);
+            }
+            // 新增指标
             ui.horizontal(|ui| {
-                ui.label("值列　");
-                let mut col = self
-                    .dialogs
-                    .pivot_value_col
-                    .min(header.len().saturating_sub(1));
-                if !base_ok.get(col).copied().unwrap_or(false) {
+                let mut col = self.dialogs.pivot_new_col;
+                if col >= header.len() || !base_ok[col] {
                     col = raw[0];
                 }
-                egui::ComboBox::from_id_source("pivot_value_col")
-                    .selected_text(header[col].clone())
-                    .width(220.0)
+                egui::ComboBox::from_id_source("pivot_new_col")
+                    .selected_text(header.get(col).cloned().unwrap_or_default())
+                    .width(200.0)
                     .show_ui(ui, |ui| {
                         for &i in &raw {
                             ui.selectable_value(&mut col, i, &header[i]);
                         }
                     });
-                self.dialogs.pivot_value_col = col;
-                // —— 聚合方式（透视表只支持这 5 种）——
+                self.dialogs.pivot_new_col = col;
                 let mut k = self
                     .dialogs
-                    .pivot_kind
-                    .min(stats::PIVOT_KINDS.len().saturating_sub(1));
-                egui::ComboBox::from_id_source("pivot_kind")
+                    .pivot_new_kind
+                    .min(stats::PIVOT_KINDS.len() - 1);
+                egui::ComboBox::from_id_source("pivot_new_kind")
                     .selected_text(stats::PIVOT_KINDS[k].label())
                     .width(96.0)
                     .show_ui(ui, |ui| {
@@ -1885,15 +1921,102 @@ impl CsvEditorApp {
                             ui.selectable_value(&mut k, i, kind.label());
                         }
                     });
-                self.dialogs.pivot_kind = k;
+                self.dialogs.pivot_new_kind = k;
+                if ui
+                    .add_enabled(
+                        values.len() < stats::PIVOT_MAX_VALUES,
+                        egui::Button::new("+ 添加"),
+                    )
+                    .clicked()
+                {
+                    values.push((col, k));
+                }
+                ui.weak(format!("已添加 {} 项", values.len()));
             });
-            ui.weak("聚合方式：求和 / 均值 / 最大 / 最小 / 计数（非空）");
+            self.dialogs.pivot_values = values;
+
+            ui.separator();
+            // —— 规模上限（可按硬件情况调整）——
+            ui.label("规模上限（按电脑内存调整；数值越大能处理的情况越多、占用内存越大）:");
+            if self.dialogs.pivot_max_rows == 0 {
+                let saved = ctx.memory(|m| {
+                    m.data
+                        .get_temp::<(usize, usize, usize)>(egui::Id::new("pivot_limits"))
+                });
+                let (r, c, cell) = saved.unwrap_or((
+                    stats::PIVOT_DEFAULT_MAX_ROWS,
+                    stats::PIVOT_DEFAULT_MAX_COLUMNS,
+                    stats::PIVOT_DEFAULT_MAX_CELLS,
+                ));
+                self.dialogs.pivot_max_rows = r;
+                self.dialogs.pivot_max_cols = c;
+                self.dialogs.pivot_max_cells = cell;
+            }
+            let mut limits_changed = false;
+            ui.horizontal(|ui| {
+                ui.label("行组合数上限");
+                limits_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.dialogs.pivot_max_rows)
+                            .clamp_range(100usize..=2_000_000usize)
+                            .speed(500.0),
+                    )
+                    .on_hover_text("行字段取值组合的最大个数（默认 20000）；调大后可处理更细的行维度")
+                    .changed();
+                ui.label("　列字段取值上限");
+                limits_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.dialogs.pivot_max_cols)
+                            .clamp_range(10usize..=16_384usize)
+                            .speed(50.0),
+                    )
+                    .on_hover_text("列字段不同取值的最大个数（默认 200，Excel 单表列上限 16384）")
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("单元格数上限");
+                limits_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.dialogs.pivot_max_cells)
+                            .clamp_range(10_000usize..=20_000_000usize)
+                            .speed(100_000.0),
+                    )
+                    .on_hover_text("行组合 × 列取值的有数据格子数上限（默认 500000）")
+                    .changed();
+                if ui
+                    .small_button("恢复默认")
+                    .on_hover_text("恢复为软件默认上限（20000 / 200 / 500000）")
+                    .clicked()
+                {
+                    self.dialogs.pivot_max_rows = stats::PIVOT_DEFAULT_MAX_ROWS;
+                    self.dialogs.pivot_max_cols = stats::PIVOT_DEFAULT_MAX_COLUMNS;
+                    self.dialogs.pivot_max_cells = stats::PIVOT_DEFAULT_MAX_CELLS;
+                    limits_changed = true;
+                }
+            });
+            // 粗略内存预估：每个格子每项指标一个聚合器，约 100 字节
+            let values_len = self.dialogs.pivot_values.len().max(1);
+            let est_mb =
+                self.dialogs.pivot_max_cells as f64 * values_len as f64 * 100.0 / 1024.0 / 1024.0;
+            ui.weak(format!(
+                "粗估最大内存占用 ≈ {:.0} MB（{} 个指标 × {} 个格子 × 约 100 字节；实际通常远小于此）",
+                est_mb, values_len, self.dialogs.pivot_max_cells
+            ));
+            if limits_changed {
+                let v = (
+                    self.dialogs.pivot_max_rows,
+                    self.dialogs.pivot_max_cols,
+                    self.dialogs.pivot_max_cells,
+                );
+                ctx.memory_mut(|m| m.data.insert_temp(egui::Id::new("pivot_limits"), v));
+            }
 
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let clash = self.dialogs.pivot_row_cols.contains(&self.dialogs.pivot_col);
+                let ready = !clash && !self.dialogs.pivot_values.is_empty();
                 if ui
-                    .add_enabled(!clash, egui::Button::new("生成透视表"))
+                    .add_enabled(ready, egui::Button::new("生成透视表"))
                     .clicked()
                 {
                     self.run_pivot_table();
@@ -1907,15 +2030,17 @@ impl CsvEditorApp {
                         egui::Color32::from_rgb(200, 120, 0),
                         "⚠ 列字段不能与行字段相同",
                     );
+                } else if self.dialogs.pivot_values.is_empty() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 120, 0),
+                        "⚠ 请至少添加一项指标",
+                    );
                 } else {
                     ui.weak(format!(
-                        "行 {} 个字段 / 列 {} / 值 {}",
+                        "行 {} 个字段 / 列 {} / 指标 {} 项",
                         self.dialogs.pivot_row_cols.len(),
                         header.get(self.dialogs.pivot_col).cloned().unwrap_or_default(),
-                        header
-                            .get(self.dialogs.pivot_value_col)
-                            .cloned()
-                            .unwrap_or_default()
+                        self.dialogs.pivot_values.len()
                     ));
                 }
             });

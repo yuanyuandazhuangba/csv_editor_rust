@@ -478,8 +478,11 @@ fn main() {
             filtered.as_deref(),
             &[c_row],
             c_col,
-            c_val,
-            AggKind::Sum,
+            &[stats::PivotValue {
+                column: c_val,
+                kind: AggKind::Sum,
+            }],
+            stats::PivotLimits::default(),
             None,
         ) {
             Ok(tb) => {

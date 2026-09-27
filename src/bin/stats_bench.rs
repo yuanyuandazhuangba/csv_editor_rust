@@ -277,8 +277,17 @@ fn main() {
             None,
             rcols,
             ccol,
-            vcol,
-            AggKind::Sum,
+            &[
+                csv_editor_rust::core::stats::PivotValue {
+                    column: vcol,
+                    kind: AggKind::Sum,
+                },
+                csv_editor_rust::core::stats::PivotValue {
+                    column: vcol,
+                    kind: AggKind::Avg,
+                },
+            ],
+            csv_editor_rust::core::stats::PivotLimits::default(),
             None,
         ) {
             Ok(t) => format!(
@@ -302,6 +311,41 @@ fn main() {
         repeat,
         || pivot(&[1], 2, 3),
     ));
+    results.push(bench("透视表：5 项指标（金额求和/均值 + 序号等）", repeat, || {
+        match csv_editor_rust::core::stats::pivot_table(
+            &m,
+            None,
+            &[1],
+            6,
+            &[
+                csv_editor_rust::core::stats::PivotValue {
+                    column: 3,
+                    kind: AggKind::Sum,
+                },
+                csv_editor_rust::core::stats::PivotValue {
+                    column: 3,
+                    kind: AggKind::Avg,
+                },
+                csv_editor_rust::core::stats::PivotValue {
+                    column: 3,
+                    kind: AggKind::Max,
+                },
+                csv_editor_rust::core::stats::PivotValue {
+                    column: 3,
+                    kind: AggKind::Min,
+                },
+                csv_editor_rust::core::stats::PivotValue {
+                    column: 3,
+                    kind: AggKind::Count,
+                },
+            ],
+            csv_editor_rust::core::stats::PivotLimits::default(),
+            None,
+        ) {
+            Ok(t) => format!("{} 列输出", t.headers.len()),
+            Err(e) => format!("失败：{}", e.chars().take(20).collect::<String>()),
+        }
+    }));
 
     // 交叉/关联统计（单线程：需要双向映射）
     let cross = |a: usize, b: usize| -> String {
