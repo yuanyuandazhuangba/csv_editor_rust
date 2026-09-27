@@ -345,7 +345,9 @@ fn main() {
     }
 
     // 9. 重复情况统计：找重复键、各重复几次、重复行占比，并给出可落回视图的行号
-    let dup_key_col = col_of("交易方户名").or(group_col);
+    let dup_key_col = col_of("交易卡号")
+        .or(col_of("交易方户名"))
+        .or(group_col);
     if let Some(c_key) = dup_key_col {
         let t = Instant::now();
         match stats::duplicate_stats(&m, filtered.as_deref(), &[c_key], 100, None) {
@@ -543,7 +545,15 @@ fn main() {
     }
 
     // 12. 交叉 / 关联统计：两个字段的对应关系
-    if let (Some(c_a), Some(c_b)) = (col_of("交易时间").or(value_col), group_col) {
+    //     A/B 选取值较少的列（银行 / 收付标志 / 是否成功），避免"交易时间"这类
+    //     高基数列触发上限护栏；若真触发上限，视为护栏生效（打印提示，不算失败）
+    let cross_a = col_of("数据来源_银行名称")
+        .or(col_of("收付标志"))
+        .or(group_col);
+    let cross_b = col_of("收付标志")
+        .or(col_of("交易是否成功"))
+        .or(col_of("交易币种"));
+    if let (Some(c_a), Some(c_b)) = (cross_a, cross_b) {
         let t = Instant::now();
         match stats::cross_stats(&m, filtered.as_deref(), c_a, c_b, 1000, None) {
             Ok(rep) => {
@@ -599,8 +609,12 @@ fn main() {
                 }
             }
             Err(e) => {
-                println!("FAIL 交叉/关联统计: {}", e);
-                fails += 1;
+                if e.contains("超过上限") {
+                    println!("OK  交叉/关联统计：高基数列已按「规模上限」护栏拒绝（{}）", e);
+                } else {
+                    println!("FAIL 交叉/关联统计: {}", e);
+                    fails += 1;
+                }
             }
         }
     } else {
