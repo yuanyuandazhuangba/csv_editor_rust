@@ -1093,22 +1093,68 @@ impl CsvEditorApp {
 
                 ui.label("新列数量:");
                 ui.add(egui::DragValue::new(&mut self.dialogs.split_num).clamp_range(1..=10));
+                let num = self.dialogs.split_num.clamp(1, 10);
 
-                ui.label("新列名称前缀:");
-                ui.add(egui::TextEdit::singleline(&mut self.dialogs.split_prefix));
+                ui.label("新列名称前缀（自动命名、以及自定义留空时使用）:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.dialogs.split_prefix)
+                        .hint_text("例：ts_ → ts_1、ts_2；留空则用 1、2、3…"),
+                );
+
+                ui.label("新列命名方式:");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut self.dialogs.split_name_mode,
+                        0,
+                        "自动命名（前缀 + 序号）",
+                    );
+                    ui.selectable_value(&mut self.dialogs.split_name_mode, 1, "逐个自定义命名");
+                });
+                if self.dialogs.split_name_mode == 1 {
+                    // 输入框数量跟随「新列数量」
+                    if self.dialogs.split_names.len() < num {
+                        self.dialogs.split_names.resize(num, String::new());
+                    }
+                    let prefix = self.dialogs.split_prefix.clone();
+                    ui.weak("为每个新列取名（留空则用「前缀 + 序号」）:");
+                    egui::ScrollArea::vertical()
+                        .max_height(170.0)
+                        .id_source("dlg_split_names")
+                        .show(ui, |ui| {
+                            for i in 0..num {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("第 {} 列:", i + 1));
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.dialogs.split_names[i])
+                                            .hint_text(format!("{}{}", prefix, i + 1))
+                                            .desired_width(170.0),
+                                    );
+                                });
+                            }
+                        });
+                }
 
                 ui.add_space(4.0);
                 if ui.button("确定").clicked() {
                     let sep = self.dialogs.split_sep.clone();
-                    let num = self.dialogs.split_num.max(1);
+                    let num = self.dialogs.split_num.clamp(1, 10);
                     let prefix = self.dialogs.split_prefix.clone();
+                    // 仅「逐个自定义命名」模式下携带自定义名称；自动模式留空走默认命名
+                    let names: Vec<String> = if self.dialogs.split_name_mode == 1 {
+                        self.dialogs.split_names.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    let src_name = header[col].clone();
                     match self.ops.as_ref().and_then(|o| o.view_to_base(col)) {
                         Some(base) => {
                             if let Some(ops) = self.ops_mut() {
-                                match ops.split_field(base, &sep, num, &prefix) {
-                                    Ok(()) => self.log(&format!(
-                                        "字段拆分完成: {} -> {} 列",
-                                        header[col], num
+                                match ops.split_field_named(base, &sep, num, &names, &prefix) {
+                                    Ok(new_names) => self.log(&format!(
+                                        "字段拆分完成: {} -> {} 列（{}）",
+                                        src_name,
+                                        num,
+                                        new_names.join("、")
                                     )),
                                     Err(e) => self.log(&format!("拆分字段失败: {}", e)),
                                 }
@@ -2130,6 +2176,7 @@ impl CsvEditorApp {
                     });
                     ui.collapsing("六、列操作（支持撤销/恢复）", |ui| {
                         ui.label("菜单「数据处理 → 列操作」下：拆分字段、合并字段、生成行哈希（md5/sha1/sha256/sha512）、复制列、插入列、删除列、隐藏列、显示列；");
+                        ui.label("拆分字段的新列命名可选「自动命名（前缀 + 序号，如 ts_1、ts_2）」或「逐个自定义命名」（每个新列单独取名；留空回退为前缀 + 序号；与已有列重名时自动追加 _1、_2…，不会覆盖原列）；");
                         ui.label("所有这些操作只记录“操作描述”，不会复制整表数据，对超大文件也是瞬时完成；");
                         ui.label("菜单「编辑 → 撤销 / 恢复」（不可用时为灰色）可逐步回退或重做。");
                     });

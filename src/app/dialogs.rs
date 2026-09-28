@@ -302,6 +302,10 @@ pub struct DialogStates {
     pub split_sep: String,
     pub split_num: usize,
     pub split_prefix: String,
+    /// 拆分字段的命名方式：0 = 自动（前缀 + 序号），1 = 逐个自定义命名
+    pub split_name_mode: usize,
+    /// 逐个自定义命名时每列的名称（不足/留空时回退为「前缀 + 序号」）
+    pub split_names: Vec<String>,
     pub merge_cols: Vec<usize>,
     pub merge_name: String,
     pub merge_sep: String,

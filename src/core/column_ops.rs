@@ -226,6 +226,9 @@ impl ColumnOps {
     }
 
     /// 拆分字段：按分隔符把源列拆成 num_cols 个新列（追加末尾）
+    ///
+    /// 命名规则：`{prefix}{序号}`（如 prefix = "时间_" → 时间_1、时间_2）。
+    /// 需要逐列指定名称时用 [`ColumnOps::split_field_named`]。
     pub fn split_field(
         &mut self,
         source: usize,
@@ -233,12 +236,41 @@ impl ColumnOps {
         num_cols: usize,
         prefix: &str,
     ) -> Result<(), String> {
+        self.split_field_named(source, separator, num_cols, &[], prefix)?;
+        Ok(())
+    }
+
+    /// 拆分字段（逐列命名）：第 i 个新列的名称取自 `names[i]`。
+    ///
+    /// 该项缺失、或去掉首尾空白后为空时，回退为 `{fallback_prefix}{序号}`
+    /// （即与 `split_field` 的自动命名一致）。名称与现有列（含本次已新增的列）
+    /// 重名时由 `unique_name` 自动追加 `_1`、`_2`…，不会覆盖原有列。
+    ///
+    /// 返回**实际写入**的新列名，供界面/日志如实显示。
+    pub fn split_field_named(
+        &mut self,
+        source: usize,
+        separator: &str,
+        num_cols: usize,
+        names: &[String],
+        fallback_prefix: &str,
+    ) -> Result<Vec<String>, String> {
         if source >= self.header.len() {
             return Err("源列不存在".to_string());
         }
+        let mut final_names: Vec<String> = Vec::with_capacity(num_cols);
         for i in 0..num_cols {
+            let raw = names
+                .get(i)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}{}", fallback_prefix, i + 1));
+            // 先按现有表头去重，使返回的名字就是最终列名
+            //（add_column 内部会再调一次 unique_name，此时名字已唯一，结果不变）
+            let name = unique_name(&self.header, &raw);
             self.add_column(
-                &format!("{}{}", prefix, i + 1),
+                &name,
                 DerivedColumn::SplitField {
                     source,
                     part: i,
@@ -246,8 +278,9 @@ impl ColumnOps {
                 },
                 None,
             )?;
+            final_names.push(name);
         }
-        Ok(())
+        Ok(final_names)
     }
 
     /// 合并字段
@@ -551,6 +584,35 @@ mod tests {
         assert_eq!(ops.field(&m, 0, 2), "00:00:00");
         assert_eq!(ops.field(&m, 1, 2), "12:30:00");
         std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn split_field_with_custom_names() {
+        let p = write_temp(b"TS\n2021-12-30 00:00:00\n2022-01-01 12:30:00\n", "_tsn.csv");
+        let m = DataModel::open(&p, 100).unwrap();
+        let mut ops = ColumnOps::new(m.header());
+        // 第 1 列自定义命名，第 2 列留白 → 回退为「前缀 + 序号」
+        let names = vec!["日期".to_string(), "   ".to_string()];
+        let used = ops.split_field_named(0, " ", 2, &names, "part_").unwrap();
+        assert_eq!(used, vec!["日期".to_string(), "part_2".to_string()]);
+        assert_eq!(ops.header()[1], "日期");
+        assert_eq!(ops.header()[2], "part_2");
+        assert_eq!(ops.field(&m, 0, 1), "2021-12-30");
+        assert_eq!(ops.field(&m, 1, 2), "12:30:00");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn split_field_custom_names_dedup() {
+        // 自定义名称与现有列同名、或两列取同名时，自动追加序号，不覆盖原列
+        let m = model();
+        let mut ops = ColumnOps::new(m.header());
+        let names = vec!["NAME".to_string(), "NAME".to_string()];
+        let used = ops.split_field_named(1, " ", 2, &names, "x").unwrap();
+        assert_eq!(used, vec!["NAME_1".to_string(), "NAME_2".to_string()]);
+        assert_eq!(ops.column_count(), 5);
+        assert_eq!(ops.header()[3], "NAME_1");
+        assert_eq!(ops.header()[4], "NAME_2");
     }
 
     #[test]
