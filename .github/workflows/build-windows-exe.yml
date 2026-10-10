@@ -1,0 +1,79 @@
+name: Build Windows EXE
+
+# 推送形如 v0.1.0 的 tag 时，自动在 Linux 上用 mingw-w64 交叉编译出
+# Windows (x86_64-pc-windows-gnu) 单文件 EXE，并发布到 Releases 供下载。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Windows EXE and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 交叉编译到 windows-gnu 需要 MinGW-w64（提供 x86_64-w64-mingw32-gcc
+      # 作为 linker，以及 windres 用于 build.rs 里的 embed-resource）
+      - name: Install MinGW-w64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mingw-w64
+
+      - name: Install Rust stable with windows-gnu target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-wgnu-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-wgnu-
+
+      # 静态 CRT：产物不依赖外部 VC++/MinGW 运行库，单文件即可分发
+      - name: Build release EXE
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Inspect EXE imports
+        run: |
+          EXE=target/x86_64-pc-windows-gnu/release/csv_editor_rust.exe
+          ls -lh "$EXE"
+          echo "--- imported DLLs ---"
+          x86_64-w64-mingw32-objdump -p "$EXE" | grep -i "DLL Name" || true
+
+      - name: Collect EXE
+        run: |
+          mkdir -p release-assets
+          cp target/x86_64-pc-windows-gnu/release/csv_editor_rust.exe \
+             "release-assets/csv_editor_rust_${GITHUB_REF_NAME}.exe"
+          ls -lh release-assets
+
+      - name: Upload EXE as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: csv_editor_rust_exe
+          path: release-assets/*.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub Release with EXE
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: CSV Editor ${{ github.ref_name }}
+          files: release-assets/*.exe
+          generate_release_notes: true
