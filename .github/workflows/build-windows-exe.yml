@@ -1,6 +1,6 @@
 name: Build Windows EXE
 
-# 推送形如 v0.1.0 的 tag 时，自动在 Linux 上用 mingw-w64 交叉编译出
+# 推送形如 v1.0.0 的 tag 时，自动在 Linux 上用 mingw-w64 交叉编译出
 # Windows (x86_64-pc-windows-gnu) 单文件 EXE，并发布到 Releases 供下载。
 on:
   push:
